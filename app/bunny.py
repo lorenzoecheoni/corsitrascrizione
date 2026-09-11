@@ -144,6 +144,7 @@ _UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _THUMBNAIL_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
 _EMBED_HOSTS = {"iframe.mediadelivery.net", "player.mediadelivery.net"}
+_MAX_CATALOG_ITEMS = 10_000
 
 
 def _video_uuid(value: str | UUID) -> UUID:
@@ -301,6 +302,7 @@ class BunnyClient:
         """Read every bounded catalog page once, preserving Bunny's provider order."""
         if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
             raise BunnyResponseError("Limite catalogo Bunny non valido")
+        max_items = min(max_items, _MAX_CATALOG_ITEMS)
         library_id = self._settings.bunny_library_id
         if library_id <= 0:
             raise BunnyUrlError("Identificativo libreria Bunny non valido")

@@ -157,6 +157,18 @@ def test_list_videos_rejects_catalogues_over_the_operational_limit(settings) -> 
 
 
 @respx.mock
+def test_list_videos_does_not_allow_callers_to_raise_the_global_catalog_limit(settings) -> None:
+    route = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([], total=10_001, page=1)
+    )
+
+    with pytest.raises(BunnyResponseError, match="Catalogo Bunny troppo grande; usa la paginazione"):
+        BunnyClient(settings).list_videos(max_items=10_001)
+
+    assert route.call_count == 1
+
+
+@respx.mock
 @pytest.mark.parametrize("overrides", [
     {"guid": "not-a-uuid"},
     {"length": -0.01},

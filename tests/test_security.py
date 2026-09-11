@@ -204,7 +204,7 @@ def test_sequential_jobs_keep_separate_context_and_reset_worker(caplog, settings
     assert_private(caplog, sentinels)
 
 
-def test_factory_protects_new_handlers_and_configured_values(caplog, settings, sentinels):
+def test_configuration_protects_new_handlers_and_configured_values(caplog, settings, sentinels):
     from io import StringIO
     from app.logging_config import configure_logging
     configure_logging(settings)
@@ -242,3 +242,119 @@ def test_invalid_source_has_safe_validation_error_in_pipeline_and_http(caplog, s
     assert_private(caplog, sentinels, response.text + str(caught.value))
     assert any(isinstance(r.msg, dict) and r.msg.get("phase") == "validation"
                and r.msg.get("error_code") == "invalid_link" for r in caplog.records)
+
+
+def test_late_standard_handler_redacts_nested_extra_without_formatter_errors(settings, sentinels, capsys):
+    from io import StringIO
+    from app.logging_config import configure_logging
+    configure_logging(settings)
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(provider_context)s %(message)s"))
+    logger = logging.getLogger("fake.late.nested")
+    logger.addHandler(handler)
+    try:
+        logger.warning({"phase": "metadata", "status_code": 403, "error_code": "bunny_auth"},
+                       extra={"provider_context": {"body": sentinels.body, "Authorization": sentinels.api_key}})
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert sentinels.body not in stream.getvalue()
+    assert sentinels.api_key not in stream.getvalue()
+    assert "bunny_auth" in stream.getvalue() and "403" in stream.getvalue()
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("field", ["name", "pathname", "filename", "module", "funcName",
+                                  "threadName", "processName", "taskName", "levelname"])
+def test_standard_record_metadata_cannot_disclose_configured_secret(settings, sentinels, field, capsys):
+    from io import StringIO
+    from app.logging_config import configure_logging
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(f"%({field})s %(message)s"))
+    logger = logging.getLogger(f"fake.{sentinels.password}")
+    logger.addHandler(handler)
+    configure_logging(settings)
+    try:
+        record = logger.makeRecord(logger.name, logging.WARNING, __file__, 1,
+                                   {"phase": "metadata", "error_code": "bunny_auth"}, (), None)
+        if field != "name":
+            setattr(record, field, f"fake-{sentinels.password}")
+        logger.handle(record)
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert sentinels.password not in stream.getvalue()
+    assert "bunny_auth" in stream.getvalue()
+    assert not capsys.readouterr().err
+
+
+def test_configuration_preserves_custom_factory_and_does_not_stack_hooks(settings, sentinels, monkeypatch):
+    from app.logging_config import configure_logging
+    calls = []
+
+    def custom_factory(*args, **kwargs):
+        calls.append(1)
+        record = logging.LogRecord(*args, **kwargs)
+        record.provider_context = {"body": sentinels.body}
+        return record
+
+    monkeypatch.setattr(logging, "_logRecordFactory", custom_factory)
+    configure_logging(settings)
+    handler_filter = logging.Handler.filter
+    configure_logging(settings)
+    configure_logging(settings)
+    assert logging.getLogRecordFactory() is custom_factory
+    assert logging.Handler.filter is handler_filter
+    logging.getLogger("fake.factory").warning("fake event")
+    assert calls == [1]
+
+
+def test_sanitization_preserves_independent_handler_name_filters(settings):
+    from io import StringIO
+    from app.logging_config import configure_logging
+    configure_logging(settings)
+    logger = logging.getLogger("fake.filtered")
+    streams = [StringIO(), StringIO()]
+    handlers = [logging.StreamHandler(stream) for stream in streams]
+    for handler in handlers:
+        handler.addFilter(logging.Filter(logger.name))
+        logger.addHandler(handler)
+    try:
+        logger.warning({"phase": "metadata", "error_code": "bunny_auth"})
+    finally:
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+    assert all(stream.getvalue().count("bunny_auth") == 1 for stream in streams)
+
+
+def test_replacement_handler_filter_is_sanitized_and_rejection_is_preserved(settings, sentinels, capsys):
+    from io import StringIO
+    from app.logging_config import configure_logging
+    configure_logging(settings)
+    stream = StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(provider_context)s %(name)s %(message)s"))
+
+    def replace(record):
+        replacement = logging.LogRecord(sentinels.password, logging.WARNING, __file__, 1,
+                                        {"phase": "metadata", "error_code": "bunny_auth"}, (), None)
+        replacement.provider_context = {"body": sentinels.body}
+        return replacement
+
+    handler.addFilter(replace)
+    logger = logging.getLogger("fake.replacement")
+    logger.addHandler(handler)
+    try:
+        logger.warning("fake event")
+        handler.addFilter(lambda record: False)
+        logger.warning("rejected fake event")
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+    assert "bunny_auth" in stream.getvalue()
+    assert stream.getvalue().count("bunny_auth") == 1
+    assert sentinels.password not in stream.getvalue() and sentinels.body not in stream.getvalue()
+    assert not capsys.readouterr().err

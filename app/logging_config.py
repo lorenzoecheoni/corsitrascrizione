@@ -3,11 +3,14 @@
 Arbitrary SDK strings/arguments can contain transcripts or provider bodies that
 cannot be reliably identified with a regex. Replace those records with a safe
 code; remote observability is emitted explicitly by application boundaries.
-The factory also protects handlers added after application initialization.
+Standard handlers sanitize the completed record after their filters run, so
+late handlers, nested extras and filter-supplied replacement records are covered.
 """
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import copy
+from functools import wraps
 import logging
 import math
 from threading import RLock
@@ -27,6 +30,11 @@ _ROUTES = {"/", "/jobs", "/jobs/{job_id}", "/api/jobs/{job_id}", "/jobs/{job_id}
            "/jobs/{job_id}/report.md", "/jobs/{job_id}/report.txt", "/static/{path:path}",
            "/healthz", "unmatched"}
 _RECORD_FIELDS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
+_LOGGER_NAMES = {"root", "app.events", "httpx", "httpcore", "openai", "asyncio",
+                 "uvicorn", "uvicorn.error", "uvicorn.access", "external"}
+_LEVEL_NAMES = {0: "NOTSET", 10: "DEBUG", 20: "INFO", 30: "WARNING", 40: "ERROR", 50: "CRITICAL"}
+_NUMERIC_FIELDS = {"lineno", "created", "msecs", "relativeCreated", "thread", "process"}
+_REDACTED = "[REDACTED]"
 
 
 class SafeEventFilter(logging.Filter):
@@ -64,10 +72,25 @@ class SafeEventFilter(logging.Filter):
         record.msg = event or {"error_code": "log_suppressed"}
         record.args = ()
         record.exc_info = record.exc_text = record.stack_info = None
-        # Extras are appended after the record factory; filter existing handlers
-        # as well so structured formatters cannot serialize an unsafe extra.
+        # Keep extra keys available to ordinary %-style formatters, but discard
+        # the entire value without recursively rendering provider-owned objects.
         for key in set(record.__dict__) - _RECORD_FIELDS:
-            del record.__dict__[key]
+            record.__dict__[key] = _REDACTED
+        # Metadata can be supplied by factories, logger names or worker names;
+        # none of those strings are trusted application event fields.
+        name = record.name if type(record.name) is str and record.name in _LOGGER_NAMES else "external"
+        record.name = _REDACTED if any(secret in name for secret in self.secrets) else name
+        if type(record.levelno) is not int or record.levelno not in _LEVEL_NAMES:
+            record.levelno = logging.INFO
+        level = _LEVEL_NAMES[record.levelno]
+        record.levelname = _REDACTED if any(secret in level for secret in self.secrets) else level
+        for key in {"pathname", "filename", "module", "funcName", "threadName", "processName", "taskName"}:
+            if key in record.__dict__:
+                record.__dict__[key] = _REDACTED
+        for key in _NUMERIC_FIELDS:
+            value = record.__dict__.get(key)
+            if type(value) not in {int, float} or not math.isfinite(value):
+                record.__dict__[key] = 0
         record.__dict__.pop("message", None)
         record.__dict__.pop("asctime", None)
         return True
@@ -83,25 +106,28 @@ def configure_logging(settings: Settings) -> None:
             settings.app_password, settings.bunny_stream_api_key,
             settings.openai_api_key, settings.bunny_token_auth_key,
         ) if value)
-        previous = logging.getLogRecordFactory()
-        if not getattr(previous, "_safe_event_factory", False):
-            def safe_factory(*args, **kwargs):
-                record = previous(*args, **kwargs)
-                _filter.filter(record)
-                return record
-            safe_factory._safe_event_factory = True
-            logging.setLogRecordFactory(safe_factory)
+        previous = logging.Handler.filter
+        if not getattr(previous, "_safe_event_filter", False):
+            @wraps(previous)
+            def safe_filter(handler, record):
+                result = previous(handler, record)
+                if result:
+                    # Python 3.12+ permits handler filters to return a new
+                    # LogRecord. Sanitize that record, preserving filter order,
+                    # rejection and replacement semantics before handle emits.
+                    # Each handler receives its own sanitized copy. Mutating
+                    # the shared record would change other handlers' filters.
+                    safe_record = copy(result if isinstance(result, logging.LogRecord) else record)
+                    _filter.filter(safe_record)
+                    return safe_record
+                return result
+            safe_filter._safe_event_filter = True
+            logging.Handler.filter = safe_filter
         root = logging.getLogger()
         if not root.handlers:
             root.addHandler(logging.StreamHandler())
         if root.level > logging.INFO:
             root.setLevel(logging.INFO)
-        loggers = [root] + [item for item in logging.Logger.manager.loggerDict.values()
-                            if isinstance(item, logging.Logger)]
-        for logger in loggers:
-            for handler in logger.handlers:
-                if _filter not in handler.filters:
-                    handler.addFilter(_filter)
 
 
 @contextmanager

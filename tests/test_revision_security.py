@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi.testclient import TestClient
 import pytest
 
-from app.bunny import BunnyVideoMetadata
+from app.bunny import BunnyCatalog, BunnyCatalogVideo, BunnyVideoMetadata
 from app.config import Settings
 from app.main import create_app
 
@@ -45,7 +45,13 @@ def app_client(monkeypatch):
         calls.append("metadata")
         return BunnyVideoMetadata(video_id=UUID(int=1), title="Original Bunny <title>",
                                   duration_seconds=3600, status=4, available_resolutions=[240, 720])
-    app.state.bunny = SimpleNamespace(get_metadata=metadata)
+
+    def list_videos():
+        return BunnyCatalog(videos=[BunnyCatalogVideo(
+            video_id=UUID(int=1), title="Catalogo di prova", duration_seconds=3600, status=4,
+        )], total_items=1)
+
+    app.state.bunny = SimpleNamespace(get_metadata=metadata, list_videos=list_videos)
     app.state.runner.submit = lambda job_id: calls.append("enqueue")
     with TestClient(app) as client:
         authenticate(client, "TEST_ONLY")

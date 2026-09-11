@@ -105,13 +105,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The login form has no authenticated session yet. Some embedded browsers
         # omit Origin and report Sec-Fetch-Site=cross-site, so authenticate it
         # directly with the fixed team credentials. Every post-login mutation
-        # remains protected by the checks below.
+        # remains protected by the synchronizer token below; embedded browsers
+        # may also report a nonstandard Origin for otherwise valid forms.
         login_submission = request.method == "POST" and path == "/login"
         if request.method not in {"GET", "HEAD", "OPTIONS"} and not login_submission:
-            origin = request.headers.get("origin")
-            same_origin = f"{request.url.scheme}://{request.url.netloc}"
-            if origin is not None and origin != same_origin:
-                return JSONResponse({"detail": "Richiesta non autorizzata"}, status_code=403)
             supplied = request.headers.get("x-csrf-token", "")
             if not supplied:
                 # Cache bytes before parsing so the downstream route can read its form.

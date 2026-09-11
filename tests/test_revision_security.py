@@ -98,12 +98,21 @@ def test_preview_requires_confirmation_and_does_not_trust_changed_fields(app_cli
     assert client.post("/jobs", data={"confirmation": "tampered", "csrf_token": csrf}).status_code == 422
 
 
-def test_token_does_not_override_untrusted_origin(app_client):
+def test_valid_token_is_authoritative_with_nonstandard_browser_origin(app_client):
     client, calls = app_client
-    response = client.post("/preview", data={"csrf_token": token(client)},
-        headers={"Origin": "null"})
-    assert response.status_code == 403
-    assert calls == []
+
+    response = client.post(
+        "/selections/preview",
+        data={
+            "csrf_token": token(client),
+            "video_ids": "00000000-0000-0000-0000-000000000001",
+        },
+        headers={"Origin": "https://untrusted.invalid"},
+    )
+
+    assert response.status_code == 200
+    assert "Original Bunny &lt;title&gt;" in response.text
+    assert calls == ["metadata"]
 
 
 def test_valid_token_allows_embedded_browser_hint_without_origin(app_client):
@@ -123,7 +132,11 @@ def test_valid_token_allows_embedded_browser_hint_without_origin(app_client):
     assert calls == ["metadata"]
 
 
-@pytest.mark.parametrize("headers", [{}, {"Sec-Fetch-Site": "cross-site"}])
+@pytest.mark.parametrize("headers", [
+    {},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Origin": "https://untrusted.invalid"},
+])
 def test_missing_token_is_rejected_even_without_origin(app_client, headers):
     client, calls = app_client
     response = client.post("/preview", data={"source_url": "unused"}, headers=headers)

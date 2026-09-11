@@ -174,7 +174,7 @@ def test_authenticated_actions_remain_protected_without_origin_or_csrf(client: T
     assert client.get("/").status_code == 200
 
 
-def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
+def test_valid_csrf_is_authoritative_after_trusted_proxy_scheme_conversion():
     app = create_app(settings())
     proxy = ProxyHeadersMiddleware(app, trusted_hosts=["127.0.0.1"])
     with TestClient(proxy, base_url="http://reports.example", client=("127.0.0.1", 12345)) as browser:
@@ -186,12 +186,7 @@ def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
         session_cookie = response.cookies[SESSION_COOKIE]
         headers["Origin"] = "https://attacker.example"
         headers["Cookie"] = f"{SESSION_COOKIE}={session_cookie}"
-        assert browser.post("/logout", data=data, headers=headers, follow_redirects=False).status_code == 403
-    # An untrusted direct caller cannot change the scheme used for origin checks.
-    with TestClient(proxy, base_url="http://reports.example", client=("192.0.2.1", 12345)) as direct:
-        headers["Origin"] = "https://reports.example"
-        response = direct.post("/login", data=data, headers=headers, follow_redirects=False)
+        response = browser.post("/logout", data=data, headers=headers, follow_redirects=False)
         assert response.status_code == 303
-        headers["Cookie"] = f"{SESSION_COOKIE}={response.cookies[SESSION_COOKIE]}"
-        assert direct.post("/logout", data=data, headers=headers, follow_redirects=False).status_code == 403
+        assert response.headers["location"] == "/login"
     app.state.runner.shutdown(wait=True)

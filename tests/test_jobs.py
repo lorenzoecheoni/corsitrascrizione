@@ -44,6 +44,46 @@ def test_job_reopens_from_same_store_but_not_after_restart() -> None:
         JobStore().get(created.id)
 
 
+def test_create_batch_keeps_titles_and_order_without_exposing_source_urls() -> None:
+    store = JobStore()
+    batch, jobs = store.create_batch([
+        ("https://private.invalid/first?token=secret-one", "Primo video"),
+        ("https://private.invalid/second?token=secret-two", "Secondo video"),
+    ])
+
+    assert [job.id for job in jobs] == batch.job_ids
+    assert [job.source_title for job in jobs] == ["Primo video", "Secondo video"]
+    assert all("source_url" not in job.model_dump() for job in jobs)
+    assert "secret-one" not in "".join(job.model_dump_json() for job in jobs)
+    assert "secret-two" not in "".join(job.model_dump_json() for job in jobs)
+
+
+def test_get_batch_returns_a_defensive_copy() -> None:
+    store = JobStore()
+    batch, _ = store.create_batch([("private-source", "Titolo sicuro")])
+    loaded = store.get_batch(batch.id)
+
+    loaded.job_ids.clear()
+
+    assert store.get_batch(batch.id).job_ids == batch.job_ids
+
+
+def test_list_recent_returns_newest_jobs_first_and_respects_limit() -> None:
+    store = JobStore()
+    first = store.create("first", source_title="Primo")
+    second = store.create("second", source_title="Secondo")
+    third = store.create("third", source_title="Terzo")
+
+    recent = store.list_recent(limit=2)
+
+    assert [job.id for job in recent] == [third.id, second.id]
+    recent[0].source_title = "Alterato"
+    assert store.list_recent(limit=1)[0].source_title == "Terzo"
+    for invalid_limit in (0, 101, 1.5, True):
+        with pytest.raises(ValueError):
+            store.list_recent(limit=invalid_limit)
+
+
 def test_records_and_nested_reports_are_defensive_copies(report: AcademyReport) -> None:
     store = JobStore()
     created = store.create("private-source")

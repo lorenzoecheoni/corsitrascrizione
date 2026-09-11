@@ -37,6 +37,7 @@ class JobState(StrEnum):
 class JobRecord(BaseModel):
     id: UUID
     source_url: str = Field(exclude=True, repr=False)
+    source_title: str = ""
     state: JobState
     progress: int = Field(ge=0, le=100, strict=True)
     message: str
@@ -44,6 +45,12 @@ class JobRecord(BaseModel):
     updated_at: datetime
     report: AcademyReport | None = None
     error: str | None = None
+
+
+class BatchRecord(BaseModel):
+    id: UUID
+    job_ids: list[UUID]
+    created_at: datetime
 
 
 _TERMINAL_STATES = {JobState.COMPLETED, JobState.FAILED, JobState.CANCELLED}
@@ -59,16 +66,46 @@ class JobStore:
     def __init__(self) -> None:
         self._lock = RLock()
         self._records: dict[UUID, JobRecord] = {}
+        self._batches: dict[UUID, BatchRecord] = {}
 
-    def create(self, source_url: str) -> JobRecord:
-        now = datetime.now(timezone.utc)
-        record = JobRecord(
+    @staticmethod
+    def _new_record(source_url: str, source_title: str, now: datetime) -> JobRecord:
+        return JobRecord(
             id=uuid4(), source_url=source_url, state=JobState.QUEUED,
-            progress=0, message="In coda", created_at=now, updated_at=now,
+            source_title=source_title, progress=0, message="In coda",
+            created_at=now, updated_at=now,
         )
+
+    def create(self, source_url: str, *, source_title: str = "") -> JobRecord:
+        record = self._new_record(source_url, source_title, datetime.now(timezone.utc))
         with self._lock:
             self._records[record.id] = record
             return record.model_copy(deep=True)
+
+    def create_batch(self, items: list[tuple[str, str]]) -> tuple[BatchRecord, list[JobRecord]]:
+        """Atomically store a batch and its independently queued jobs."""
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            records = [self._new_record(source_url, source_title, now) for source_url, source_title in items]
+            batch = BatchRecord(
+                id=uuid4(), job_ids=[record.id for record in records], created_at=now,
+            )
+            self._records.update({record.id: record for record in records})
+            self._batches[batch.id] = batch
+            return batch.model_copy(deep=True), [record.model_copy(deep=True) for record in records]
+
+    def get_batch(self, batch_id: UUID) -> BatchRecord:
+        with self._lock:
+            return self._batches[batch_id].model_copy(deep=True)
+
+    def list_recent(self, limit: int = 20) -> list[JobRecord]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Il limite dei lavori recenti deve essere tra 1 e 100")
+        with self._lock:
+            recent = sorted(
+                self._records.values(), key=lambda record: record.created_at, reverse=True,
+            )[:limit]
+            return [record.model_copy(deep=True) for record in recent]
 
     def get(self, job_id: UUID) -> JobRecord:
         with self._lock:

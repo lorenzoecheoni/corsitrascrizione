@@ -14,7 +14,7 @@ from openai.types.audio import TranscriptionDiarized
 
 import app.main as main
 from app.analysis import SlideBatchResult
-from app.bunny import BunnyVideoMetadata
+from app.bunny import BunnyCatalog, BunnyVideoMetadata
 from app.config import Settings
 from app.models import AcademyReport
 
@@ -95,6 +95,9 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             return BunnyVideoMetadata(video_id=VIDEO_ID, title="Titolo originale Bunny", duration_seconds=2,
                                       status=3, available_resolutions=[240])
 
+        def list_videos(self):
+            return BunnyCatalog(videos=[], total_items=0)
+
         def select_hls_url(self, metadata, *, cancellation_event):
             assert str(metadata.video_id) == VIDEO_ID
             return str(video)
@@ -109,23 +112,27 @@ def run_smoke_scenario(tmp_path, monkeypatch):
                         bunny_cdn_hostname="cdn.example.invalid", openai_api_key="TEST_ONLY_OPENAI",
                         app_password="TEST_ONLY_PASSWORD", temp_root=str(temporary), _env_file=None)
     app = main.create_app(settings)
-    auth = ("team", settings.app_password)
     location = None
     try:
         with TestClient(app) as client:
-            assert client.get("/").status_code == 401
+            assert client.get("/", follow_redirects=False).status_code == 303
             assert client.get("/healthz").json() == {"status": "ok"}
-            assert client.get("/", auth=auth).status_code == 200
-            page = client.get("/", auth=auth)
-            csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
-            preview = client.post("/preview", data={"source_url": SOURCE, "csrf_token": csrf}, auth=auth)
+            login = client.post("/login", data={
+                "username": "team", "password": settings.app_password,
+                "csrf_token": app.state.csrf_token,
+            }, follow_redirects=False)
+            assert login.status_code == 303
+            assert client.get("/").status_code == 200
+            page = client.get("/")
+            csrf = app.state.csrf_token
+            preview = client.post("/preview", data={"source_url": SOURCE, "csrf_token": csrf})
             assert preview.status_code == 200 and "Titolo originale Bunny" in preview.text
             confirmation = re.search(r'name="confirmation" value="([^"]+)"', preview.text)[1]
-            response = client.post("/jobs", data={"confirmation": confirmation, "csrf_token": csrf}, auth=auth, follow_redirects=False)
+            response = client.post("/jobs", data={"confirmation": confirmation, "csrf_token": csrf}, follow_redirects=False)
             assert response.status_code == 303
             location = response.headers["location"]
             while monotonic() - started < 12:
-                status = client.get("/api" + location, auth=auth).json()
+                status = client.get("/api" + location).json()
                 if status["state"] in {"completed", "failed", "cancelled"}:
                     break
                 sleep(.02)
@@ -138,11 +145,11 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             assert report.usage.transcription.provider_audio_seconds == 2
             assert report.usage.responses.requests == 2
             assert status["progress"] == 100
-            page = client.get(location, auth=auth)
+            page = client.get(location)
             assert "Corso sintetico" in page.text
             assert "Stampa / Salva PDF" in page.text
             for extension, mime in (("md", "text/markdown"), ("txt", "text/plain")):
-                download = client.get(f"{location}/report.{extension}", auth=auth)
+                download = client.get(f"{location}/report.{extension}")
                 assert download.status_code == 200
                 assert download.headers["content-type"].startswith(mime)
                 assert "attachment" in download.headers["content-disposition"]
@@ -153,8 +160,14 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             from uuid import UUID
             app.state.runner.cancel(UUID(location.rsplit("/", 1)[1]))
         app.state.runner.shutdown(wait=True)
-    with TestClient(main.create_app(settings)) as restarted:
-        assert restarted.get(location, auth=auth).status_code == 404
+    restarted_app = main.create_app(settings)
+    with TestClient(restarted_app) as restarted:
+        login = restarted.post("/login", data={
+            "username": "team", "password": settings.app_password,
+            "csrf_token": restarted_app.state.csrf_token,
+        }, follow_redirects=False)
+        assert login.status_code == 303
+        assert restarted.get(location).status_code == 404
     assert monotonic() - started < 15
 
 

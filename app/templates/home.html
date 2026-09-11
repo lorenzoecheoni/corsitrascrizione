@@ -3,23 +3,49 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bunny Video Report</title>
+    <title>Catalogo · Bunny Video Report</title>
     <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
   </head>
   <body>
     <main>
-      <h1>Bunny Video Report</h1>
-      <p>Analisi interna dei video Bunny Stream.</p>
-      <form action="/preview" method="post" class="panel">
+      <h1>Catalogo Bunny</h1>
+      <p>Video disponibili: {{ total_items }} video · Durata complessiva: {{ format_timestamp(total_duration) }}</p>
+      {% if catalog_error %}
+      <p role="alert">{{ catalog_error }}</p>
+      {% elif not videos %}
+      <p>Nessun video disponibile.</p>
+      {% else %}
+      <form action="/selections/preview" method="post" class="panel">
         <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
-        <label for="source-url">Link del video Bunny</label>
-        <input id="source-url" name="source_url" type="url" required autocomplete="off"
-               placeholder="https://iframe.mediadelivery.net/embed/…" aria-describedby="privacy-note">
-        <button type="submit">Anteprima e costo</button>
-        <p id="privacy-note">Il video non viene conservato</p>
-        <p class="muted">Durata massima: quattro ore. I file temporanei vengono eliminati dopo l’elaborazione.
-          Il report rimane disponibile solo finché questo processo del server è attivo.</p>
+        <fieldset>
+          <legend>Scegli da uno a cinquanta video</legend>
+          {% for video in videos %}
+          <article>
+            <label>
+              <input type="checkbox" name="video_ids" value="{{ video.video_id }}">
+              <strong>{{ video.title }}</strong>
+              <span> · {{ format_timestamp(video.duration_seconds) }}</span>
+            </label>
+            {% if video.description %}<p>{{ video.description }}</p>{% endif %}
+          </article>
+          {% endfor %}
+        </fieldset>
+        <button type="submit">Analizza selezionati</button>
       </form>
+      {% endif %}
+
+      <section aria-labelledby="recent-jobs">
+        <h2 id="recent-jobs">Lavori recenti</h2>
+        {% if recent_jobs %}
+        <ul>
+          {% for job in recent_jobs %}
+          <li><a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a> · {{ job.message }}</li>
+          {% endfor %}
+        </ul>
+        {% else %}
+        <p>Nessun lavoro recente.</p>
+        {% endif %}
+      </section>
     </main>
   </body>
 </html>

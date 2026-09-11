@@ -10,14 +10,27 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
-from app.bunny import BunnyError, BunnyReadinessError, BunnyUrlError, parse_bunny_url, read_metadata
+from app.bunny import (
+    BunnyAuthError,
+    BunnyError,
+    BunnyRateLimitError,
+    BunnyReadinessError,
+    BunnyServerError,
+    BunnyTimeoutError,
+    BunnyTransportError,
+    BunnyUrlError,
+    parse_bunny_url,
+    read_metadata,
+)
 from app.costs import estimate_cost
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
+from app.selection import sign_selection, verify_selection
 
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+templates.env.globals["format_timestamp"] = format_timestamp
 
 
 def secure_cookie(request: Request) -> bool:
@@ -56,9 +69,114 @@ def get_job(request: Request, job_id: str) -> JobRecord:
         raise HTTPException(404, "Lavoro non trovato; potrebbe essere terminata la sessione del server") from None
 
 
+def _catalog_error_message(error: BunnyError) -> str:
+    """Map provider failures to fixed UI text without exposing exception data."""
+    if isinstance(error, BunnyAuthError):
+        return "Accesso a Bunny non autorizzato; verifica la configurazione"
+    if isinstance(error, BunnyRateLimitError):
+        return "Limite di richieste Bunny raggiunto; riprova più tardi"
+    if isinstance(error, BunnyServerError):
+        return "Servizio Bunny temporaneamente non disponibile; riprova più tardi"
+    if isinstance(error, (BunnyTimeoutError, BunnyTransportError)):
+        return "Bunny non è disponibile al momento; riprova più tardi"
+    if isinstance(error, BunnyUrlError):
+        return "Configurazione Bunny non disponibile; verifica le impostazioni"
+    return "Impossibile caricare il catalogo Bunny; riprova più tardi"
+
+
+def _selection_error() -> HTTPException:
+    return HTTPException(422, "Selezione video non valida; ripetere la scelta")
+
+
+def _canonical_video_ids(video_ids: list[str]) -> list[UUID]:
+    if not 1 <= len(video_ids) <= 50:
+        raise _selection_error()
+    try:
+        parsed = [UUID(video_id) for video_id in video_ids]
+    except (TypeError, ValueError, AttributeError):
+        raise _selection_error() from None
+    if any(str(video_id) != raw for video_id, raw in zip(parsed, video_ids, strict=True)):
+        raise _selection_error()
+    if len(set(parsed)) != len(parsed):
+        raise _selection_error()
+    return parsed
+
+
+def _read_selected_metadata(request: Request, video_ids: list[UUID]):
+    try:
+        return [read_metadata(request.app.state.bunny, str(video_id)) for video_id in video_ids]
+    except BunnyReadinessError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except BunnyError:
+        raise HTTPException(422, "Impossibile leggere i video selezionati; riprova più tardi") from None
+
+
+def get_batch(request: Request, batch_id: str):
+    try:
+        return request.app.state.store.get_batch(UUID(batch_id))
+    except (KeyError, ValueError):
+        raise HTTPException(404, "Gruppo di lavori non trovato; potrebbe essere terminata la sessione del server") from None
+
+
 @router.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(request, "home.html")
+    try:
+        catalog = request.app.state.bunny.list_videos()
+    except BunnyError as exc:
+        return templates.TemplateResponse(request, "home.html", {
+            "catalog_error": _catalog_error_message(exc), "videos": [], "total_items": 0,
+            "total_duration": 0, "recent_jobs": request.app.state.store.list_recent(),
+        })
+    return templates.TemplateResponse(request, "home.html", {
+        "videos": catalog.videos,
+        "total_items": catalog.total_items,
+        "total_duration": sum(video.duration_seconds for video in catalog.videos),
+        "recent_jobs": request.app.state.store.list_recent(),
+    })
+
+
+@router.post("/selections/preview", response_class=HTMLResponse)
+def selection_preview(request: Request, video_ids: list[str] = Form(default=[])) -> HTMLResponse:
+    selected_ids = _canonical_video_ids(video_ids)
+    metadata = _read_selected_metadata(request, selected_ids)
+    total_duration = sum(video.duration_seconds for video in metadata)
+    return templates.TemplateResponse(request, "selection_preview.html", {
+        "videos": metadata,
+        "total_duration": total_duration,
+        "cost": estimate_cost(total_duration, 0),
+        "confirmation": sign_selection(selected_ids, request.app.state.confirmation_key),
+    })
+
+
+@router.post("/batches")
+def create_batch(request: Request, confirmation: str = Form("")) -> RedirectResponse:
+    try:
+        video_ids = verify_selection(confirmation, request.app.state.confirmation_key)
+    except ValueError:
+        raise HTTPException(422, "Conferma non valida o scaduta; ripetere la selezione") from None
+
+    metadata = _read_selected_metadata(request, video_ids)
+    library_id = request.app.state.settings.bunny_library_id
+    items = [
+        (f"https://iframe.mediadelivery.net/embed/{library_id}/{video_id}", video.title)
+        for video_id, video in zip(video_ids, metadata, strict=True)
+    ]
+    batch, jobs = request.app.state.store.create_batch(items)
+    for job in jobs:
+        try:
+            request.app.state.runner.submit(job.id)
+        except Exception:
+            # submit() raises before returning a future. Cancel this newly-created,
+            # unscheduled job, then leave the rest of the batch independent.
+            request.app.state.runner.cancel(job.id)
+    return RedirectResponse(f"/batches/{batch.id}", status_code=303)
+
+
+@router.get("/batches/{batch_id}", response_class=HTMLResponse)
+def batch_page(request: Request, batch_id: str) -> HTMLResponse:
+    batch = get_batch(request, batch_id)
+    jobs = [request.app.state.store.get(job_id) for job_id in batch.job_ids]
+    return templates.TemplateResponse(request, "batch.html", {"batch": batch, "jobs": jobs})
 
 
 @router.post("/preview", response_class=HTMLResponse)

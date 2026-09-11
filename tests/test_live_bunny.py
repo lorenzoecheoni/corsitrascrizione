@@ -21,7 +21,7 @@ def live_settings():
         configure_logging(settings)
         return settings
     except Exception:
-        pytest.fail("Invalid live configuration (details withheld)", pytrace=False)
+        raise pytest.fail.Exception("Invalid live configuration (details withheld)", pytrace=False) from None
 
 
 @pytest.mark.live
@@ -34,7 +34,9 @@ def test_real_bunny_video_produces_valid_report(live_settings):
         if validated.duration_seconds <= 0:
             raise ValueError
     except Exception:
-        pytest.fail("Live analysis failed; inspect only sanitized application diagnostics", pytrace=False)
+        raise pytest.fail.Exception(
+            "Live analysis failed; inspect only sanitized application diagnostics", pytrace=False,
+        ) from None
     finally:
         if services is not None:
             services.runner.shutdown(wait=True)

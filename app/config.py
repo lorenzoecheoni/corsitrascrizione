@@ -10,5 +10,8 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(repr=False)
     app_password: str = Field(repr=False)
     temp_root: str | None = None
+    media_runtime_seconds: float = Field(default=21600, gt=0, allow_inf_nan=False)
+    media_inactivity_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
+    media_max_workspace_bytes: int = Field(default=2_000_000_000, gt=0)
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)

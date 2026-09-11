@@ -19,6 +19,7 @@
         <p id="poll-error" role="status" hidden></p>
         <form id="cancel-form" method="post" action="/jobs/{{ job.id }}/cancel"
               {% if job.state.value not in ['queued', 'processing'] %}hidden{% endif %}>
+          <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
           <button type="submit" class="secondary">Annulla</button>
         </form>
         <p class="muted">Puoi chiudere questa pagina senza interrompere il lavoro e riaprirla dallo stesso link.

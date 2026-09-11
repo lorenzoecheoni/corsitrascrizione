@@ -81,12 +81,36 @@ def test_phash_distance_eight_is_duplicate_but_ten_is_distinct(tmp_path, patch_v
     ])) == expected_count
 
 
-def test_dedup_orders_frames_enforces_gap_and_removes_repeated_slides(tmp_path: Path) -> None:
+def test_dedup_orders_frames_enforces_gap_and_preserves_return_to_slide(tmp_path: Path) -> None:
     first, second, third = [noise_frame(tmp_path, i) for i in range(3)]
     assert deduplicate_frames([
         FrameCandidate(first, 10), FrameCandidate(third, 5),
         FrameCandidate(second, 1), FrameCandidate(first, 0),
-    ]) == [FrameCandidate(first, 0), FrameCandidate(third, 5)]
+    ]) == [FrameCandidate(first, 0), FrameCandidate(third, 5), FrameCandidate(first, 10)]
+
+
+@pytest.mark.parametrize("limit", ["runtime", "inactivity", "storage"])
+def test_media_limit_terminates_reaps_and_cleans_real_process(tmp_path, monkeypatch, limit):
+    processes = []
+    real_popen = subprocess.Popen
+    def record(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+    monkeypatch.setattr(subprocess, "Popen", record)
+    script = ("import time; time.sleep(5)" if limit != "storage" else
+              "import pathlib,time,sys; pathlib.Path(sys.argv[1]).write_bytes(b'x'*20000); time.sleep(5)")
+    with temporary_workspace(tmp_path) as workspace:
+        started = time.monotonic()
+        with pytest.raises(MediaError):
+            media._run_process([sys.executable, "-u", "-c", script, str(workspace / "output")],
+                Event(), lambda *_: None, workspace=workspace,
+                runtime_seconds=.2 if limit == "runtime" else 2,
+                inactivity_seconds=.2 if limit == "inactivity" else 2,
+                max_workspace_bytes=1000 if limit == "storage" else 100000)
+        assert time.monotonic() - started < 1.5
+    assert processes and processes[0].poll() is not None
+    assert not workspace.exists()
 
 
 def test_over_600_distinct_frames_are_sampled_across_the_whole_video(tmp_path: Path) -> None:

@@ -3,6 +3,9 @@
 import json
 import socket
 import subprocess
+import sys
+from pathlib import Path
+import re
 from time import monotonic, sleep
 from types import SimpleNamespace
 
@@ -69,7 +72,7 @@ class OfflineOpenAI:
         return SimpleNamespace(status="completed", output_parsed=text_format.model_validate(data))
 
 
-def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path, monkeypatch):
+def run_smoke_scenario(tmp_path, monkeypatch):
     # Catches lost production wiring, export/schema regressions and media leaks.
     assert callable(getattr(main, "build_services", None)), "Expose the substitutable service factory"
     started = monotonic()
@@ -89,10 +92,11 @@ def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path, monkeyp
 
         def get_metadata(self, video_id):
             assert video_id == VIDEO_ID
-            return BunnyVideoMetadata(video_id=VIDEO_ID, title="Corso sintetico", duration_seconds=2)
+            return BunnyVideoMetadata(video_id=VIDEO_ID, title="Titolo originale Bunny", duration_seconds=2,
+                                      status=3, available_resolutions=[240])
 
-        def build_hls_url(self, video_id):
-            assert video_id == VIDEO_ID
+        def select_hls_url(self, metadata, *, cancellation_event):
+            assert str(metadata.video_id) == VIDEO_ID
             return str(video)
 
     def no_network(*args, **kwargs):
@@ -112,7 +116,12 @@ def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path, monkeyp
             assert client.get("/").status_code == 401
             assert client.get("/healthz").json() == {"status": "ok"}
             assert client.get("/", auth=auth).status_code == 200
-            response = client.post("/jobs", data={"source_url": SOURCE}, auth=auth, follow_redirects=False)
+            page = client.get("/", auth=auth)
+            csrf = re.search(r'name="csrf_token" value="([^"]+)"', page.text)[1]
+            preview = client.post("/preview", data={"source_url": SOURCE, "csrf_token": csrf}, auth=auth)
+            assert preview.status_code == 200 and "Titolo originale Bunny" in preview.text
+            confirmation = re.search(r'name="confirmation" value="([^"]+)"', preview.text)[1]
+            response = client.post("/jobs", data={"confirmation": confirmation, "csrf_token": csrf}, auth=auth, follow_redirects=False)
             assert response.status_code == 303
             location = response.headers["location"]
             while monotonic() - started < 12:
@@ -125,6 +134,9 @@ def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path, monkeyp
             assert report.duration_seconds == 2
             assert report.slides[0].timestamp_seconds == 0
             assert report.cost.estimated_high_usd > 0
+            assert report.bunny_title == "Titolo originale Bunny"
+            assert report.usage.transcription.provider_audio_seconds == 2
+            assert report.usage.responses.requests == 2
             assert status["progress"] == 100
             page = client.get(location, auth=auth)
             assert "Corso sintetico" in page.text
@@ -144,3 +156,18 @@ def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path, monkeyp
     with TestClient(main.create_app(settings)) as restarted:
         assert restarted.get(location, auth=auth).status_code == 404
     assert monotonic() - started < 15
+
+
+def test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup(tmp_path):
+    from smoke_support import run_bounded_smoke
+    script = """
+import sys
+from pathlib import Path
+import pytest
+sys.path.insert(0, 'tests')
+from test_end_to_end import run_smoke_scenario
+with pytest.MonkeyPatch.context() as patch:
+    run_smoke_scenario(Path(sys.argv[1]), patch)
+"""
+    run_bounded_smoke([sys.executable, "-c", script], tmp_path, timeout=12)
+    assert not list(tmp_path.iterdir())

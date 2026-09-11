@@ -146,6 +146,16 @@ def test_usage_requires_complete_token_accounting(chunks, usage, expected):
     assert result.audio_seconds == 320
 
 
+def test_partial_usage_keeps_returned_counters_and_marks_missing(chunks):
+    client = FakeClient([response([], usage={"type": "tokens", "input_tokens": 10,
+        "output_tokens": 2, "total_tokens": 12}), response([], duration=20, usage={"type": "duration", "seconds": 20})])
+    result = OpenAITranscriber(client).transcribe(chunks)
+    assert result.usage.requests == 2
+    assert result.usage.input_tokens == 10 and result.usage.output_tokens == 2
+    assert result.usage.provider_audio_seconds == 20
+    assert result.usage.missing_input_requests == 1
+
+
 @pytest.mark.parametrize("duration", [1.99, 10.01, float("nan"), float("inf")])
 def test_invalid_reference_duration_is_rejected_before_request(chunks, duration):
     client = FakeClient([])

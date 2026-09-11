@@ -128,7 +128,8 @@ def test_playback_rejects_malformed_configured_hostname(hostname, settings) -> N
 @respx.mock
 def test_get_metadata_is_read_only_and_uses_access_key(settings) -> None:
     route = respx.get(METADATA_URL).respond(200, json={
-        "guid": VIDEO_ID, "title": "Corso", "length": 7200,
+        "guid": VIDEO_ID, "title": "Corso", "length": 7200, "status": 4,
+        "availableResolutions": "240p,480p,720p", "description": "Descrizione originale",
         "captions": [{"srclang": "it", "label": "Italiano"}],
         "chapters": [{"title": "Inizio", "start": 0, "end": 120}],
     })
@@ -136,6 +137,9 @@ def test_get_metadata_is_read_only_and_uses_access_key(settings) -> None:
     assert metadata.video_id == UUID(VIDEO_ID)
     assert metadata.title == "Corso"
     assert metadata.duration_seconds == 7200
+    assert metadata.status == 4
+    assert metadata.available_resolutions == [240, 480, 720]
+    assert metadata.description == "Descrizione originale"
     assert metadata.captions == [{"srclang": "it", "label": "Italiano"}]
     assert metadata.chapters == [{"title": "Inizio", "start": 0, "end": 120}]
     assert route.call_count == 1
@@ -151,6 +155,51 @@ def test_missing_optional_metadata_defaults_to_empty_collections(settings) -> No
     assert metadata.captions == []
     assert metadata.chapters == []
     assert metadata.duration_seconds == 0
+
+
+@respx.mock
+def test_selects_lowest_available_hls_variant_on_configured_cdn(settings):
+    from app.bunny import BunnyVideoMetadata
+    client = BunnyClient(settings)
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title="Corso", duration_seconds=60,
+                                  status=4, available_resolutions=[240, 720])
+    master = client.build_hls_url(VIDEO_ID)
+    respx.get(master).respond(200, text="#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720\n720p/video.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=600000,RESOLUTION=352x240\n240p/video.m3u8\n")
+    url = client.select_hls_url(metadata)
+    assert url == master.removesuffix("playlist.m3u8") + "240p/video.m3u8"
+
+
+@respx.mock
+@pytest.mark.parametrize("uri", ["https://untrusted.invalid/video.m3u8", "../../other.m3u8", "/other/video.m3u8"])
+def test_hls_selection_rejects_manifest_uri_outside_signed_video_directory(settings, uri):
+    from app.bunny import BunnyVideoMetadata
+    client = BunnyClient(settings)
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title="Corso", duration_seconds=60,
+                                  status=4, available_resolutions=[240])
+    respx.get(client.build_hls_url(VIDEO_ID)).respond(200, text=f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=600000,RESOLUTION=352x240\n{uri}\n")
+    with pytest.raises(BunnyError):
+        client.select_hls_url(metadata)
+
+
+def test_regenerated_token_is_distinct_even_within_same_second(settings, monkeypatch):
+    settings.bunny_token_auth_key = "TEST_ONLY_TOKEN"
+    monkeypatch.setattr("app.bunny.time.time", lambda: 2_000_000_000)
+    client = BunnyClient(settings)
+    first, second = client.build_hls_url(VIDEO_ID), client.build_hls_url(VIDEO_ID)
+    assert bool(first != second), "Regeneration must issue a fresh token"
+
+
+@respx.mock
+def test_playback_manifest_access_failure_is_safe_and_not_generically_retried(settings):
+    from app.bunny import BunnyPlaybackError, BunnyVideoMetadata
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title="Corso", duration_seconds=60,
+                                  status=3, available_resolutions=[240])
+    client = BunnyClient(settings)
+    route = respx.get(client.build_hls_url(VIDEO_ID)).respond(403, text="TEST_ONLY_UPSTREAM_BODY")
+    with pytest.raises(BunnyPlaybackError) as caught:
+        client.select_hls_url(metadata)
+    assert route.call_count == 1
+    assert "UPSTREAM" not in str(caught.value) and "https://" not in str(caught.value)
 
 
 @pytest.mark.parametrize("status, error_type, retryable", [

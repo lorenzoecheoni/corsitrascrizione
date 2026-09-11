@@ -21,6 +21,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.media import AudioChunk
 from app.retry import check_cancelled, retry_remote
+from app.models import ProviderUsage
+from app.usage import record_usage
 
 
 class TranscriptSegment(BaseModel):
@@ -42,8 +44,9 @@ class TranscriptionResult(BaseModel):
     text: str = Field(repr=False)
     segments: list[TranscriptSegment]
     audio_seconds: float = Field(ge=0, allow_inf_nan=False)
-    input_tokens: int | None = None
-    output_tokens: int | None = None
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    usage: ProviderUsage = Field(default_factory=ProviderUsage)
     original_segments: list[TranscriptSegment] = Field(default_factory=list)
     speaker_mapping: dict[str, str] = Field(default_factory=dict)
 
@@ -153,6 +156,7 @@ class OpenAITranscriber:
         next_speaker = 1
         input_tokens = output_tokens = 0
         complete_usage = bool(chunks)
+        usage = ProviderUsage()
         previous_start = -1.0
         for index, chunk in enumerate(chunks):
             check_cancelled(cancellation_event)
@@ -177,8 +181,10 @@ class OpenAITranscriber:
                     except CancelledError:
                         raise
                     except Exception as exc:
+                        record_usage(usage, exc, audio_seconds=chunk.duration_seconds)
                         check_cancelled(cancellation_event)
                         raise _classify_remote_error(exc) from None
+                record_usage(usage, result, audio_seconds=chunk.duration_seconds)
                 check_cancelled(cancellation_event)
                 return result
 
@@ -240,4 +246,5 @@ class OpenAITranscriber:
             audio_seconds=sum(chunk.duration_seconds for chunk in chunks),
             input_tokens=input_tokens if complete_usage else None,
             output_tokens=output_tokens if complete_usage else None,
+            usage=usage,
         )

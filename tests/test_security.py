@@ -66,8 +66,9 @@ def failing_pipeline(settings, sentinels, tmp_path, phase):
     return AnalysisPipeline(
         settings,
         SimpleNamespace(get_metadata=stage("metadata", BunnyVideoMetadata(
-            video_id=UUID(int=1), title="Fake fixture", duration_seconds=60)),
-            build_hls_url=lambda _: sentinels.signed_url),
+            video_id=UUID(int=1), title="Fake fixture", duration_seconds=60,
+            status=3, available_resolutions=[240])),
+            select_hls_url=lambda _, **kwargs: sentinels.signed_url),
         SimpleNamespace(extract=stage("media", MediaArtifacts([], [], 0))),
         SimpleNamespace(transcribe=stage("transcription", TranscriptionResult(
             text=sentinels.transcript, segments=[], audio_seconds=60))),
@@ -158,7 +159,8 @@ def test_unexpected_http_and_validation_errors_are_fixed(caplog, settings, senti
 
     with TestClient(app, raise_server_exceptions=False) as client:
         responses = [client.get("/fake-error", auth=("team", sentinels.password)),
-                     client.post("/jobs", files={"source_url": (sentinels.body, sentinels.image)},
+                     client.post("/preview", files={"source_url": (sentinels.body, sentinels.image)},
+                                 headers={"X-CSRF-Token": app.state.csrf_token},
                                  auth=("team", sentinels.password))]
     app.state.runner.shutdown()
     assert [r.status_code for r in responses] == [500, 422]
@@ -235,7 +237,8 @@ def test_invalid_source_has_safe_validation_error_in_pipeline_and_http(caplog, s
         pipeline.run(invalid_source, lambda *_: None)
     assert caught.value.code == "invalid_link"
     with TestClient(app) as client:
-        response = client.post("/jobs", data={"source_url": invalid_source},
+        response = client.post("/preview", data={"source_url": invalid_source},
+                               headers={"X-CSRF-Token": app.state.csrf_token},
                                auth=("team", sentinels.password))
     app.state.runner.shutdown()
     assert response.status_code == 422

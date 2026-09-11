@@ -42,6 +42,12 @@ Sono accettati link HTTPS nei seguenti formati, esclusivamente per la libreria e
 
 Eventuali query del link incollato vengono scartate. Il playback viene ricostruito usando la configurazione del server e, se presente, la chiave token CDN. Link dashboard, URL arbitrari e video di altre librerie non sono supportati. DRM e restrizioni referrer che impediscono l'accesso server sono esclusi: non vengono aggirati. La compatibilità dei token e delle protezioni della propria libreria deve essere verificata con il test live.
 
+Il form autenticato mostra prima il titolo originale Bunny, la durata e la stima del costo; soltanto la conferma accoda il lavoro. Entrambi i form e l’annullamento richiedono un token CSRF casuale valido per la vita del processo. La conferma scade dopo dieci minuti. Il worker rilegge i metadati e verifica nuovamente la disponibilità: gli stati Bunny 3 (Finished) e 4 (Resolution finished) sono accettati solo con risoluzioni disponibili. Descrizione, capitoli e didascalie esistenti sono usati come evidenze nell’analisi.
+
+La playlist master viene letta entro 1 MB e viene scelta la variante alla risoluzione minima disponibile, al massimo 720p; a parità di risoluzione viene scelto il bitrate minore. Se mancano varianti ridotte, abilitare una risoluzione SD nella codifica Bunny. Le varianti devono restare nella directory autorizzata sul CDN configurato. Playlist con tracce audio esterne separate non sono supportate in questa versione. FFmpeg legge una sola variante completa e produce audio e immagini dalla stessa lettura; il ritorno a una slide precedente conserva il nuovo timestamp.
+
+I limiti configurabili sono `MEDIA_RUNTIME_SECONDS=21600` (sei ore per estrazione, incluse le operazioni locali), `MEDIA_INACTIVITY_SECONDS=120` e `MEDIA_MAX_WORKSPACE_BYTES=2000000000` (2 GB). Un controllo circa ogni 100 ms interrompe e raccoglie il processo quando supera uno dei limiti; brevi superamenti della soglia di spazio fra due controlli sono possibili. I file vengono rimossi prima del lavoro successivo. Gli errori temporanei Bunny hanno al massimo tre tentativi; un errore di accesso al playback protetto rigenera il token una sola volta, ripartendo in una directory pulita. Questa ripartenza può rileggere media già scaricato nel tentativo fallito.
+
 Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. Inserire il link nel form, seguire l'avanzamento e riaprire l'URL del lavoro nella stessa sessione del server. Dal report si possono scaricare **Markdown (.md)** e **testo (.txt)**, copiare il contenuto oppure scegliere **Stampa / Salva PDF** nel browser. Il PDF usa la stampa browser, non un generatore server.
 
 Nomi e ruoli richiedono evidenze testuali o visive; in caso di dubbio compaiono etichette generiche e incertezze. L'identità dei relatori non viene dedotta biometricamente dalla voce. Il report richiede revisione umana prima dell'uso editoriale.
@@ -72,6 +78,8 @@ Usare **esattamente una replica e un processo Uvicorn**, senza `--workers` multi
 
 La stima iniziale è **$0.40-$0.70 per ora di video**, da ricalibrare sul primo video reale usando usage API e traffico Bunny. Non è un preventivo: modello, numero di frame, retry, contenuti e tariffe possono cambiare il costo. Il traffico mostrato è una stima dai byte dei pacchetti di input FFmpeg con margine del 20%, non traffico di rete misurato. Le costanti iniziali sono in `app/costs.py`; aggiornarle soltanto sulla base di misure reali insieme a questo README.
 
+Il report conserva separatamente titolo Bunny e titolo didattico suggerito. Nei download e nella pagina compaiono i contatori numerici restituiti da trascrizione e Responses per ogni tentativo, inclusi batch, retry e riparazioni quando disponibili. I contatori mancanti sono dichiarati; la stima usa quelli disponibili e aggiunge una quota da durata quando non è possibile calcolare un tentativo. Non sostituisce la fattura. Il traffico di un tentativo FFmpeg fallito non è misurabile dalla sintesi finale ed è escluso dalla stima di banda.
+
 Suite offline, senza credenziali reali né accesso ai servizi:
 
 ```sh
@@ -89,5 +97,7 @@ Il test live è **opt-in e a pagamento**. Compilare in `.env` le variabili obbli
 Se l'opt-in o una variabile obbligatoria manca, il test viene saltato. Non usare `--showlocals`, debugger o registrazioni HTTP con credenziali reali. Il test non stampa URL, transcript, report o segreti e non effettua modifiche su Bunny. Lasciare `RUN_LIVE_BUNNY=0` al termine.
 
 Prima della messa online: eseguire la build Docker e il controllo FFmpeg sopra; provare prima un video breve e poi uno di almeno un'ora; verificare almeno dieci timestamp fra interventi, capitoli e slide; controllare presentatore, assenza del moderatore e due relatori. Provare annullamento e riavvio, aprire MD/TXT e controllare visivamente la stampa PDF. Registrare costo e durata del collaudo senza conservare contenuti sensibili nei log.
+
+Lo smoke test offline gira in un processo isolato con limite esterno di dodici secondi e fino a due secondi per arresto/raccolta dei processi. Il supervisore elimina i media anche se il worker o il suo shutdown restano bloccati. Il controllo JavaScript è eseguibile con `node tests/job_ui.cjs` e include il ripristino della pagina dalla cache del browser.
 
 Nel primo ambiente di sviluppo non è disponibile Docker/Podman/Buildah: sono verificabili la suite offline e il contenuto della wheel, ma build ed esecuzione del container richiedono un host con runtime. I test live, i costi e la precisione su video reali restano da verificare con le credenziali del team.

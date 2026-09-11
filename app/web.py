@@ -2,14 +2,17 @@
 
 from pathlib import Path
 from uuid import UUID
+import hmac
+import time
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app.bunny import BunnyUrlError, parse_bunny_url
+from app.bunny import BunnyError, BunnyReadinessError, BunnyUrlError, parse_bunny_url, read_metadata
+from app.costs import estimate_cost
 from app.jobs import JobRecord, JobState
-from app.reporting import render_markdown, render_text
+from app.reporting import format_timestamp, render_markdown, render_text
 
 
 router = APIRouter()
@@ -28,15 +31,44 @@ def home(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request, "home.html")
 
 
-@router.post("/jobs")
-def create_job(request: Request, source_url: str = Form("")) -> RedirectResponse:
+@router.post("/preview", response_class=HTMLResponse)
+def preview_job(request: Request, source_url: str = Form("")) -> HTMLResponse:
     settings = request.app.state.settings
     try:
         ref = parse_bunny_url(source_url, expected_library_id=settings.bunny_library_id,
                               cdn_hostname=settings.bunny_cdn_hostname)
     except BunnyUrlError:
         raise HTTPException(422, "Il link Bunny non è valido; usa un video della libreria configurata") from None
-    # Keep only the video reference; discard user-supplied tokens immediately.
+    try:
+        metadata = read_metadata(request.app.state.bunny, str(ref.video_id))
+    except BunnyReadinessError as exc:
+        raise HTTPException(422, str(exc)) from None
+    except BunnyError:
+        raise HTTPException(422, "Impossibile leggere il video; verificare accesso e disponibilità su Bunny") from None
+    payload = f"{ref.video_id}:{int(time.time()) + 600}"
+    signature = hmac.digest(request.app.state.confirmation_key, payload.encode(), "sha256").hex()
+    return templates.TemplateResponse(request, "preview.html", {
+        "metadata": metadata, "duration": format_timestamp(metadata.duration_seconds),
+        "cost": estimate_cost(metadata.duration_seconds, 0), "confirmation": f"{payload}:{signature}",
+    })
+
+
+@router.post("/jobs")
+def create_job(request: Request, confirmation: str = Form("")) -> RedirectResponse:
+    try:
+        video_id, expiry, signature = confirmation.split(":")
+        payload = f"{video_id}:{expiry}"
+        expected = hmac.digest(request.app.state.confirmation_key, payload.encode(), "sha256").hex()
+        if not hmac.compare_digest(signature.encode(), expected.encode()) or int(expiry) < time.time():
+            raise ValueError
+        video_id = UUID(video_id)
+    except (ValueError, TypeError):
+        raise HTTPException(422, "Conferma non valida o scaduta; ripetere l'anteprima") from None
+    # Only the authenticated preview can authorize this canonical video reference.
+    settings = request.app.state.settings
+    ref = parse_bunny_url(f"https://iframe.mediadelivery.net/embed/{settings.bunny_library_id}/{video_id}",
+                          expected_library_id=settings.bunny_library_id,
+                          cdn_hostname=settings.bunny_cdn_hostname)
     canonical_url = f"https://iframe.mediadelivery.net/embed/{ref.library_id}/{ref.video_id}"
     job = request.app.state.store.create(canonical_url)
     request.app.state.runner.submit(job.id)

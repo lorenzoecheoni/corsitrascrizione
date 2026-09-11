@@ -1,5 +1,5 @@
 import re
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -7,17 +7,19 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 Confidence = Literal["alta", "media", "bassa"]
 GENERIC_SPEAKER_LABEL = re.compile(r"^Relatore [1-9]\d*$")
 IDENTITY_EVIDENCE_KINDS = {"introduzione", "sottopancia", "slide", "metadata"}
+Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
+Counter = Annotated[int, Field(ge=0, strict=True)]
 
 
 class ReportModel(BaseModel):
     """Base model that rejects report fields outside the documented contract."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
 
 class Evidence(ReportModel):
     kind: Literal["introduzione", "sottopancia", "slide", "metadata", "inferenza"]
-    timestamp_seconds: float | None = None
+    timestamp_seconds: Nonnegative | None = None
     note: str
 
 
@@ -41,39 +43,98 @@ class SpeakerProfile(ReportModel):
         )
 
 
-class Intervention(ReportModel):
-    start_seconds: float
-    end_seconds: float
+class TimeInterval(ReportModel):
+    start_seconds: Nonnegative
+    end_seconds: Nonnegative
+
+    @model_validator(mode="after")
+    def ordered_interval(self):
+        if self.end_seconds < self.start_seconds:
+            raise ValueError("La fine precede l'inizio")
+        return self
+
+
+class Intervention(TimeInterval):
     speaker_ids: list[str]
     summary: str
 
 
-class Chapter(ReportModel):
-    start_seconds: float
-    end_seconds: float
+class Chapter(TimeInterval):
     title: str
     summary: str
 
 
 class SlideChange(ReportModel):
-    timestamp_seconds: float
+    timestamp_seconds: Nonnegative
     title: str | None = None
     visible_content: list[str] = Field(default_factory=list)
     confidence: Confidence
 
 
 class CostEstimate(ReportModel):
-    estimated_low_usd: float
-    estimated_high_usd: float
-    bunny_bandwidth_usd: float
-    transcription_usd: float
-    analysis_usd: float
+    estimated_low_usd: Nonnegative
+    estimated_high_usd: Nonnegative
+    bunny_bandwidth_usd: Nonnegative
+    transcription_usd: Nonnegative
+    analysis_usd: Nonnegative
     basis: str
+
+    @model_validator(mode="after")
+    def ordered_cost(self):
+        if self.estimated_high_usd < self.estimated_low_usd:
+            raise ValueError("Intervallo dei costi non valido")
+        return self
+
+
+class UsageEntry(ReportModel):
+    """One attempted API request; unknown counters remain absent, never zero."""
+    input_tokens: Counter | None = None
+    output_tokens: Counter | None = None
+    audio_input_tokens: Counter | None = None
+    provider_audio_seconds: Nonnegative | None = None
+    request_audio_seconds: Nonnegative = 0
+
+
+class ProviderUsage(ReportModel):
+    entries: list[UsageEntry] = Field(default_factory=list)
+
+    @property
+    def requests(self) -> int:
+        return len(self.entries)
+
+    def _sum(self, field: str):
+        values = [getattr(entry, field) for entry in self.entries if getattr(entry, field) is not None]
+        return sum(values) if values else None
+
+    @property
+    def input_tokens(self) -> int | None:
+        return self._sum("input_tokens")
+
+    @property
+    def output_tokens(self) -> int | None:
+        return self._sum("output_tokens")
+
+    @property
+    def provider_audio_seconds(self) -> float | None:
+        return self._sum("provider_audio_seconds")
+
+    @property
+    def missing_input_requests(self) -> int:
+        return sum(entry.input_tokens is None for entry in self.entries)
+
+    @property
+    def missing_output_requests(self) -> int:
+        return sum(entry.output_tokens is None for entry in self.entries)
+
+
+class APIUsage(ReportModel):
+    transcription: ProviderUsage = Field(default_factory=ProviderUsage)
+    responses: ProviderUsage = Field(default_factory=ProviderUsage)
 
 
 class AcademyContent(ReportModel):
     title: str
-    duration_seconds: float
+    duration_seconds: Nonnegative
     detected_language: str
     synopsis: str
     extended_description: str
@@ -92,3 +153,10 @@ class AcademyContent(ReportModel):
 
 class AcademyReport(AcademyContent):
     cost: CostEstimate
+    bunny_title: str = ""
+    usage: APIUsage = Field(default_factory=APIUsage)
+
+
+class AnalysisResult(AcademyContent):
+    """Application-owned usage, added after the strict AcademyContent parse."""
+    usage: ProviderUsage = Field(default_factory=ProviderUsage)

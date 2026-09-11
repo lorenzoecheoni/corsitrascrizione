@@ -111,6 +111,36 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
                for part in images)
 
 
+def test_usage_counts_batches_retry_error_and_semantic_repair(inputs, content, monkeypatch):
+    monkeypatch.setattr("app.retry.time.sleep", lambda _: None)
+    failure = APIStatusError("safe", response=httpx.Response(503, request=httpx.Request("POST", "https://api.openai.com")),
+                             body={"usage": {"input_tokens": 5, "output_tokens": 1}})
+    bad = copy.deepcopy(content)
+    bad["detected_language"] = "und"
+    def returned(data, input_tokens, output_tokens):
+        return lambda _: SimpleNamespace(output_parsed=data, status="completed",
+            usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens))
+    client = FakeClient(failure, returned(visual("slide", "camera_change", "slide"), 100, 10),
+                        returned(bad, 200, 20), returned(content, 50, 5))
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert result.usage.requests == 4
+    assert result.usage.input_tokens == 355
+    assert result.usage.output_tokens == 36
+    assert result.usage.missing_input_requests == 0
+
+
+def test_metadata_description_and_existing_evidence_reach_analysis(inputs, content):
+    inputs["metadata"].__dict__["description"] = "Descrizione originale"
+    inputs["metadata"].captions = [{"srclang": "it", "label": "Italiano", "version": 1}]
+    inputs["metadata"].chapters = [{"title": "Apertura", "start": 0, "end": 10}]
+    client = FakeClient(visual("slide", "camera_change", "slide"), content)
+    OpenAIAnalyzer(client).analyze(**inputs)
+    metadata = json.loads(client.calls[-1]["input"])["metadata"]
+    assert metadata["description"] == "Descrizione originale"
+    assert metadata["captions"][0]["srclang"] == "it"
+    assert metadata["chapters"][0]["title"] == "Apertura"
+
+
 def test_visual_batches_never_exceed_twenty_images(inputs, content):
     path = inputs["frames"][0].path
     inputs["frames"] = [FrameCandidate(path, i * 2) for i in range(41)]
@@ -139,14 +169,13 @@ def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, c
     assert result.interventions[1].speaker_ids == ["a", "b"]
 
 
-@pytest.mark.parametrize("fault", ["overlap", "range", "nan", "order", "speaker", "duplicate",
+@pytest.mark.parametrize("fault", ["overlap", "range", "order", "speaker", "duplicate",
                                   "empty_speakers", "empty_section", "duration", "language", "evidence"])
 def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors(inputs, content, fault):
     inputs["frames"] = []
     bad = copy.deepcopy(content)
     if fault == "overlap": bad["chapters"][1]["start_seconds"] = 9
     if fault == "range": bad["interventions"][1]["end_seconds"] = 91
-    if fault == "nan": bad["interventions"][0]["start_seconds"] = float("nan")
     if fault == "order": bad["interventions"].reverse()
     if fault == "speaker": bad["interventions"][0]["speaker_ids"] = ["missing"]
     if fault == "duplicate": bad["speakers"][1]["id"] = "host"
@@ -163,6 +192,15 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
     assert set(repair) == {"errors", "previous_json"}
     assert repair["errors"]
     assert "transcription" not in repair
+
+
+def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, content):
+    inputs["frames"] = []
+    content["interventions"][0]["start_seconds"] = float("nan")
+    client = FakeClient(content)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.code == "response" and len(client.calls) == 1
 
 
 def test_second_invalid_response_has_fixed_safe_error(inputs, content):

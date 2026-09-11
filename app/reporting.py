@@ -31,6 +31,7 @@ def render_markdown(report: AcademyReport) -> str:
     lines = [
         f"# {report.title}",
         "",
+        f"Titolo originale Bunny: {report.bunny_title or 'Non disponibile'}",
         f"Durata: {format_timestamp(report.duration_seconds)}",
         f"Lingua rilevata: {report.detected_language}",
         "",
@@ -108,6 +109,19 @@ def render_markdown(report: AcademyReport) -> str:
             f"- Base della stima: {report.cost.basis}",
         ]
     )
+    lines.extend(["", "## Utilizzo API restituito"])
+    for name, usage in (("Trascrizione", report.usage.transcription), ("Responses", report.usage.responses)):
+        def shown(value):
+            return str(value) if value is not None else "non disponibile"
+        lines.append(f"- {name}: {usage.requests} richieste; token input {shown(usage.input_tokens)}; "
+                     f"token output {shown(usage.output_tokens)}.")
+        lines.append(f"  Contatori mancanti: input in {usage.missing_input_requests} richieste, "
+                     f"output in {usage.missing_output_requests} richieste.")
+        if not usage.entries:
+            lines.append("  Utilizzo del provider non disponibile; stima da durata.")
+        if name == "Trascrizione":
+            lines.append(f"  Secondi audio restituiti dal provider: {shown(usage.provider_audio_seconds)}.")
+    lines.append("Il costo monetario è una stima applicativa e non sostituisce la fattura dei fornitori.")
     return "\n".join(lines)
 
 

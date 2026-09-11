@@ -26,7 +26,8 @@ def components(tmp_path):
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     data.pop("cost")
     content = AcademyContent.model_validate(data)
-    metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600)
+    metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600,
+                                  status=3, available_resolutions=[240, 720])
     state = SimpleNamespace(settings=settings, metadata=metadata, content=content, calls=[],
                             error=None, cancel_after=None, event=Event(), workspace=None)
 
@@ -42,7 +43,7 @@ def components(tmp_path):
         stage("metadata")
         return metadata
 
-    def hls(video_id):
+    def hls(metadata, *, cancellation_event):
         stage("hls")
         return "https://cdn.example.com/regenerated-playlist"
 
@@ -71,7 +72,7 @@ def components(tmp_path):
         stage("analysis")
         return content
 
-    state.pipeline = AnalysisPipeline(settings, SimpleNamespace(get_metadata=get_metadata, build_hls_url=hls),
+    state.pipeline = AnalysisPipeline(settings, SimpleNamespace(get_metadata=get_metadata, select_hls_url=hls),
                                       SimpleNamespace(extract=extract), SimpleNamespace(transcribe=transcribe),
                                       SimpleNamespace(analyze=analyze), temp_root=tmp_path)
     return state
@@ -82,6 +83,8 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     report = components.pipeline.run(SOURCE, lambda p, m: values.append(p), components.event)
     assert components.calls == ["metadata", "hls", "media", "transcription", "analysis"]
     assert report.title == components.content.title
+    assert report.bunny_title == "Corso di prova"
+    assert report.usage.transcription.requests == 0
     assert report.cost.estimated_low_usd == .41
     assert report.cost.estimated_high_usd == .69
     assert values == sorted(values)
@@ -133,3 +136,116 @@ def test_invalid_link_never_contacts_bunny(components):
         components.pipeline.run("https://evil.example/video", lambda p, m: None)
     assert caught.value.code == "invalid_link"
     assert components.calls == []
+
+
+def test_metadata_retry_uses_three_attempts_and_cancellation(components, monkeypatch):
+    from app.bunny import BunnyServerError
+    attempts = []
+    def metadata(video_id):
+        attempts.append(video_id)
+        if len(attempts) < 3:
+            raise BunnyServerError("safe")
+        return components.metadata
+    monkeypatch.setattr(components.event, "wait", lambda delay: False)
+    components.pipeline.bunny.get_metadata = metadata
+    components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert len(attempts) == 3
+    attempts.clear()
+    monkeypatch.setattr(components.event, "wait", lambda delay: components.event.set())
+    with pytest.raises(PipelineCancelled):
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("status", [0, 1, 2, 5, 6, 7, 8, 99])
+def test_nonready_encoding_never_reads_hls(components, status):
+    components.metadata.__dict__["status"] = status
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None)
+    assert caught.value.code in {"not_ready", "encoding_failed", "unsupported_media"}
+    assert components.calls == ["metadata"]
+
+
+def test_protected_access_regenerates_once_in_clean_workspace(components, tmp_path):
+    components.settings.bunny_token_auth_key = "TEST_ONLY"
+    original = components.pipeline.media.extract
+    attempts = []
+    def extract(url, workspace, progress, event):
+        assert list(workspace.iterdir()) == []
+        attempts.append(workspace)
+        if len(attempts) == 1:
+            (workspace / "partial").write_bytes(b"partial")
+            raise MediaProtectedError("safe")
+        return original(url, workspace, progress, event)
+    components.pipeline.media.extract = extract
+    components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert components.calls.count("hls") == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_protected_access_fails_explicitly_after_one_renewal(components, tmp_path):
+    components.settings.bunny_token_auth_key = "TEST_ONLY"
+    components.error = "media", MediaProtectedError("safe")
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert caught.value.code == "protected_video"
+    assert components.calls.count("media") == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_metadata_retry_exhaustion_never_reads_hls(components, monkeypatch):
+    from app.bunny import BunnyServerError
+    components.error = "metadata", BunnyServerError("safe")
+    monkeypatch.setattr(components.event, "wait", lambda delay: False)
+    with pytest.raises(PipelineError):
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert components.calls == ["metadata", "metadata", "metadata"]
+
+
+def test_failed_bounded_media_is_cleaned_before_next_queued_job(components, tmp_path):
+    import sys
+    from app.media import _run_process
+    from app.jobs import JobStore, SingleWorkerRunner, JobState
+    original = components.pipeline.media.extract
+    attempts = []
+    def extract(url, workspace, progress, event):
+        attempts.append(workspace)
+        if len(attempts) == 1:
+            (workspace / "partial.m4a").write_bytes(b"partial")
+            _run_process([sys.executable, "-c", "import time; time.sleep(5)"], event, lambda *_: None,
+                         workspace=workspace, runtime_seconds=.2)
+        assert not attempts[0].exists()
+        return original(url, workspace, progress, event)
+    components.pipeline.media.extract = extract
+    def run(source, progress, event):
+        components.event = event
+        return components.pipeline.run(source, progress, event)
+    store = JobStore()
+    runner = SingleWorkerRunner(store, run)
+    first, second = store.create(SOURCE), store.create(SOURCE)
+    try:
+        one, two = runner.submit(first.id), runner.submit(second.id)
+        one.result(timeout=3)
+        two.result(timeout=3)
+        assert store.get(first.id).state == JobState.FAILED
+        assert store.get(second.id).state == JobState.COMPLETED
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        runner.shutdown(wait=True)
+
+
+def test_worker_refetch_rejects_video_that_became_unready(components):
+    components.metadata.status = 2
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None)
+    assert caught.value.code == "not_ready"
+    assert components.calls == ["metadata"]
+
+
+def test_video_without_low_resolution_is_rejected_before_hls(components):
+    components.metadata.available_resolutions = [1080, 2160]
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None)
+    assert caught.value.code == "unsupported_media"
+    assert components.calls == ["metadata"]

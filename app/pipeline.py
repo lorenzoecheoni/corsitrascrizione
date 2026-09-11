@@ -1,19 +1,21 @@
 """Connect ephemeral media and AI stages without retaining source artifacts."""
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from concurrent.futures import CancelledError
 from pathlib import Path
 from threading import Event
 from time import monotonic
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
-from app.bunny import BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError, parse_bunny_url
+from app.bunny import (BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError,
+                       BunnyPlaybackError, BunnyReadinessError, parse_bunny_url, read_metadata)
 from app.config import Settings
 from app.costs import estimate_cost
 from app.jobs import JobCancelled
 from app.logging_config import log_event
 from app.media import FFmpegProcessor, MediaError, MediaProtectedError, temporary_workspace
-from app.models import AcademyReport
+from app.models import AcademyReport, APIUsage, ProviderUsage
 from app.transcription import OpenAITranscriber, TranscriptionError
 
 
@@ -27,6 +29,9 @@ _MESSAGES = {
     "transcription": "Trascrizione non riuscita; verifica la configurazione OpenAI e riprova",
     "analysis": "Analisi non riuscita; verifica la configurazione OpenAI e riprova",
     "temporary_failure": "Servizio temporaneamente non disponibile; riprova più tardi",
+    "not_ready": "Video ancora in elaborazione su Bunny; attendere la fine della codifica",
+    "encoding_failed": "Codifica o caricamento Bunny fallito; verificare il video nella libreria",
+    "unsupported_media": "Formato o risoluzioni Bunny non supportati; verificare la codifica HLS",
 }
 
 
@@ -88,19 +93,28 @@ class AnalysisPipeline:
             ref = parse_bunny_url(source_url, expected_library_id=self.settings.bunny_library_id,
                                   cdn_hostname=self.settings.bunny_cdn_hostname)
             next_phase("metadata")
-            metadata = self.bunny.get_metadata(str(ref.video_id))
+            metadata = read_metadata(self.bunny, str(ref.video_id), event)
             progress(5, "Metadati letti")
             if metadata.duration_seconds > 14_400:
                 raise PipelineError("unsupported_duration")
-            with temporary_workspace(self.temp_root) as workspace:
+            with ExitStack() as workspaces:
                 next_phase("media")
                 progress(10, "Estrazione audio e immagini")
                 def media_progress(seconds: float) -> None:
                     fraction = min(1, max(0, seconds / max(1, metadata.duration_seconds)))
                     progress(10 + int(35 * fraction), "Estrazione audio e immagini")
 
-                media = self.media.extract(self.bunny.build_hls_url(str(ref.video_id)),
-                                           workspace, media_progress, event)
+                for attempt in range(2):
+                    workspace = workspaces.enter_context(temporary_workspace(self.temp_root))
+                    try:
+                        url = self.bunny.select_hls_url(metadata, cancellation_event=event)
+                        media = self.media.extract(url, workspace, media_progress, event)
+                        break
+                    except (MediaProtectedError, BunnyPlaybackError):
+                        workspaces.close()
+                        check_cancelled()
+                        if attempt or not self.settings.bunny_token_auth_key:
+                            raise PipelineError("protected_video") from None
                 progress(45, "Audio e immagini pronti")
                 progress(50, "Trascrizione e distinzione dei relatori")
                 next_phase("transcription")
@@ -113,8 +127,10 @@ class AnalysisPipeline:
                 progress(85, "Analisi completata")
                 progress(88, "Preparazione del report")
                 next_phase("report")
-                report = AcademyReport(**content.model_dump(),
-                                       cost=estimate_cost(metadata.duration_seconds, media.downloaded_bytes))
+                usage = APIUsage(transcription=transcript.usage,
+                                 responses=getattr(content, "usage", ProviderUsage()))
+                report = AcademyReport(**content.model_dump(exclude={"usage"}), bunny_title=metadata.title,
+                    usage=usage, cost=estimate_cost(metadata.duration_seconds, media.downloaded_bytes, usage=usage))
                 # No transcript or media references escape this method.
                 del transcript
                 progress(98, "Report pronto; pulizia dei file temporanei")
@@ -133,6 +149,8 @@ class AnalysisPipeline:
                 code = "invalid_link"
             elif isinstance(exc, BunnyAuthError):
                 code = "bunny_auth"
+            elif isinstance(exc, BunnyReadinessError):
+                code = exc.code
             elif isinstance(exc, BunnyNotFoundError):
                 code = "not_found"
             elif isinstance(exc, MediaProtectedError):

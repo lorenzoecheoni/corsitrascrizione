@@ -1,6 +1,7 @@
 from pathlib import Path
 from threading import Event
 from uuid import uuid4
+import re
 
 from fastapi.testclient import TestClient
 import pytest
@@ -10,6 +11,7 @@ from app.jobs import JobState
 from app.main import create_app
 from app.models import AcademyReport
 from app.pipeline import AnalysisPipeline
+from app.bunny import BunnyVideoMetadata
 
 
 AUTH = ("team", "team-secret")
@@ -26,14 +28,19 @@ def client(monkeypatch):
     app = create_app(Settings(bunny_library_id=123, bunny_stream_api_key="bunny-secret",
         bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
         app_password="team-secret", _env_file=None))
+    app.state.bunny.get_metadata = lambda video_id: BunnyVideoMetadata(video_id=video_id,
+        title="Corso di prova", duration_seconds=3600, status=3, available_resolutions=[240, 720])
     with TestClient(app) as client:
+        client.headers["X-CSRF-Token"] = app.state.csrf_token
         yield client
         finished.set()
     app.state.runner.shutdown(wait=True)
 
 
 def test_create_job_redirects_and_can_be_reopened_without_exposing_source(client):
-    response = client.post("/jobs", data={"source_url": SOURCE}, auth=AUTH, follow_redirects=False)
+    preview = client.post("/preview", data={"source_url": SOURCE}, auth=AUTH)
+    confirmation = re.search(r'name="confirmation" value="([^"]+)"', preview.text)[1]
+    response = client.post("/jobs", data={"confirmation": confirmation}, auth=AUTH, follow_redirects=False)
     assert response.status_code == 303
     location = response.headers["location"]
     assert location.startswith("/jobs/")
@@ -46,7 +53,7 @@ def test_create_job_redirects_and_can_be_reopened_without_exposing_source(client
 
 
 def test_invalid_link_is_rejected_before_enqueue(client):
-    response = client.post("/jobs", data={"source_url": "https://evil.example"}, auth=AUTH)
+    response = client.post("/preview", data={"source_url": "https://evil.example"}, auth=AUTH)
     assert response.status_code == 422
     assert "evil.example" not in response.text
 

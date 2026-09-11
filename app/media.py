@@ -8,6 +8,7 @@ FFmpeg diagnostics are consumed privately and never logged or included in errors
 from collections.abc import Callable, Iterator
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
+from contextvars import ContextVar
 import csv
 from dataclasses import dataclass
 import json
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 from threading import Event
+from time import monotonic
 
 import imagehash
 from PIL import Image
@@ -58,6 +60,17 @@ class MediaProtectedError(MediaError):
     """FFmpeg encountered an authorization or unsupported protection failure."""
 
 
+@dataclass(frozen=True)
+class MediaLimits:
+    workspace: Path
+    deadline: float
+    inactivity_seconds: float
+    max_workspace_bytes: int
+
+
+_active_limits: ContextVar[MediaLimits | None] = ContextVar("media_limits", default=None)
+
+
 @contextmanager
 def temporary_workspace(root: Path | None = None) -> Iterator[Path]:
     workspace = Path(tempfile.mkdtemp(prefix="bunny-video-", dir=root))
@@ -70,7 +83,7 @@ def temporary_workspace(root: Path | None = None) -> Iterator[Path]:
 def deduplicate_frames(
     candidates: list[FrameCandidate], cancellation_event: Event | None = None,
 ) -> list[FrameCandidate]:
-    """Globally deduplicate slides by pHash (distance <= 8), with a 2s gap.
+    """Deduplicate consecutive visual states by pHash, with a 2s gap.
 
     pHash measures structure, so flat screens differing only in color may merge.
     More than 600 surviving frames are sampled uniformly, including both ends.
@@ -84,7 +97,7 @@ def deduplicate_frames(
             continue
         with Image.open(candidate.path) as image:
             fingerprint = imagehash.phash(image)
-        if any(fingerprint - previous <= 8 for previous in hashes):
+        if hashes and fingerprint - hashes[-1] <= 8:
             continue
         kept.append(candidate)
         hashes.append(fingerprint)
@@ -110,13 +123,45 @@ def _stop_process(process: subprocess.Popen) -> None:
             process.wait()
 
 
-def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], None]) -> None:
+def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], None], *,
+                 workspace: Path | None = None, runtime_seconds: float = 21600,
+                 inactivity_seconds: float = 120, max_workspace_bytes: int = 2_000_000_000) -> None:
     """Drain both pipes without blocking cancellation on a stalled input.
 
     Selectors support our macOS/Linux hosts. Bounded buffers discard overlong
     diagnostic lines; we only parse short numeric FFmpeg records.
     """
     _check_cancelled(event)
+    limits = _active_limits.get()
+    deadline = monotonic() + runtime_seconds
+    if limits:
+        workspace, deadline = limits.workspace, limits.deadline
+        inactivity_seconds, max_workspace_bytes = limits.inactivity_seconds, limits.max_workspace_bytes
+    last_activity = monotonic()
+    last_size = 0
+    last_progress = -1
+
+    def check_limits() -> None:
+        nonlocal last_activity, last_size
+        now = monotonic()
+        if now > deadline:
+            raise MediaError("Tempo massimo di elaborazione media superato")
+        if workspace is not None:
+            size = 0
+            for root, _, files in os.walk(workspace):
+                for filename in files:
+                    try:
+                        size += (Path(root) / filename).stat().st_size
+                    except FileNotFoundError:
+                        continue
+                    if size > max_workspace_bytes:
+                        raise MediaError("Limite dello spazio temporaneo superato")
+            if size != last_size:
+                last_size, last_activity = size, now
+        if now - last_activity > inactivity_seconds:
+            raise MediaError("Elaborazione media interrotta per inattività")
+
+    check_limits()
     try:
         process = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -128,7 +173,14 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
     protected = False
 
     def consume(name: str, line: str) -> None:
-        nonlocal protected
+        nonlocal protected, last_progress, last_activity
+        if name == "stdout" and line.startswith("out_time_us="):
+            try:
+                progress = int(line.split("=", 1)[1])
+                if progress > last_progress:
+                    last_progress, last_activity = progress, monotonic()
+            except ValueError:
+                pass
         if name == "stderr" and re.search(
             r"\b(?:forbidden|unauthorized|drm|sample-aes)\b|"
             r"(?:http error|server returned)\s+(?:401|403)\b|"
@@ -145,6 +197,7 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
                 selector.register(pipe, selectors.EVENT_READ, name)
             while selector.get_map():
                 _check_cancelled(event)
+                check_limits()
                 for key, _ in selector.select(timeout=.1):
                     data = os.read(key.fd, 65536)
                     name = key.data
@@ -160,8 +213,10 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
                             consume(name, line.decode("utf-8", "replace"))
             while process.poll() is None:
                 _check_cancelled(event)
+                check_limits()
                 event.wait(.1)
             _check_cancelled(event)
+            check_limits()
             if process.returncode:
                 if protected:
                     raise MediaProtectedError("Accesso al video negato o protezione non supportata")
@@ -177,15 +232,28 @@ _INPUT_BYTES = re.compile(r"Input stream #0:\d+.*?\d+ packets read \((\d+) bytes
 
 
 class FFmpegProcessor:
-    def __init__(self, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> None:
+    def __init__(self, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe", *,
+                 runtime_seconds: float = 21600, inactivity_seconds: float = 120,
+                 max_workspace_bytes: int = 2_000_000_000) -> None:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
+        self.runtime_seconds = runtime_seconds
+        self.inactivity_seconds = inactivity_seconds
+        self.max_workspace_bytes = max_workspace_bytes
 
     def extract(
         self, source_url: str, workspace: Path,
         progress_callback: Callable[[float], None], cancellation_event: Event,
     ) -> MediaArtifacts:
         """Decode the source once; all later probes operate on local outputs."""
+        token = _active_limits.set(MediaLimits(workspace, monotonic() + self.runtime_seconds,
+                                              self.inactivity_seconds, self.max_workspace_bytes))
+        try:
+            return self._extract(source_url, workspace, progress_callback, cancellation_event)
+        finally:
+            _active_limits.reset(token)
+
+    def _extract(self, source_url, workspace, progress_callback, cancellation_event) -> MediaArtifacts:
         _check_cancelled(cancellation_event)
         output = Path(tempfile.mkdtemp(prefix="media-", dir=workspace))
         timestamps: dict[int, float] = {}

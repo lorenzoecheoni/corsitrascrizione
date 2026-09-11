@@ -7,6 +7,7 @@
   const pollError = document.getElementById("poll-error");
   let timer;
   let stopped = false;
+  let generation = 0;
 
   function render(data) {
     job.dataset.state = data.state;
@@ -25,8 +26,10 @@
 
   async function poll() {
     if (stopped) return;
+    const current = generation;
     try {
       const response = await fetch(`/api/jobs/${job.dataset.jobId}`, {cache: "no-store"});
+      if (stopped || current !== generation) return;
       if (response.status === 401 || response.status === 404) {
         pollError.textContent = response.status === 401
           ? "Accesso scaduto. Ricarica la pagina per autenticarti."
@@ -36,13 +39,16 @@
         return;
       }
       if (!response.ok) throw new Error("poll");
-      render(await response.json());
+      const data = await response.json();
+      if (stopped || current !== generation) return;
+      render(data);
       pollError.hidden = true;
     } catch {
+      if (stopped || current !== generation) return;
       pollError.textContent = "Connessione interrotta. Nuovo tentativo tra tre secondi.";
       pollError.hidden = false;
     }
-    if (!stopped && !terminal.has(job.dataset.state)) timer = setTimeout(poll, 3000);
+    if (!stopped && current === generation && !terminal.has(job.dataset.state)) timer = setTimeout(poll, 3000);
   }
 
   document.getElementById("copy-report").addEventListener("click", async () => {
@@ -60,9 +66,11 @@
     }
   });
   document.getElementById("print-report").addEventListener("click", () => window.print());
-  window.addEventListener("pagehide", () => { stopped = true; clearTimeout(timer); });
+  window.addEventListener("pagehide", () => { generation++; stopped = true; clearTimeout(timer); });
   window.addEventListener("pageshow", (event) => {
     if (event.persisted) {
+      generation++;
+      clearTimeout(timer);
       stopped = false;
       if (!terminal.has(job.dataset.state)) poll();
     }

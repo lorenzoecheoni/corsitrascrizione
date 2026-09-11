@@ -9,7 +9,8 @@ import hashlib
 import hmac
 import re
 import time
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urljoin
+from threading import Event, Lock
 from uuid import UUID
 
 import httpx
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings
 from app.logging_config import log_event
+from app.retry import check_cancelled, retry_remote
 
 
 class BunnyError(Exception):
@@ -43,6 +45,21 @@ class BunnyNotFoundError(BunnyError):
 
 class BunnyResponseError(BunnyError):
     pass
+
+
+class BunnyPlaybackError(BunnyError):
+    """Safe access failure eligible for one playback-token regeneration."""
+
+
+class BunnyReadinessError(BunnyError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__({
+            "not_ready": "Video ancora in elaborazione su Bunny; attendere la fine della codifica",
+            "encoding_failed": "Codifica o caricamento Bunny fallito; verificare il video nella libreria",
+            "unsupported_media": "Formato o risoluzioni Bunny non supportati; verificare la codifica HLS",
+            "unsupported_duration": "Durata non supportata; il limite è quattro ore",
+        }[code])
 
 
 class BunnyRateLimitError(BunnyError):
@@ -72,6 +89,27 @@ class BunnyVideoMetadata(BaseModel):
     duration_seconds: float = Field(ge=0, allow_inf_nan=False)
     captions: list[dict[str, object]] = Field(default_factory=list)
     chapters: list[dict[str, object]] = Field(default_factory=list)
+    status: int | None = None
+    available_resolutions: list[int] = Field(default_factory=list)
+    description: str | None = None
+
+    def require_ready(self) -> None:
+        if self.status in {5, 8}:
+            raise BunnyReadinessError("encoding_failed")
+        if self.status in {0, 1, 2, 6, 7}:
+            raise BunnyReadinessError("not_ready")
+        if self.status not in {3, 4} or not any(0 < resolution <= 720 for resolution in self.available_resolutions):
+            raise BunnyReadinessError("unsupported_media")
+        if not 0 < self.duration_seconds <= 14_400:
+            raise BunnyReadinessError("unsupported_duration")
+
+
+def read_metadata(client: "BunnyClient", video_id: str, event: Event | None = None) -> BunnyVideoMetadata:
+    metadata = retry_remote(lambda: client.get_metadata(video_id),
+        retryable=lambda exc: isinstance(exc, BunnyError) and exc.retryable,
+        cancellation_event=event)
+    metadata.require_ready()
+    return metadata
 
 
 _UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
@@ -159,6 +197,8 @@ def build_cdn_token_url(
 class BunnyClient:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        self._token_lock = Lock()
+        self._last_token_expiry = 0
 
     def get_metadata(self, video_id: str | UUID) -> BunnyVideoMetadata:
         """Perform one GET. Errors contain no raw upstream data or credentials."""
@@ -195,12 +235,21 @@ class BunnyClient:
 
         try:
             payload = response.json()
+            resolutions = payload.get("availableResolutions") or ""
+            if not isinstance(resolutions, str):
+                raise ValueError
+            supported = {240, 360, 480, 720, 1080, 1440, 2160}
+            resolutions = sorted({int(item.strip().removesuffix("p")) for item in resolutions.split(",") if item.strip()})
+            if not set(resolutions) <= supported:
+                raise ValueError
             metadata = BunnyVideoMetadata(
                 video_id=payload["guid"],
                 title=payload["title"],
                 duration_seconds=payload["length"],
-                captions=payload.get("captions", []),
-                chapters=payload.get("chapters", []),
+                captions=payload.get("captions") or [],
+                chapters=payload.get("chapters") or [],
+                status=payload.get("status"), available_resolutions=resolutions,
+                description=payload.get("description"),
             )
         except (ValueError, KeyError, TypeError, ValidationError):
             raise BunnyResponseError("Metadati Bunny non validi", status_code=status) from None
@@ -208,16 +257,79 @@ class BunnyClient:
             raise BunnyResponseError("I metadati Bunny non corrispondono al video richiesto", status_code=status)
         return metadata
 
+    def select_hls_url(self, metadata: BunnyVideoMetadata, *, cancellation_event: Event | None = None) -> str:
+        """Read only the bounded master manifest and choose its lowest variant.
+
+        The media remains a single FFmpeg source read. Resolve relative URIs
+        within the same signed video directory; never forward API credentials.
+        """
+        metadata.require_ready()
+        url = self.build_hls_url(metadata.video_id)
+
+        def manifest() -> str:
+            check_cancelled(cancellation_event)
+            try:
+                with httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False) as client:
+                    with client.stream("GET", url) as response:
+                        if response.status_code in {401, 403}:
+                            raise BunnyPlaybackError("Accesso al flusso Bunny negato")
+                        if response.status_code == 429 or response.status_code >= 500:
+                            raise BunnyServerError("Flusso Bunny temporaneamente non disponibile")
+                        if response.status_code != 200:
+                            raise BunnyResponseError("Playlist Bunny non disponibile")
+                        body = bytearray()
+                        for chunk in response.iter_bytes(16384):
+                            check_cancelled(cancellation_event)
+                            body.extend(chunk)
+                            if len(body) > 1_000_000:
+                                raise BunnyResponseError("Playlist Bunny troppo grande")
+                        return body.decode("utf-8")
+            except httpx.TimeoutException:
+                raise BunnyTimeoutError("Bunny non ha risposto entro il tempo previsto") from None
+            except (httpx.RequestError, UnicodeError):
+                raise BunnyResponseError("Playlist Bunny non valida") from None
+
+        playlist = retry_remote(manifest, retryable=lambda exc: isinstance(exc, BunnyError) and exc.retryable,
+                                cancellation_event=cancellation_event)
+        variants = []
+        attributes = None
+        base = url.rsplit("/", 1)[0] + "/"
+        for line in playlist.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-STREAM-INF:"):
+                attributes = line
+            elif line and not line.startswith("#") and attributes:
+                resolution = re.search(r"(?:[:,])RESOLUTION=\d+x(\d+)(?:,|$)", attributes)
+                bandwidth = re.search(r"(?:[:,])BANDWIDTH=(\d+)(?:,|$)", attributes)
+                if (resolution and bandwidth and int(resolution[1]) <= 720
+                        and int(resolution[1]) in metadata.available_resolutions):
+                    candidate = urljoin(base, line)
+                    decoded = unquote(line)
+                    if (urlsplit(line).scheme or line.startswith("/") or "\\" in decoded
+                            or ".." in decoded.split("/") or not candidate.startswith(base)
+                            or not urlsplit(candidate).path.endswith(".m3u8")):
+                        raise BunnyResponseError("Percorso playlist Bunny non valido")
+                    if "AUDIO=" in attributes:
+                        raise BunnyReadinessError("unsupported_media")
+                    variants.append((int(resolution[1]), int(bandwidth[1]), candidate))
+                attributes = None
+        if not variants:
+            raise BunnyReadinessError("unsupported_media")
+        return min(variants)[2]
+
     def build_hls_url(self, video_id: str | UUID) -> str:
         """Regenerate playback exclusively from configured host, key, and video ID."""
         validated_id = _video_uuid(video_id)
         hostname = _cdn_hostname(self._settings.bunny_cdn_hostname)
         key = self._settings.bunny_token_auth_key
         if key:
+            with self._token_lock:
+                expires = max(int(time.time()) + 3600, self._last_token_expiry + 1)
+                self._last_token_expiry = expires
             return build_cdn_token_url(
                 hostname=hostname,
                 video_id=validated_id,
                 key=key,
-                expires=int(time.time()) + 3600,
+                expires=expires,
             )
         return f"https://{hostname}/{validated_id}/playlist.m3u8"

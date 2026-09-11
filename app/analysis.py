@@ -16,15 +16,16 @@ from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
 from app.models import (
     AcademyContent, Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
-    ReportModel, SlideChange,
+    ReportModel, SlideChange, AnalysisResult, ProviderUsage, Nonnegative,
 )
 from app.prompts import REPORT_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT
 from app.retry import check_cancelled, retry_remote
 from app.transcription import TranscriptionResult
+from app.usage import record_usage
 
 
 class ClassifiedFrame(ReportModel):
-    timestamp_seconds: float
+    timestamp_seconds: Nonnegative
     kind: Literal["slide", "camera_change", "uncertain"]
     title: str | None = None
     visible_content: list[str] = Field(default_factory=list, repr=False)
@@ -163,7 +164,7 @@ class OpenAIAnalyzer:
     def _structured(
         self, *, text_format: type[T], instructions: str, payload: str | list,
         prepare: Callable[[dict], None], validate: Callable[[T], list[str]],
-        cancellation_event: Event | None,
+        cancellation_event: Event | None, usage: ProviderUsage,
     ) -> T:
         attempts = 0
         for repair in range(2):
@@ -179,8 +180,10 @@ class OpenAIAnalyzer:
                 except CancelledError:
                     raise
                 except Exception as exc:
+                    record_usage(usage, exc)
                     check_cancelled(cancellation_event)
                     raise _remote_error(exc) from None
+                record_usage(usage, response)
                 check_cancelled(cancellation_event)
                 return response
 
@@ -215,8 +218,9 @@ class OpenAIAnalyzer:
     def analyze(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
         frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
-    ) -> AcademyContent:
+    ) -> AnalysisResult:
         check_cancelled(cancellation_event)
+        usage = ProviderUsage()
         timestamps = [frame.timestamp_seconds for frame in frames]
         if (any(not _valid_time(value, metadata.duration_seconds) for value in timestamps)
                 or timestamps != sorted(set(timestamps))):
@@ -241,7 +245,7 @@ class OpenAIAnalyzer:
                 classified = self._structured(
                     text_format=SlideBatchResult, instructions=VISUAL_PROMPT,
                     payload=[{"role": "user", "content": parts}], prepare=lambda data: None,
-                    validate=validate_batch, cancellation_event=cancellation_event,
+                    validate=validate_batch, cancellation_event=cancellation_event, usage=usage,
                 )
             except OSError:
                 raise AnalysisError("frames") from None
@@ -271,7 +275,7 @@ class OpenAIAnalyzer:
         result = self._structured(
             text_format=AcademyContent, instructions=REPORT_PROMPT, payload=payload,
             prepare=prepare_content, validate=lambda content: _content_errors(content, metadata.duration_seconds),
-            cancellation_event=cancellation_event,
+            cancellation_event=cancellation_event, usage=usage,
         )
         check_cancelled(cancellation_event)
-        return result
+        return AnalysisResult(**result.model_dump(), usage=usage)

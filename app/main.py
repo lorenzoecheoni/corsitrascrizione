@@ -102,7 +102,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if path.startswith("/api/"):
                 return JSONResponse({"detail": "Richiesta non autorizzata"}, status_code=401)
             return RedirectResponse("/login", status_code=303)
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        # The login form has no authenticated session yet. Some embedded browsers
+        # omit Origin and report Sec-Fetch-Site=cross-site, so authenticate it
+        # directly with the fixed team credentials. Every post-login mutation
+        # remains protected by the checks below.
+        login_submission = request.method == "POST" and path == "/login"
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not login_submission:
             origin = request.headers.get("origin")
             same_origin = f"{request.url.scheme}://{request.url.netloc}"
             if (origin is not None):

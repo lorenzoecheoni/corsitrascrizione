@@ -52,7 +52,6 @@ def test_healthcheck_is_public(client: TestClient) -> None:
 def test_invalid_login_does_not_issue_a_session_cookie(client: TestClient) -> None:
     response = client.post("/login", data={
         "username": "team", "password": "wrong-password",
-        "csrf_token": client.app.state.csrf_token,
     }, follow_redirects=False)
 
     assert response.status_code == 401
@@ -152,13 +151,27 @@ def test_exact_origin_and_valid_csrf_override_in_app_cross_site_hint(client: Tes
     assert response.headers["location"] == "/"
 
 
-def test_cross_site_without_origin_stays_rejected_with_valid_csrf(client: TestClient) -> None:
+def test_login_accepts_correct_credentials_without_origin_or_csrf(client: TestClient) -> None:
     response = client.post("/login", data={
         "username": "team", "password": "team-secret",
-        "csrf_token": client.app.state.csrf_token,
     }, headers={"Sec-Fetch-Site": "cross-site"}, follow_redirects=False)
 
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert f"{SESSION_COOKIE}=" in response.headers["set-cookie"]
+
+
+def test_authenticated_actions_remain_protected_without_origin_or_csrf(client: TestClient) -> None:
+    login(client)
+
+    response = client.post(
+        "/logout",
+        headers={"Sec-Fetch-Site": "cross-site"},
+        follow_redirects=False,
+    )
+
     assert response.status_code == 403
+    assert client.get("/").status_code == 200
 
 
 def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
@@ -170,10 +183,15 @@ def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
         response = browser.post("/login", data=data, headers=headers, follow_redirects=False)
         assert response.status_code == 303
         assert "Secure" in response.headers["set-cookie"]
+        session_cookie = response.cookies[SESSION_COOKIE]
         headers["Origin"] = "https://attacker.example"
-        assert browser.post("/login", data=data, headers=headers).status_code == 403
-    # An untrusted direct caller cannot change the origin scheme with this header.
+        headers["Cookie"] = f"{SESSION_COOKIE}={session_cookie}"
+        assert browser.post("/logout", data=data, headers=headers, follow_redirects=False).status_code == 403
+    # An untrusted direct caller cannot change the scheme used for origin checks.
     with TestClient(proxy, base_url="http://reports.example", client=("192.0.2.1", 12345)) as direct:
         headers["Origin"] = "https://reports.example"
-        assert direct.post("/login", data=data, headers=headers).status_code == 403
+        response = direct.post("/login", data=data, headers=headers, follow_redirects=False)
+        assert response.status_code == 303
+        headers["Cookie"] = f"{SESSION_COOKIE}={response.cookies[SESSION_COOKIE]}"
+        assert direct.post("/logout", data=data, headers=headers, follow_redirects=False).status_code == 403
     app.state.runner.shutdown(wait=True)

@@ -7,7 +7,6 @@
     <h1 id="login-title">Spazio di lavoro Bunny</h1>
     <p class="muted">Accedi per consultare il catalogo e preparare i report del team.</p>
     <form action="/login" method="post" class="panel stack">
-      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
       <div>
         <label for="username">Utente</label>
         <input id="username" name="username" type="text" required autocomplete="username">

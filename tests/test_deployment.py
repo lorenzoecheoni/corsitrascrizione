@@ -9,6 +9,7 @@ import pytest
 from uvicorn import Config
 from uvicorn.main import main as uvicorn_command
 
+from app.auth import SESSION_COOKIE
 from app.config import Settings
 from app.main import create_app
 
@@ -46,7 +47,7 @@ def test_container_explicitly_enables_proxy_headers_with_bounded_allowlist(conta
 
 
 @pytest.mark.parametrize("peer", ["127.0.0.1", "100.64.0.42", "100.255.0.1"])
-def test_container_login_accepts_https_from_trusted_proxy_and_rejects_wrong_origin(container_proxy, peer):
+def test_container_accepts_https_from_trusted_proxy_and_protects_mutations(container_proxy, peer):
     app, config, _ = container_proxy
     with TestClient(config.loaded_app, base_url="http://reports.example", client=(peer, 12345)) as browser:
         data = {"username": "team", "password": "team-secret", "csrf_token": app.state.csrf_token}
@@ -55,16 +56,21 @@ def test_container_login_accepts_https_from_trusted_proxy_and_rejects_wrong_orig
         assert response.status_code == 303
         assert response.headers["location"] == "/"
         assert "Secure" in response.headers["set-cookie"]
+        headers["Cookie"] = f"{SESSION_COOKIE}={response.cookies[SESSION_COOKIE]}"
         headers["Origin"] = "https://attacker.example"
-        assert browser.post("/login", data=data, headers=headers).status_code == 403
+        assert browser.post("/logout", data=data, headers=headers, follow_redirects=False).status_code == 403
 
 
 @pytest.mark.parametrize("peer", ["192.0.2.1", "99.255.255.254", "101.0.0.1"])
-def test_container_rejects_spoofed_https_from_peers_outside_allowlist(container_proxy, peer):
+def test_container_rejects_spoofed_https_for_mutations_outside_allowlist(container_proxy, peer):
     app, config, _ = container_proxy
     with TestClient(config.loaded_app, base_url="http://reports.example", client=(peer, 12345)) as browser:
-        response = browser.post("/login", data={
+        data = {
             "username": "team", "password": "team-secret", "csrf_token": app.state.csrf_token,
-        }, headers={"X-Forwarded-Proto": "https", "Origin": "https://reports.example"})
+        }
+        headers = {"X-Forwarded-Proto": "https", "Origin": "https://reports.example"}
+        response = browser.post("/login", data=data, headers=headers, follow_redirects=False)
+        assert response.status_code == 303
+        headers["Cookie"] = f"{SESSION_COOKIE}={response.cookies[SESSION_COOKIE]}"
+        response = browser.post("/logout", data=data, headers=headers, follow_redirects=False)
         assert response.status_code == 403
-        assert "set-cookie" not in response.headers

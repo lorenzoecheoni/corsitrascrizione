@@ -105,8 +105,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
             same_origin = f"{request.url.scheme}://{request.url.netloc}"
-            if ((origin is not None and origin != same_origin)
-                    or request.headers.get("sec-fetch-site") == "cross-site"):
+            if (origin is not None):
+                cross_site = origin != same_origin
+            else:
+                cross_site = request.headers.get("sec-fetch-site") == "cross-site"
+            if cross_site:
                 return JSONResponse({"detail": "Richiesta non autorizzata"}, status_code=403)
             supplied = request.headers.get("x-csrf-token", "")
             if not supplied:

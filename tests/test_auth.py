@@ -139,6 +139,28 @@ def test_login_marks_cookie_secure_for_forwarded_https(client: TestClient) -> No
     assert "Secure" in response.headers["set-cookie"]
 
 
+def test_exact_origin_and_valid_csrf_override_in_app_cross_site_hint(client: TestClient) -> None:
+    response = client.post("/login", data={
+        "username": "team", "password": "team-secret",
+        "csrf_token": client.app.state.csrf_token,
+    }, headers={
+        "Origin": "http://testserver",
+        "Sec-Fetch-Site": "cross-site",
+    }, follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+
+
+def test_cross_site_without_origin_stays_rejected_with_valid_csrf(client: TestClient) -> None:
+    response = client.post("/login", data={
+        "username": "team", "password": "team-secret",
+        "csrf_token": client.app.state.csrf_token,
+    }, headers={"Sec-Fetch-Site": "cross-site"}, follow_redirects=False)
+
+    assert response.status_code == 403
+
+
 def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
     app = create_app(settings())
     proxy = ProxyHeadersMiddleware(app, trusted_hosts=["127.0.0.1"])

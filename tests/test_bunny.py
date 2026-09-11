@@ -115,6 +115,24 @@ def test_list_videos_returns_an_empty_catalog_after_its_first_page(settings) -> 
 
 
 @respx.mock
+def test_list_videos_treats_empty_collection_id_as_no_collection(settings) -> None:
+    route = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200,
+        json=catalog_page(
+            [catalog_item(VIDEO_ID, collectionId="")],
+            total=1,
+            page=1,
+        ),
+    )
+
+    result = BunnyClient(settings).list_videos()
+
+    assert len(result.videos) == 1
+    assert result.videos[0].collection_id is None
+    assert route.call_count == 1
+
+
+@respx.mock
 @pytest.mark.parametrize("payload", [
     catalog_page([catalog_item(VIDEO_ID)], total=2, page=2),
     catalog_page([catalog_item(VIDEO_ID)], total=2, page=1, per_page=-1),
@@ -174,6 +192,7 @@ def test_list_videos_does_not_allow_callers_to_raise_the_global_catalog_limit(se
     {"length": -0.01},
     {"length": "NaN"},
     {"dateUploaded": "not-a-date"},
+    {"collectionId": "not-a-uuid"},
     {"thumbnailFileName": "../secret.jpg"},
 ])
 def test_list_videos_redacts_invalid_provider_item_fields(settings, overrides, caplog) -> None:

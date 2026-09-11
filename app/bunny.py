@@ -356,6 +356,9 @@ class BunnyClient:
                     if not isinstance(item, dict):
                         raise ValueError
                     filename = item.get("thumbnailFileName")
+                    collection_id = item.get("collectionId")
+                    if collection_id == "":
+                        collection_id = None
                     video = BunnyCatalogVideo(
                         video_id=item["guid"],
                         title=item["title"],
@@ -363,7 +366,7 @@ class BunnyClient:
                         status=item.get("status"),
                         description=item.get("description"),
                         uploaded_at=item.get("dateUploaded"),
-                        collection_id=item.get("collectionId"),
+                        collection_id=collection_id,
                         thumbnail_file_name=filename,
                         thumbnail_url=(self.build_thumbnail_url(item["guid"], filename) if filename is not None else None),
                     )

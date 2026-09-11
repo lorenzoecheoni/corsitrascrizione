@@ -358,19 +358,22 @@ def test_hls_timestamps_are_relative_to_video_start_and_segments_read_once(
         server_thread.join(timeout=2)
 
 
-def test_long_audio_segments_keep_offsets_and_stay_within_5400_seconds(tmp_path, media_tools) -> None:
+def test_long_audio_segments_keep_offsets_and_stay_within_transcription_target(tmp_path, media_tools) -> None:
     source = tmp_path / "long.mp4"
     subprocess.run([
-        media_tools[0], "-v", "error", "-f", "lavfi", "-i", "color=blue:s=32x32:r=1:d=5401",
-        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=5401",
+        media_tools[0], "-v", "error", "-f", "lavfi", "-i", "color=blue:s=32x32:r=1:d=601",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=601",
         "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "24k", str(source),
     ], check=True, capture_output=True)
     with temporary_workspace(tmp_path) as workspace:
         result = FFmpegProcessor(*media_tools).extract(str(source), workspace, lambda _: None, Event())
         assert len(result.audio_chunks) >= 2
-        assert all(c.duration_seconds <= 5400 and c.path.stat().st_size < 25_000_000 for c in result.audio_chunks)
-        assert sum(c.duration_seconds for c in result.audio_chunks) == pytest.approx(5401, abs=1)
+        assert all(
+            c.duration_seconds <= 601 and c.path.stat().st_size < 25_000_000
+            for c in result.audio_chunks
+        )
+        assert sum(c.duration_seconds for c in result.audio_chunks) == pytest.approx(601, abs=1)
         assert result.audio_chunks[0].start_seconds == 0
         for first, second in zip(result.audio_chunks, result.audio_chunks[1:]):
             assert second.start_seconds == pytest.approx(first.start_seconds + first.duration_seconds, abs=.13)
-        assert result.audio_chunks[-1].start_seconds >= 5399.9
+        assert result.audio_chunks[-1].start_seconds >= 599.9

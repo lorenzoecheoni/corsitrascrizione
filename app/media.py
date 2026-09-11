@@ -27,6 +27,11 @@ import imagehash
 from PIL import Image
 
 
+_TRANSCRIPTION_SEGMENT_SECONDS = 600
+_OPENAI_MAX_AUDIO_SECONDS = 1400
+_OPENAI_MAX_AUDIO_BYTES = 24_000_000
+
+
 @dataclass(frozen=True)
 class AudioChunk:
     path: Path
@@ -284,7 +289,8 @@ class FFmpegProcessor:
             self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose",
             "-nostats", "-progress", "pipe:1", "-i", source_url,
             "-map", "0:a:0", "-vn", "-c:a", "aac", "-ac", "1", "-ar", "16000",
-            "-b:a", "24k", "-f", "segment", "-segment_time", "5400",
+            "-b:a", "24k", "-f", "segment",
+            "-segment_time", str(_TRANSCRIPTION_SEGMENT_SECONDS),
             "-reset_timestamps", "1", "-segment_format", "mp4",
             "-segment_list", str(output / "audio.csv"), "-segment_list_type", "csv",
             str(output / "audio-%05d.m4a"),
@@ -323,15 +329,22 @@ class FFmpegProcessor:
     def _fit_chunk(self, chunk: AudioChunk, size: int, event: Event) -> list[AudioChunk]:
         """Remux only local AAC if a segment breaches either delivery limit.
 
-        The segment muxer cuts at packet boundaries; even a 5400s target can
-        exceed 5400s slightly. Recheck every child, including container overhead.
+        The segment muxer cuts at packet boundaries, so the 600s target can
+        run slightly long. Recheck every child against OpenAI's hard limits.
         """
         _check_cancelled(event)
-        if size <= 24_000_000 and chunk.duration_seconds <= 5400:
+        if (
+            size <= _OPENAI_MAX_AUDIO_BYTES
+            and chunk.duration_seconds <= _OPENAI_MAX_AUDIO_SECONDS
+        ):
             return [chunk]
         if chunk.duration_seconds <= .128:
             raise MediaError("Il segmento audio supera il limite consentito")
-        parts = max(2, math.ceil(size / 24_000_000), math.ceil(chunk.duration_seconds / 5400))
+        parts = max(
+            2,
+            math.ceil(size / _OPENAI_MAX_AUDIO_BYTES),
+            math.ceil(chunk.duration_seconds / _TRANSCRIPTION_SEGMENT_SECONDS),
+        )
         output = Path(tempfile.mkdtemp(prefix="split-", dir=chunk.path.parent))
         _run_process([
             self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",

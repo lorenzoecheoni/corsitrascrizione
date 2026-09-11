@@ -1,15 +1,19 @@
 from pathlib import Path
-from threading import Event
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 import re
 
 from fastapi.testclient import TestClient
 import pytest
+import respx
 
 from app.bunny import (
     BunnyAuthError,
     BunnyCatalog,
     BunnyCatalogVideo,
+    BunnyCatalogTooLarge,
+    BunnyClient,
     BunnyRateLimitError,
     BunnyServerError,
     BunnyVideoMetadata,
@@ -132,6 +136,12 @@ def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(cli
     assert 'loading="lazy"' in response.text
     assert 'id="analyse-selection"' in response.text and 'disabled' in response.text
     assert 'catalog.js' in response.text
+    assert 'id="selection-limit"' in response.text
+    assert 'aria-describedby="selection-limit selection-status"' in response.text
+    assert 'id="selection-status" role="status"' in response.text
+    assert "Massimo 50 video per conferma" in response.text
+    selection_bar = re.search(r'<aside id="selection-bar"(.*?)</aside>', response.text, re.S)[1]
+    assert '/ 50 video selezionati' in selection_bar
 
 
 def test_catalog_script_is_limited_to_the_authenticated_dashboard(client):
@@ -154,12 +164,42 @@ def test_dashboard_handles_an_empty_catalog(client):
 
     assert response.status_code == 200
     assert "Nessun video disponibile" in response.text
+    assert '<a id="refresh-catalog"' in response.text
+    assert re.search(r'<a id="refresh-catalog"[^>]+href="/"', response.text)
+
+
+def test_large_catalog_has_distinct_status_and_collection_options(client):
+    videos = [catalog_video(str(UUID(int=index + 1)), "Corso", 60) for index in range(10_000)]
+    for index, video in enumerate(videos):
+        video.status = [3, 4, None][index % 3]
+        video.collection_id = UUID(VIDEO_ID) if index % 2 else None
+    client.app.state.bunny.list_videos = lambda: catalog(*videos)
+    page = client.get("/").text
+    status = re.search(r'<select id="status-filter">(.*?)</select>', page, re.S)[1]
+    collection = re.search(r'<select id="collection-filter">(.*?)</select>', page, re.S)[1]
+    assert re.findall(r'<option value="([^"]+)"', status) == ["all", "3", "4", "unknown"]
+    assert re.findall(r'<option value="([^"]+)"', collection) == ["all", "none", VIDEO_ID]
+
+
+@respx.mock
+def test_oversized_catalog_explains_operational_limit_and_offers_refresh(client):
+    client.app.state.bunny = BunnyClient(client.app.state.settings)
+    respx.get("https://video.bunnycdn.com/library/123/videos", params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json={"totalItems": 10_001, "currentPage": 1, "itemsPerPage": 100, "items": [],
+                   "upstream": "TEST_ONLY_UPSTREAM_BODY"},
+    )
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "10.000" in response.text and "paginazione" in response.text
+    assert "TEST_ONLY_UPSTREAM_BODY" not in response.text
+    assert re.search(r'<a id="refresh-catalog"[^>]+href="/"', response.text)
 
 
 @pytest.mark.parametrize(("error", "message"), [
     (BunnyAuthError("bunny-secret upstream body"), "Accesso a Bunny non autorizzato"),
     (BunnyRateLimitError("bunny-secret upstream body"), "Limite di richieste Bunny raggiunto"),
     (BunnyServerError("bunny-secret upstream body"), "Servizio Bunny temporaneamente non disponibile"),
+    (BunnyCatalogTooLarge("bunny-secret upstream body"), "Il catalogo supera il limite di 10.000 video"),
 ])
 def test_dashboard_maps_provider_errors_to_safe_messages(client, error, message):
     def unavailable():
@@ -172,6 +212,7 @@ def test_dashboard_maps_provider_errors_to_safe_messages(client, error, message)
     assert message in response.text
     assert "bunny-secret" not in response.text
     assert "upstream body" not in response.text
+    assert re.search(r'<a id="refresh-catalog"[^>]+href="/"', response.text)
 
 
 @pytest.mark.parametrize("video_ids", [[VIDEO_ID], [VIDEO_ID] * 50])
@@ -239,6 +280,73 @@ def test_selected_videos_are_rechecked_then_queued(client):
         assert secret not in batch.text
 
 
+def test_same_confirmation_reuses_batch_without_rechecking_or_resubmitting(client):
+    token = extract_hidden(selection_form(client, [VIDEO_ID, OTHER_VIDEO_ID]).text, "confirmation")
+    submitted = []
+    client.app.state.runner.submit = submitted.append
+    first = client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+
+    def unavailable(video_id):
+        raise BunnyAuthError("upstream body")
+
+    client.app.state.bunny.get_metadata = unavailable
+    second = client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+    assert first.status_code == second.status_code == 303
+    assert first.headers["location"] == second.headers["location"]
+    assert len(client.app.state.store.list_recent()) == len(submitted) == 2
+    assert client.post("/batches", data={"confirmation": token},
+                       headers={"X-CSRF-Token": ""}).status_code == 403
+
+
+def test_metadata_failure_does_not_consume_confirmation_or_leave_partial_jobs(client):
+    token = extract_hidden(selection_form(client, [VIDEO_ID, OTHER_VIDEO_ID]).text, "confirmation")
+    original = client.app.state.bunny.get_metadata
+
+    def unavailable(video_id):
+        if str(video_id) == OTHER_VIDEO_ID:
+            raise BunnyAuthError("upstream body")
+        return original(video_id)
+
+    client.app.state.bunny.get_metadata = unavailable
+    assert client.post("/batches", data={"confirmation": token}).status_code == 422
+    assert not client.app.state.store.list_recent()
+    client.app.state.bunny.get_metadata = original
+    submitted = []
+    client.app.state.runner.submit = submitted.append
+    response = client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+    assert response.status_code == 303
+    assert len(client.app.state.store.list_recent()) == len(submitted) == 2
+
+
+def test_concurrent_reposts_create_and_submit_only_one_batch(client):
+    token = extract_hidden(selection_form(client, [VIDEO_ID, OTHER_VIDEO_ID]).text, "confirmation")
+    submitted = []
+    client.app.state.runner.submit = submitted.append
+    start = Barrier(8)
+
+    def confirm():
+        start.wait(timeout=5)
+        return client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        responses = list(pool.map(lambda _: confirm(), range(8)))
+    assert all(response.status_code == 303 for response in responses)
+    assert len({response.headers["location"] for response in responses}) == 1
+    assert len(client.app.state.store.list_recent()) == len(submitted) == 2
+
+
+def test_expired_confirmation_is_rejected_and_cached_association_is_pruned(client, monkeypatch):
+    monkeypatch.setattr("app.selection.time.time", lambda: 1_000)
+    token = extract_hidden(selection_form(client, [VIDEO_ID]).text, "confirmation")
+    client.app.state.runner.submit = lambda _: None
+    response = client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+    assert response.status_code == 303
+    monkeypatch.setattr("app.selection.time.time", lambda: 1_600)
+    assert client.post("/batches", data={"confirmation": token}).status_code == 422
+    assert not client.app.state.confirmations._confirmed
+    assert len(client.app.state.store.list_recent()) == 1
+
+
 @pytest.mark.parametrize("confirmation", ["changed", sign_selection([UUID(VIDEO_ID)], b"x" * 32, now=0)])
 def test_batch_rejects_altered_or_expired_confirmation(client, confirmation):
     response = client.post("/batches", data={
@@ -284,10 +392,36 @@ def test_submit_failure_cancels_only_unscheduled_job_and_keeps_batch_visible(cli
     assert "Annullato" in batch.text
     assert "bunny-secret" not in batch.text
     assert "upstream response" not in batch.text
+    repeated = client.post("/batches", data={"confirmation": token}, follow_redirects=False)
+    assert repeated.status_code == 303
+    assert repeated.headers["location"] == response.headers["location"]
+    assert len(submitted) == 2
 
 
 def test_missing_batch_is_404(client):
     assert client.get(f"/batches/{uuid4()}").status_code == 404
+
+
+@pytest.mark.parametrize(("state", "message", "expected_progress"), [
+    (JobState.COMPLETED, "Completato", 100),
+    (JobState.FAILED, "Errore di elaborazione", 37),
+    (JobState.CANCELLED, "Annullato", 37),
+])
+def test_batch_refresh_shows_progress_and_terminal_transitions(client, state, message, expected_progress):
+    batch, jobs = client.app.state.store.create_batch([("https://private.example/source", "Corso")])
+    location = f"/batches/{batch.id}"
+    page = client.get(location).text
+    assert re.search(rf'<a id="refresh-batch"[^>]+href="{location}"', page)
+    assert f'for="batch-progress-{jobs[0].id}"' in page
+    assert re.search(r'<progress[^>]+value="0"[^>]+max="100"', page)
+    client.app.state.store.update(jobs[0].id, state=JobState.PROCESSING, progress=37, message="Analisi in corso")
+    page = client.get(location).text
+    assert "Analisi in corso" in page and "37%" in page
+    assert re.search(r'<progress[^>]+value="37"[^>]+max="100"', page)
+    client.app.state.store.update(jobs[0].id, state=state, message=message)
+    page = client.get(location).text
+    assert message in page and f"{expected_progress}%" in page
+    assert "private.example" not in page
 
 
 def test_exports_require_completion_and_queued_job_can_be_cancelled(client):

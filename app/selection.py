@@ -2,8 +2,11 @@
 
 import base64
 import binascii
+from collections.abc import Callable
+import hashlib
 import hmac
 import time
+from threading import Lock
 from uuid import UUID
 
 
@@ -56,6 +59,10 @@ def sign_selection(video_ids: list[UUID], key: bytes, *, now: int | None = None)
 
 def verify_selection(token: str, key: bytes, *, now: int | None = None) -> list[UUID]:
     """Validate a confirmation without exposing malformed-token details."""
+    return _verified_selection(token, key, now=now)[0]
+
+
+def _verified_selection(token: str, key: bytes, *, now: int | None = None) -> tuple[list[UUID], int]:
     try:
         if not isinstance(token, str) or len(token.encode("utf-8")) > _MAX_TOKEN_BYTES:
             raise _selection_error()
@@ -82,6 +89,33 @@ def verify_selection(token: str, key: bytes, *, now: int | None = None) -> list[
             raise _selection_error()
         if len(set(video_ids)) != len(video_ids):
             raise _selection_error()
-        return video_ids
+        return video_ids, int(expiry_text)
     except (TypeError, ValueError, UnicodeError, OverflowError):
         raise _selection_error() from None
+
+
+class ConfirmationStore:
+    """Process-local, expiring idempotency records for confirmed batches."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._confirmed: dict[bytes, tuple[int, UUID]] = {}
+
+    def create_once(
+        self, token: str, key: bytes,
+        create: Callable[[list[UUID]], tuple[UUID, list[UUID]]],
+    ) -> tuple[UUID, list[UUID]]:
+        # The lock covers validation, metadata reads, creation and association.
+        # Only the first caller receives job IDs to submit. Record the batch
+        # before submission, so a downstream failure cannot create another batch.
+        with self._lock:
+            now = int(time.time())
+            self._confirmed = {digest: record for digest, record in self._confirmed.items()
+                               if record[0] > now}
+            video_ids, expiry = _verified_selection(token, key, now=now)
+            digest = hashlib.sha256(token.encode("ascii")).digest()
+            if digest in self._confirmed:
+                return self._confirmed[digest][1], []
+            batch_id, job_ids = create(video_ids)
+            self._confirmed[digest] = (expiry, batch_id)
+            return batch_id, job_ids

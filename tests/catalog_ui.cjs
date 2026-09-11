@@ -18,9 +18,9 @@ function createElement({dataset = {}, value = '', checked = false, hidden = fals
   };
 }
 
-function setup() {
+function setup(size = 3) {
   const elements = new Map();
-  const rows = [
+  let rows = [
     createElement({dataset: {
       videoRow: '', title: 'Corso Python', description: 'Fondamenti pratici',
       status: 'ready', collection: 'academy', duration: '61',
@@ -34,6 +34,9 @@ function setup() {
       status: 'ready', collection: 'creative', duration: '360',
     }}),
   ];
+  if (size !== 3) rows = Array.from({length: size}, (_, index) => createElement({dataset: {
+    title: `Video ${index + 1}`, description: '', status: 'ready', collection: 'academy', duration: '60',
+  }}));
   const selects = rows.map(row => createElement({dataset: {videoSelect: ''}}));
   elements.set('catalog-search', createElement());
   elements.set('status-filter', createElement({value: 'all'}));
@@ -44,6 +47,9 @@ function setup() {
   elements.set('selection-count', createElement());
   elements.set('selection-duration', createElement());
   elements.set('selection-bar', createElement({hidden: true}));
+  elements.set('catalog-form', createElement());
+  elements.set('analyse-selection', createElement());
+  elements.set('selection-status', createElement());
 
   vm.runInNewContext(source, {
     document: {
@@ -59,7 +65,9 @@ function setup() {
 }
 
 function fire(element, type) {
-  element.handlers[type]();
+  const event = {defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }};
+  element.handlers[type](event);
+  return event;
 }
 
 assert.doesNotThrow(() => vm.runInNewContext(source, {
@@ -116,4 +124,38 @@ assert.equal(ui.elements.get('selection-count').textContent, '0');
 assert.equal(ui.elements.get('selection-duration').textContent, '00:00');
 assert.equal(ui.elements.get('selection-bar').hidden, true);
 
-console.log('PASS: catalog filters and selected-only workflow');
+for (const size of [51, 50]) {
+  const large = setup(size);
+  fire(large.elements.get('select-visible'), 'click');
+  assert.equal(large.selects.filter(select => select.checked).length, 50, `${size} visible videos stop at 50`);
+  assert.equal(large.elements.get('selection-count').textContent, '50');
+  assert.equal(large.elements.get('selection-duration').textContent, '50:00');
+  assert.equal(large.elements.get('analyse-selection').disabled, false);
+  assert.match(large.elements.get('selection-status').textContent, /50/);
+  assert.equal(fire(large.elements.get('catalog-form'), 'submit').defaultPrevented, false);
+  if (size === 51) {
+    large.selects[50].checked = true;
+    fire(large.selects[50], 'change');
+    assert.equal(large.selects[50].checked, false, 'Individual selection cannot become the 51st video');
+    large.selects[50].checked = true;
+    assert.equal(fire(large.elements.get('catalog-form'), 'submit').defaultPrevented, true,
+      'Submit guard blocks even an invalid selection introduced without change events');
+    assert.equal(large.elements.get('analyse-selection').disabled, true);
+    assert.match(large.elements.get('selection-status').textContent, /50/);
+  }
+}
+
+const remaining = setup(51);
+remaining.selects.slice(0, 49).forEach(select => { select.checked = true; });
+fire(remaining.selects[48], 'change');
+remaining.elements.get('catalog-search').value = 'Video 5';
+fire(remaining.elements.get('catalog-search'), 'input');
+fire(remaining.elements.get('select-visible'), 'click');
+assert.equal(remaining.selects[49].checked, true, 'Visible selection fills the final free slot');
+assert.equal(remaining.selects[50].checked, false, 'Visible selection respects hidden selected videos');
+assert.equal(remaining.selects.filter(select => select.checked).length, 50);
+fire(remaining.elements.get('clear-selection'), 'click');
+assert.equal(fire(remaining.elements.get('catalog-form'), 'submit').defaultPrevented, true);
+assert.equal(remaining.elements.get('analyse-selection').disabled, true);
+
+console.log('PASS: catalog filters, selection workflow and accessible 50/51 limit');

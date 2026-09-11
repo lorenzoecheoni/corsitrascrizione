@@ -1,7 +1,9 @@
 import pytest
 from fastapi.testclient import TestClient
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app import auth
+from app.bunny import BunnyCatalog
 from app.config import Settings
 from app.main import create_app
 
@@ -16,12 +18,14 @@ def settings() -> Settings:
         bunny_cdn_hostname="academy.example.b-cdn.net",
         openai_api_key="openai-secret",
         app_password="team-secret",
+        _env_file=None,
     )
 
 
 @pytest.fixture
 def client():
     app = create_app(settings())
+    app.state.bunny.list_videos = lambda: BunnyCatalog(videos=[], total_items=0)
     with TestClient(app) as test_client:
         yield test_client
     app.state.runner.shutdown(wait=True)
@@ -68,6 +72,29 @@ def test_html_login_issues_session_and_unlocks_home(client: TestClient) -> None:
     assert client.get("/").status_code == 200
 
 
+def test_login_accepts_unicode_password_without_crashing(client):
+    client.app.state.settings.app_password = "caffè-🔐"
+    response = client.post("/login", data={
+        "username": "team", "password": "caffè-🔐",
+        "csrf_token": client.app.state.csrf_token,
+    }, follow_redirects=False)
+    assert response.status_code == 303
+    assert SESSION_COOKIE in response.headers["set-cookie"]
+
+
+@pytest.mark.parametrize(("username", "password"), [
+    ("tèam", "team-secret"), ("team", "erràta-🔐"), ("wrong", "wrong"),
+])
+def test_bad_credentials_have_uniform_safe_message(client, username, password):
+    response = client.post("/login", data={
+        "username": username, "password": password,
+        "csrf_token": client.app.state.csrf_token,
+    }, follow_redirects=False)
+    assert response.status_code == 401
+    assert "Credenziali non valide" in response.text
+    assert SESSION_COOKIE not in response.headers.get("set-cookie", "")
+
+
 def test_session_tokens_reject_expiry_and_tampering() -> None:
     secret = b"x" * 32
     issue_session = getattr(auth, "issue_session", None)
@@ -110,3 +137,21 @@ def test_login_marks_cookie_secure_for_forwarded_https(client: TestClient) -> No
     }, headers={"X-Forwarded-Proto": "https"}, follow_redirects=False)
 
     assert "Secure" in response.headers["set-cookie"]
+
+
+def test_https_proxy_origin_is_checked_after_trusted_proxy_scheme_conversion():
+    app = create_app(settings())
+    proxy = ProxyHeadersMiddleware(app, trusted_hosts=["127.0.0.1"])
+    with TestClient(proxy, base_url="http://reports.example", client=("127.0.0.1", 12345)) as browser:
+        data = {"username": "team", "password": "team-secret", "csrf_token": app.state.csrf_token}
+        headers = {"X-Forwarded-Proto": "https", "Origin": "https://reports.example"}
+        response = browser.post("/login", data=data, headers=headers, follow_redirects=False)
+        assert response.status_code == 303
+        assert "Secure" in response.headers["set-cookie"]
+        headers["Origin"] = "https://attacker.example"
+        assert browser.post("/login", data=data, headers=headers).status_code == 403
+    # An untrusted direct caller cannot change the origin scheme with this header.
+    with TestClient(proxy, base_url="http://reports.example", client=("192.0.2.1", 12345)) as direct:
+        headers["Origin"] = "https://reports.example"
+        assert direct.post("/login", data=data, headers=headers).status_code == 403
+    app.state.runner.shutdown(wait=True)

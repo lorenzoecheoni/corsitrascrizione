@@ -45,6 +45,6 @@ def session_is_valid(value: str | None, secret: bytes, *, now: int | None = None
 
 
 def credentials_are_valid(username: str, password: str, expected_password: str) -> bool:
-    username_matches = secrets.compare_digest(username, "team")
-    password_matches = secrets.compare_digest(password, expected_password)
+    username_matches = secrets.compare_digest(username.encode("utf-8"), b"team")
+    password_matches = secrets.compare_digest(password.encode("utf-8"), expected_password.encode("utf-8"))
     return username_matches and password_matches

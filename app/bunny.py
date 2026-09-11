@@ -49,6 +49,10 @@ class BunnyResponseError(BunnyError):
     pass
 
 
+class BunnyCatalogTooLarge(BunnyResponseError):
+    """The catalog exceeds the bounded in-memory loading limit."""
+
+
 class BunnyPlaybackError(BunnyError):
     """Safe access failure eligible for one playback-token regeneration."""
 
@@ -343,7 +347,7 @@ class BunnyClient:
             if expected_total is None:
                 expected_total = total_items
                 if expected_total > max_items:
-                    raise BunnyResponseError("Catalogo Bunny troppo grande; usa la paginazione", status_code=response.status_code)
+                    raise BunnyCatalogTooLarge("Catalogo Bunny troppo grande; usa la paginazione", status_code=response.status_code)
             elif total_items != expected_total:
                 raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code)
 
@@ -463,9 +467,8 @@ class BunnyClient:
         hostname = _cdn_hostname(self._settings.bunny_cdn_hostname)
         key = self._settings.bunny_token_auth_key
         if key:
-            with self._token_lock:
-                expires = max(int(time.time()) + 3600, self._last_token_expiry + 1)
-                self._last_token_expiry = expires
+            # Catalog volume must not extend thumbnail TTL or playback expiry.
+            expires = int(time.time()) + 3600
             playlist = build_cdn_token_url(
                 hostname=hostname,
                 video_id=validated_id,

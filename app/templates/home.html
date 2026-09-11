@@ -15,6 +15,7 @@
       <p class="eyebrow">Libreria Bunny</p>
       <h1 id="catalog-title">Catalogo video</h1>
     </div>
+    <a id="refresh-catalog" class="button secondary" href="/">Aggiorna catalogo</a>
     <p class="catalog-total">{{ total_items }} video <span aria-hidden="true">·</span> Durata complessiva: {{ format_timestamp(total_duration) }}</p>
   </section>
   {% if catalog_error %}
@@ -25,8 +26,12 @@
     <p>Quando la libreria Bunny contiene video, compariranno qui.</p>
   </section>
   {% else %}
-  <form action="/selections/preview" method="post" class="catalog-form">
+  <form id="catalog-form" action="/selections/preview" method="post" class="catalog-form" aria-describedby="selection-limit selection-status">
     <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+    <div class="panel">
+      <p id="selection-limit">Massimo 50 video per conferma. Seleziona visibili aggiunge video fino ai posti disponibili.</p>
+      <p id="selection-status" role="status" aria-live="polite">Puoi selezionare ancora 50 video.</p>
+    </div>
     <section class="catalog-controls panel" aria-label="Filtra catalogo">
       <div class="control-search">
         <label for="catalog-search">Cerca nel catalogo</label>
@@ -36,14 +41,14 @@
         <label for="status-filter">Stato Bunny</label>
         <select id="status-filter">
           <option value="all">Tutti gli stati</option>
-          {% for video in videos %}<option value="{{ video.status if video.status is not none else 'unknown' }}">Stato {{ video.status if video.status is not none else 'non disponibile' }}</option>{% endfor %}
+          {% for status in status_options %}<option value="{{ status if status is not none else 'unknown' }}">Stato {{ status if status is not none else 'non disponibile' }}</option>{% endfor %}
         </select>
       </div>
       <div>
         <label for="collection-filter">Collezione</label>
         <select id="collection-filter">
           <option value="all">Tutte le collezioni</option>
-          {% for video in videos %}<option value="{{ video.collection_id or 'none' }}">{{ video.collection_id or 'Senza collezione' }}</option>{% endfor %}
+          {% for collection in collection_options %}<option value="{{ collection or 'none' }}">{{ collection or 'Senza collezione' }}</option>{% endfor %}
         </select>
       </div>
       <label class="check-control" for="selected-only">
@@ -74,7 +79,7 @@
       {% endfor %}
     </fieldset>
     <aside id="selection-bar" class="selection-bar" aria-live="polite" hidden>
-      <p><strong id="selection-count">0</strong> video selezionati <span aria-hidden="true">·</span> <span id="selection-duration">00:00</span></p>
+      <p><strong id="selection-count">0</strong> / 50 video selezionati <span aria-hidden="true">·</span> <span id="selection-duration">00:00</span></p>
       <button id="analyse-selection" type="submit" disabled>Analizza selezionati</button>
     </aside>
   </form>

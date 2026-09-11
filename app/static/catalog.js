@@ -9,8 +9,12 @@
   const selectionDuration = document.getElementById('selection-duration');
   const selectionBar = document.getElementById('selection-bar');
   const submitSelection = document.getElementById('analyse-selection');
+  const form = document.getElementById('catalog-form');
+  const selectionStatus = document.getElementById('selection-status');
+  const maxSelection = 50;
   if (!search || !statusFilter || !collectionFilter || !selectedOnly || !selectVisible
-      || !clearSelection || !selectionCount || !selectionDuration || !selectionBar) return;
+      || !clearSelection || !selectionCount || !selectionDuration || !selectionBar
+      || !submitSelection || !form || !selectionStatus) return;
   const rows = [...document.querySelectorAll('[data-video-row]')];
   const selects = [...document.querySelectorAll('[data-video-select]')];
 
@@ -36,31 +40,52 @@
   const selectedDuration = () => selects.reduce(
     (total, select, index) => total + (select.checked ? duration(rows[index]?.dataset.duration) : 0), 0,
   );
+  const countSelected = () => selects.filter(select => select.checked).length;
   const update = () => {
     rows.forEach((row, index) => {
       row.hidden = !rowMatches(row, selects[index]?.checked);
     });
-    const count = selects.filter(select => select.checked).length;
+    const count = countSelected();
     selectionCount.textContent = String(count);
     selectionDuration.textContent = formatDuration(selectedDuration());
     selectionBar.hidden = count === 0;
-    if (submitSelection) submitSelection.disabled = count === 0;
+    submitSelection.disabled = count === 0 || count > maxSelection;
+    selectionStatus.textContent = count > maxSelection
+      ? 'Seleziona al massimo 50 video prima di continuare.'
+      : count === maxSelection
+        ? 'Limite di 50 video raggiunto. Deseleziona un video per sceglierne un altro.'
+        : `Puoi selezionare ancora ${maxSelection - count} video (massimo 50).`;
   };
 
   search.addEventListener('input', update);
   statusFilter.addEventListener('change', update);
   collectionFilter.addEventListener('change', update);
   selectedOnly.addEventListener('change', update);
-  selects.forEach(select => select.addEventListener('change', update));
+  selects.forEach(select => select.addEventListener('change', () => {
+    if (select.checked && countSelected() > maxSelection) select.checked = false;
+    update();
+  }));
   selectVisible.addEventListener('click', () => {
+    let remaining = Math.max(0, maxSelection - countSelected());
     rows.forEach((row, index) => {
-      if (!row.hidden && selects[index]) selects[index].checked = true;
+      if (!row.hidden && selects[index] && !selects[index].checked && remaining > 0) {
+        selects[index].checked = true;
+        remaining -= 1;
+      }
     });
     update();
   });
   clearSelection.addEventListener('click', () => {
     selects.forEach(select => { select.checked = false; });
     update();
+  });
+  form.addEventListener('submit', event => {
+    const count = countSelected();
+    if (count === 0 || count > maxSelection) {
+      event.preventDefault();
+      update();
+      if (count === 0) selectionStatus.textContent = 'Seleziona almeno un video per continuare (massimo 50).';
+    }
   });
 
   update();

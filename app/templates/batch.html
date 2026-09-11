@@ -6,9 +6,19 @@
     <div><p class="eyebrow">Elaborazione</p><h1 id="batch-title">Coda lavori</h1></div>
     <p class="catalog-total">Il gruppo contiene {{ jobs|length }} lavori.</p>
   </section>
-  <section class="panel"><ul class="job-list">
+  <section class="panel" aria-label="Avanzamento dei lavori">
+    <p>Per vedere i progressi più recenti, aggiorna lo stato.</p>
+    <p><a id="refresh-batch" class="button secondary" href="/batches/{{ batch.id }}">Aggiorna stato</a></p>
+    <ul class="job-list">
     {% for job in jobs %}
-    <li><a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a><span>{{ job.message }}</span></li>
+    <li>
+      <a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a>
+      <div class="batch-job-progress">
+        <p>{{ job.message }}</p>
+        <label for="batch-progress-{{ job.id }}">Avanzamento: {{ job.progress }}%<span class="sr-only"> · {{ job.source_title or 'Report video' }}</span></label>
+        <progress id="batch-progress-{{ job.id }}" value="{{ job.progress }}" max="100">{{ job.progress }}%</progress>
+      </div>
+    </li>
     {% endfor %}
   </ul></section>
 {% endblock %}

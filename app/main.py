@@ -18,6 +18,7 @@ from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
 from app.pipeline import AnalysisPipeline
+from app.selection import ConfirmationStore
 from app.transcription import OpenAITranscriber
 from app.web import router
 
@@ -82,6 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.runner = services.runner
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
+    app.state.confirmations = ConfirmationStore()
     app.state.session_key = secrets.token_bytes(32)
 
     @app.exception_handler(RequestValidationError)

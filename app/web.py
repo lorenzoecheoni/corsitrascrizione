@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
 from app.bunny import (
     BunnyAuthError,
+    BunnyCatalogTooLarge,
     BunnyError,
     BunnyRateLimitError,
     BunnyReadinessError,
@@ -25,7 +26,7 @@ from app.bunny import (
 from app.costs import estimate_cost
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
-from app.selection import sign_selection, verify_selection
+from app.selection import sign_selection
 
 
 router = APIRouter()
@@ -71,6 +72,8 @@ def get_job(request: Request, job_id: str) -> JobRecord:
 
 def _catalog_error_message(error: BunnyError) -> str:
     """Map provider failures to fixed UI text without exposing exception data."""
+    if isinstance(error, BunnyCatalogTooLarge):
+        return "Il catalogo supera il limite di 10.000 video; occorre introdurre la paginazione prima di proseguire"
     if isinstance(error, BunnyAuthError):
         return "Accesso a Bunny non autorizzato; verifica la configurazione"
     if isinstance(error, BunnyRateLimitError):
@@ -129,6 +132,8 @@ def home(request: Request) -> HTMLResponse:
         })
     return templates.TemplateResponse(request, "home.html", {
         "videos": catalog.videos,
+        "status_options": list(dict.fromkeys(video.status for video in catalog.videos)),
+        "collection_options": list(dict.fromkeys(video.collection_id for video in catalog.videos)),
         "total_items": catalog.total_items,
         "total_duration": sum(video.duration_seconds for video in catalog.videos),
         "recent_jobs": request.app.state.store.list_recent(),
@@ -150,26 +155,31 @@ def selection_preview(request: Request, video_ids: list[str] = Form(default=[]))
 
 @router.post("/batches")
 def create_batch(request: Request, confirmation: str = Form("")) -> RedirectResponse:
+    def create(video_ids: list[UUID]) -> tuple[UUID, list[UUID]]:
+        metadata = _read_selected_metadata(request, video_ids)
+        library_id = request.app.state.settings.bunny_library_id
+        items = [
+            (f"https://iframe.mediadelivery.net/embed/{library_id}/{video_id}", video.title)
+            for video_id, video in zip(video_ids, metadata, strict=True)
+        ]
+        batch, jobs = request.app.state.store.create_batch(items)
+        return batch.id, [job.id for job in jobs]
+
     try:
-        video_ids = verify_selection(confirmation, request.app.state.confirmation_key)
+        batch_id, job_ids = request.app.state.confirmations.create_once(
+            confirmation, request.app.state.confirmation_key, create,
+        )
     except ValueError:
         raise HTTPException(422, "Conferma non valida o scaduta; ripetere la selezione") from None
 
-    metadata = _read_selected_metadata(request, video_ids)
-    library_id = request.app.state.settings.bunny_library_id
-    items = [
-        (f"https://iframe.mediadelivery.net/embed/{library_id}/{video_id}", video.title)
-        for video_id, video in zip(video_ids, metadata, strict=True)
-    ]
-    batch, jobs = request.app.state.store.create_batch(items)
-    for job in jobs:
+    for job_id in job_ids:
         try:
-            request.app.state.runner.submit(job.id)
+            request.app.state.runner.submit(job_id)
         except Exception:
             # submit() raises before returning a future. Cancel this newly-created,
             # unscheduled job, then leave the rest of the batch independent.
-            request.app.state.runner.cancel(job.id)
-    return RedirectResponse(f"/batches/{batch.id}", status_code=303)
+            request.app.state.runner.cancel(job_id)
+    return RedirectResponse(f"/batches/{batch_id}", status_code=303)
 
 
 @router.get("/batches/{batch_id}", response_class=HTMLResponse)

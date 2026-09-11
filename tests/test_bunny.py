@@ -264,6 +264,20 @@ def test_build_thumbnail_url_reuses_directory_token_without_exposing_key(setting
     assert "token-secret" not in url
 
 
+def test_large_thumbnail_catalog_and_reload_keep_one_hour_expiry_and_hls_independent(settings, monkeypatch):
+    settings.bunny_token_auth_key = "token-secret"
+    monkeypatch.setattr("app.bunny.time.time", lambda: 1_999_996_400)
+    client = BunnyClient(settings)
+    assert "&expires=2000000000&" in client.build_hls_url(VIDEO_ID)
+    for _ in range(2):
+        for index in range(10_000):
+            url = client.build_thumbnail_url(UUID(int=index + 1), "thumbnail.jpg")
+            assert "&expires=2000000000&" in url
+    assert "&expires=2000000001&" in client.build_hls_url(VIDEO_ID)
+    monkeypatch.setattr("app.bunny.time.time", lambda: 1_999_996_460)
+    assert "&expires=2000000060&" in client.build_thumbnail_url(VIDEO_ID, "thumbnail.jpg")
+
+
 @pytest.mark.parametrize("host", ["iframe.mediadelivery.net", "player.mediadelivery.net"])
 def test_parse_embed_link(host: str) -> None:
     ref = parse(f"https://{host}/embed/123/{VIDEO_ID}")

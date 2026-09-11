@@ -83,6 +83,7 @@ input:not([type="checkbox"]), select {
 .job-list li, .selection-list li { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding-bottom: .75rem; border-bottom: 1px solid #e3e9f1; }
 .job-list li:last-child, .selection-list li:last-child { padding-bottom: 0; border-bottom: 0; }
 .job-list span { color: #53647b; }
+.batch-job-progress { width: 100%; max-width: 30rem; }
 .empty-state { text-align: center; }
 .confirmation-card { display: grid; max-width: 48rem; gap: 1.25rem; }
 .summary-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; margin: 0; }

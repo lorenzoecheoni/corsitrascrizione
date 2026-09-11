@@ -74,7 +74,7 @@ docker run --rm bunny-video-report:local ffmpeg -version
 docker run --rm --env-file .env -p 127.0.0.1:8000:8000 bunny-video-report:local
 ```
 
-L'immagine include FFmpeg, template e asset statici, esegue l'app come `appuser` non root e avvia `uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log`. I segreti entrano soltanto a runtime attraverso `--env-file` o il secret manager del servizio scelto; non usare build argument o `ENV` nel Dockerfile per le credenziali. La directory di build è filtrata da `.dockerignore`.
+L'immagine include FFmpeg, template e asset statici, esegue l'app come `appuser` non root e avvia `uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1,100.0.0.0/8`. Gli header del proxy sono accettati solo da loopback e dalla rete proxy Railway configurata, così l'origine HTTPS viene verificata correttamente anche dietro il proxy. I segreti entrano soltanto a runtime attraverso `--env-file` o il secret manager del servizio scelto; non usare build argument o `ENV` nel Dockerfile per le credenziali. La directory di build è filtrata da `.dockerignore`.
 
 La distribuzione prevista è Railway. Per pubblicare, configurare il dominio con TLS valido e usare sempre **HTTPS** per l'accesso remoto, così il cookie di sessione viene emesso con `Secure`. Impedire l'accesso pubblico diretto alla porta del container e inoltrare gli header proxy soltanto da proxy fidati. Disabilitare anche sul proxy il logging di cookie, body, query e URL completi sensibili.
 

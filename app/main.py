@@ -4,14 +4,14 @@ from pathlib import Path
 from time import monotonic
 import secrets
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 from app.analysis import OpenAIAnalyzer
-from app.auth import basic, require_team
+from app.auth import SESSION_COOKIE, session_is_valid
 from app.bunny import BunnyClient
 from app.config import Settings
 from app.jobs import JobStore, SingleWorkerRunner
@@ -82,7 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.runner = services.runner
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
-    authenticate = require_team(app_settings.app_password)
+    app.state.session_key = secrets.token_bytes(32)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):
@@ -91,14 +91,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.middleware("http")
     async def protect_application(request: Request, call_next):
         started = monotonic()
-        if request.url.path != "/healthz":
-            try:
-                authenticate(await basic(request))
-            except HTTPException as exc:
-                log_event("http", elapsed_seconds=monotonic() - started,
-                          status_code=exc.status_code, error_code="unauthorized",
-                          route="unmatched", method=request.method)
-                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        path = request.url.path
+        public = path == "/healthz" or path == "/login" or path.startswith("/static/")
+        if not public and not session_is_valid(request.cookies.get(SESSION_COOKIE), app.state.session_key):
+            log_event("http", elapsed_seconds=monotonic() - started,
+                      status_code=401, error_code="unauthorized",
+                      route="unmatched", method=request.method)
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "Richiesta non autorizzata"}, status_code=401)
+            return RedirectResponse("/login", status_code=303)
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
             same_origin = f"{request.url.scheme}://{request.url.netloc}"

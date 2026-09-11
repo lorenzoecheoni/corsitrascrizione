@@ -9,6 +9,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
 from app.bunny import BunnyError, BunnyReadinessError, BunnyUrlError, parse_bunny_url, read_metadata
 from app.costs import estimate_cost
 from app.jobs import JobRecord, JobState
@@ -17,6 +18,35 @@ from app.reporting import format_timestamp, render_markdown, render_text
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+
+
+def secure_cookie(request: Request) -> bool:
+    return request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
+
+
+@router.get("/login", response_class=HTMLResponse)
+def login_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(request, "login.html")
+
+
+@router.post("/login", response_class=HTMLResponse)
+def login(request: Request, username: str = Form(""), password: str = Form("")) -> Response:
+    if not credentials_are_valid(username, password, request.app.state.settings.app_password):
+        return templates.TemplateResponse(request, "login.html", {"error": "Credenziali non valide"},
+                                          status_code=401)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(SESSION_COOKIE, issue_session(request.app.state.session_key),
+                        max_age=SESSION_TTL_SECONDS, httponly=True, samesite="strict",
+                        secure=secure_cookie(request), path="/")
+    return response
+
+
+@router.post("/logout")
+def logout(request: Request) -> RedirectResponse:
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, httponly=True, samesite="strict",
+                           secure=secure_cookie(request), path="/")
+    return response
 
 
 def get_job(request: Request, job_id: str) -> JobRecord:

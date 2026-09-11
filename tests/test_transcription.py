@@ -241,12 +241,28 @@ def test_missing_audio_file_produces_safe_error(chunks):
     assert str(chunks[0].path) not in "".join(traceback.format_exception(caught.value))
 
 
-@pytest.mark.parametrize("segments", [[(-1, 2, "A", "secret")], [(2, 1, "A", "secret")],
-                                     [(10, 12, "A", "secret"), (0, 2, "B", "secret")]])
-def test_invalid_or_unordered_remote_timestamps_fail_safely(chunks, segments):
+@pytest.mark.parametrize("segments", [[(-1, 2, "A", "secret")], [(2, 1, "A", "secret")]])
+def test_invalid_remote_timestamps_fail_safely(chunks, segments):
     with pytest.raises(TranscriptionError) as caught:
         OpenAITranscriber(FakeClient([response(segments)])).transcribe(chunks)
     assert "secret" not in str(caught.value)
+
+
+def test_out_of_order_remote_timestamps_are_sorted_and_preserved(chunks):
+    client = FakeClient([response([
+        (188.366, 203.066, "A", "Prima parte."),
+        (203.066, 203.266, "@", "Intervento breve."),
+        (202.836, 216.036, "A", "Continuazione."),
+    ])])
+
+    result = OpenAITranscriber(client).transcribe(chunks[:1])
+
+    assert [(segment.start_seconds, segment.end_seconds, segment.text)
+            for segment in result.original_segments] == [
+        (188.366, 203.066, "Prima parte."),
+        (202.836, 216.036, "Continuazione."),
+        (203.066, 203.266, "Intervento breve."),
+    ]
 
 
 def test_real_sdk_serializes_expected_multipart_and_uses_only_three_attempts(chunks, monkeypatch):

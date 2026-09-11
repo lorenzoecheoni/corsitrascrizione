@@ -197,11 +197,17 @@ class OpenAITranscriber:
                 # fields the SDK's permissive parsing may leave missing.
                 response = TranscriptionDiarized.model_validate(response.model_dump())
                 chunk_segments = []
-                local_start = -1.0
-                for segment in response.segments:
-                    if segment.start < local_start or segment.start < 0 or not segment.speaker.strip():
+                provider_segments = list(response.segments)
+                for segment in provider_segments:
+                    if (not math.isfinite(segment.start) or not math.isfinite(segment.end)
+                            or segment.start < 0 or segment.end < segment.start
+                            or not segment.speaker.strip()):
                         raise ValueError
-                    local_start = segment.start
+                # Diarization can legitimately return slightly overlapping
+                # turns out of order. Preserve every valid turn and normalize
+                # the provider order before downstream role analysis.
+                provider_segments.sort(key=lambda segment: (segment.start, segment.end))
+                for segment in provider_segments:
                     chunk_segments.append(TranscriptSegment(
                         start_seconds=chunk.start_seconds + segment.start,
                         end_seconds=chunk.start_seconds + segment.end,

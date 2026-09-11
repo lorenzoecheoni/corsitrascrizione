@@ -111,6 +111,15 @@ def test_pipeline_sanitizes_failures_and_cleans_files(components, tmp_path, stag
     assert list(tmp_path.iterdir()) == []
 
 
+def test_analysis_rate_limit_has_specific_actionable_message(components, tmp_path):
+    components.error = "analysis", AnalysisError("rate_limit", status_code=429)
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: None, components.event)
+    assert caught.value.code == "analysis_rate_limit"
+    assert caught.value.user_message == "Limite OpenAI temporaneamente raggiunto; riprova più tardi"
+    assert list(tmp_path.iterdir()) == []
+
+
 @pytest.mark.parametrize("stage", ["metadata", "media", "transcription", "analysis"])
 def test_cancellation_between_stages_stops_and_cleans(components, tmp_path, stage):
     components.cancel_after = stage

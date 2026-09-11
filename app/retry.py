@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from concurrent.futures import CancelledError
+import math
 from threading import Event
 import time
 from typing import TypeVar
@@ -13,6 +14,7 @@ T = TypeVar("T")
 def retry_remote(
     call: Callable[[], T], *, retryable: Callable[[Exception], bool],
     attempts: int = 3, base_delay: float = 1.0,
+    delay_for: Callable[[Exception, float], float] | None = None,
     cancellation_event: Event | None = None,
 ) -> T:
     """Try at most three times, waiting 1s then 2s with default settings.
@@ -30,7 +32,10 @@ def retry_remote(
             check_cancelled(cancellation_event)
             if isinstance(exc, CancelledError) or attempt == attempts - 1 or not retryable(exc):
                 raise
-            delay = base_delay * (2**attempt)
+            default_delay = base_delay * (2**attempt)
+            delay = delay_for(exc, default_delay) if delay_for is not None else default_delay
+            if type(delay) not in {int, float} or not math.isfinite(delay) or delay < 0:
+                raise ValueError("Il ritardo di retry deve essere un numero finito non negativo")
             if cancellation_event is None:
                 time.sleep(delay)
             else:

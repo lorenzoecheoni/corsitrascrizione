@@ -24,6 +24,9 @@ from app.transcription import TranscriptionResult
 from app.usage import record_usage
 
 
+_VISUAL_BATCH_SIZE = 100
+
+
 class ClassifiedFrame(ReportModel):
     timestamp_seconds: Nonnegative
     kind: Literal["slide", "camera_change", "uncertain"]
@@ -51,10 +54,14 @@ _MESSAGES = {
 class AnalysisError(Exception):
     """Fixed user-facing text, without response bodies or raw upstream errors."""
 
-    def __init__(self, code: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self, code: str, *, status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         super().__init__(_MESSAGES[code])
         self.code = code
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
         self.retryable = code in {"timeout", "rate_limit", "server"}
 
 
@@ -67,8 +74,22 @@ def _remote_error(exc: Exception) -> AnalysisError:
         status = exc.status_code
         code = ("rate_limit" if status == 429 else "server" if 500 <= status <= 599
                 else "auth" if status in {401, 403} else "request")
-        return AnalysisError(code, status_code=status)
+        retry_after = None
+        if status == 429:
+            try:
+                candidate = float(exc.response.headers.get("retry-after", ""))
+                if math.isfinite(candidate) and candidate >= 0:
+                    retry_after = candidate
+            except (TypeError, ValueError):
+                pass
+        return AnalysisError(code, status_code=status, retry_after_seconds=retry_after)
     return AnalysisError("transport")
+
+
+def _analysis_retry_delay(exc: Exception, default_delay: float) -> float:
+    if isinstance(exc, AnalysisError) and exc.retry_after_seconds is not None:
+        return max(default_delay, exc.retry_after_seconds)
+    return default_delay
 
 
 def _valid_time(value: float, duration: float) -> bool:
@@ -189,7 +210,8 @@ class OpenAIAnalyzer:
 
             response = retry_remote(
                 request, retryable=lambda exc: isinstance(exc, AnalysisError) and exc.retryable,
-                attempts=3 - attempts, cancellation_event=cancellation_event,
+                attempts=3 - attempts, delay_for=_analysis_retry_delay,
+                cancellation_event=cancellation_event,
             )
             try:
                 if getattr(response, "status", "completed") != "completed":
@@ -227,16 +249,16 @@ class OpenAIAnalyzer:
             raise AnalysisError("frames")
         slides: list[SlideChange] = []
         uncertain_count = 0
-        for offset in range(0, len(frames), 20):
+        for offset in range(0, len(frames), _VISUAL_BATCH_SIZE):
             check_cancelled(cancellation_event)
-            batch = frames[offset:offset + 20]
+            batch = frames[offset:offset + _VISUAL_BATCH_SIZE]
             expected = [frame.timestamp_seconds for frame in batch]
             parts = []
             try:
                 for frame in batch:
                     check_cancelled(cancellation_event)
                     parts.append({"type": "input_text", "text": f"timestamp_seconds={frame.timestamp_seconds}"})
-                    parts.append({"type": "input_image", "detail": "high", "image_url": "data:image/jpeg;base64," +
+                    parts.append({"type": "input_image", "detail": "low", "image_url": "data:image/jpeg;base64," +
                                   base64.b64encode(frame.path.read_bytes()).decode("ascii")})
                 def validate_batch(result: SlideBatchResult) -> list[str]:
                     if [frame.timestamp_seconds for frame in result.frames] != expected:

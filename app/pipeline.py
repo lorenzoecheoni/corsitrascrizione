@@ -28,6 +28,7 @@ _MESSAGES = {
     "media_decode": "Impossibile elaborare audio o immagini; verifica il video e l'installazione di FFmpeg",
     "transcription": "Trascrizione non riuscita; verifica la configurazione OpenAI e riprova",
     "analysis": "Analisi non riuscita; verifica la configurazione OpenAI e riprova",
+    "analysis_rate_limit": "Limite OpenAI temporaneamente raggiunto; riprova più tardi",
     "temporary_failure": "Servizio temporaneamente non disponibile; riprova più tardi",
     "not_ready": "Video ancora in elaborazione su Bunny; attendere la fine della codifica",
     "encoding_failed": "Codifica o caricamento Bunny fallito; verificare il video nella libreria",
@@ -160,7 +161,7 @@ class AnalysisPipeline:
             elif isinstance(exc, TranscriptionError):
                 code = "transcription"
             elif isinstance(exc, AnalysisError):
-                code = "analysis"
+                code = "analysis_rate_limit" if exc.code == "rate_limit" else "analysis"
             else:
                 code = "temporary_failure"
             log_event(phase, elapsed_seconds=monotonic() - started, error_code=code,

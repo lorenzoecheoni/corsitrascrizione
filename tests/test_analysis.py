@@ -107,7 +107,7 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     assert [slide.timestamp_seconds for slide in result.slides] == [2]
     assert "cost" not in result.model_dump()
     images = [part for part in client.calls[0]["input"][0]["content"] if part["type"] == "input_image"]
-    assert all(part["detail"] == "high" and part["image_url"].startswith("data:image/jpeg;base64,")
+    assert all(part["detail"] == "low" and part["image_url"].startswith("data:image/jpeg;base64,")
                for part in images)
 
 
@@ -141,18 +141,37 @@ def test_metadata_description_and_existing_evidence_reach_analysis(inputs, conte
     assert metadata["chapters"][0]["title"] == "Apertura"
 
 
-def test_visual_batches_never_exceed_twenty_images(inputs, content):
+def test_visual_batches_group_one_hundred_low_detail_images_without_losing_frames(inputs, content):
     path = inputs["frames"][0].path
-    inputs["frames"] = [FrameCandidate(path, i * 2) for i in range(41)]
+    inputs["metadata"].duration_seconds = 400
+    content["duration_seconds"] = 400
+    inputs["frames"] = [FrameCandidate(path, i * 2) for i in range(201)]
     outcomes = [{"frames": [dict(timestamp_seconds=i * 2, kind="camera_change", confidence="alta")
-                             for i in range(start, min(start + 20, 41))]}
-                for start in (0, 20, 40)]
+                             for i in range(start, min(start + 100, 201))]}
+                for start in (0, 100, 200)]
     client = FakeClient(*outcomes, content)
     OpenAIAnalyzer(client).analyze(**inputs)
+    visual_calls = client.calls[:-1]
     counts = [sum(part["type"] == "input_image" for part in call["input"][0]["content"])
-              for call in client.calls[:-1]]
-    assert counts == [20, 20, 1]
+              for call in visual_calls]
+    assert counts == [100, 100, 1]
+    assert all(part["detail"] == "low" for call in visual_calls
+               for part in call["input"][0]["content"] if part["type"] == "input_image")
     assert "data:image" not in client.calls[-1]["input"]
+
+
+def test_rate_limit_honors_retry_after_before_retrying(inputs, content, monkeypatch):
+    inputs["frames"] = []
+    sleeps = []
+    monkeypatch.setattr("app.retry.time.sleep", sleeps.append)
+    response = httpx.Response(
+        429, headers={"Retry-After": "12.5"},
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    client = FakeClient(APIStatusError("safe", response=response, body={}), content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert result.title == "Pubblicazione Academy"
+    assert sleeps == [12.5]
 
 
 def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, content):

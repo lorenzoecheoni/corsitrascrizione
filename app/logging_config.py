@@ -24,6 +24,7 @@ _lock = RLock()
 _PHASES = {"validation", "metadata", "media", "transcription", "analysis", "report", "http"}
 _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protected_video",
           "unsupported_duration", "media_decode", "transcription", "analysis", "temporary_failure",
+          "analysis_rate_limit",
           "timeout", "transport", "remote_response", "invalid_request", "unauthorized",
           "log_suppressed"}
 _ROUTES = {"/", "/jobs", "/jobs/{job_id}", "/api/jobs/{job_id}", "/jobs/{job_id}/cancel",

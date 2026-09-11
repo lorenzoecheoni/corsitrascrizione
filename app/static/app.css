@@ -13,3 +13,31 @@ main {
   margin: 4rem auto;
   padding: 0 1.5rem;
 }
+
+* { box-sizing: border-box; }
+a { color: #1d4ed8; }
+h1 { letter-spacing: -.03em; }
+.panel { background: white; padding: 1.5rem; border: 1px solid #dbe3ee; border-radius: .75rem; }
+label { display: block; font-weight: 600; margin-bottom: .5rem; }
+input { display: block; width: 100%; padding: .85rem; margin: .5rem 0 1rem; border: 1px solid #94a3b8; border-radius: .4rem; font: inherit; }
+button, .button { display: inline-block; background: #1d4ed8; color: white; border: 1px solid #1d4ed8; border-radius: .4rem; padding: .7rem 1rem; font: inherit; text-decoration: none; cursor: pointer; }
+.secondary { background: white; color: #1d4ed8; }
+button:hover, .button:hover { filter: brightness(.92); }
+:focus-visible { outline: 3px solid #f59e0b; outline-offset: 3px; }
+.muted { color: #526174; font-size: .9rem; line-height: 1.6; }
+progress { width: 100%; height: 1.25rem; accent-color: #1d4ed8; margin-bottom: 1rem; }
+#job-error { color: #991b1b; }
+.actions { display: flex; gap: .65rem; flex-wrap: wrap; margin-top: 1.5rem; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.7; background: white; padding: 1.5rem; border-radius: .75rem; }
+[hidden] { display: none !important; }
+@media (max-width: 600px) {
+  main { margin: 2rem auto; padding: 0 1rem; }
+  .panel, pre { padding: 1rem; }
+  .actions > * { width: 100%; text-align: center; }
+}
+@media print {
+  :root, body, pre { color: #000; background: #fff; }
+  main { max-width: none; margin: 0; padding: 0; }
+  .no-print { display: none !important; }
+  pre { padding: 0; font-size: 10pt; line-height: 1.45; }
+}

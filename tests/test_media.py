@@ -17,6 +17,28 @@ from app.media import FFmpegProcessor, FrameCandidate, MediaError, deduplicate_f
 from app import media
 
 
+@pytest.mark.parametrize("diagnostic", [
+    "HTTP error 403 Forbidden https://private.invalid/?token=secret",
+    "Server returned 401 Unauthorized secret",
+    "SAMPLE-AES encryption is not supported secret",
+    "DRM protected content secret",
+    "Referrer denied secret",
+])
+def test_authorization_failures_have_a_safe_protected_category(diagnostic):
+    script = f"import sys; sys.stderr.write({diagnostic!r}); sys.exit(1)"
+    with pytest.raises(media.MediaProtectedError) as caught:
+        media._run_process([sys.executable, "-c", script], Event(), lambda name, line: None)
+    assert "secret" not in str(caught.value)
+    assert "https://" not in str(caught.value)
+
+
+def test_frame_numbers_do_not_misclassify_decode_failure_as_protected():
+    script = "import sys; sys.stderr.write('frame=401 decode error'); sys.exit(1)"
+    with pytest.raises(MediaError) as caught:
+        media._run_process([sys.executable, "-c", script], Event(), lambda name, line: None)
+    assert not isinstance(caught.value, media.MediaProtectedError)
+
+
 @pytest.mark.parametrize("outcome", [None, RuntimeError, CancelledError])
 def test_workspace_is_removed_on_every_exit(tmp_path: Path, outcome) -> None:
     created = None

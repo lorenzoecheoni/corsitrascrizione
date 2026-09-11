@@ -54,6 +54,10 @@ class MediaError(RuntimeError):
     """Safe application-authored media error without upstream diagnostics."""
 
 
+class MediaProtectedError(MediaError):
+    """FFmpeg encountered an authorization or unsupported protection failure."""
+
+
 @contextmanager
 def temporary_workspace(root: Path | None = None) -> Iterator[Path]:
     workspace = Path(tempfile.mkdtemp(prefix="bunny-video-", dir=root))
@@ -121,6 +125,19 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
     except OSError:
         raise MediaError("Impossibile avviare FFmpeg/FFprobe; verificare l'installazione") from None
     buffers: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    protected = False
+
+    def consume(name: str, line: str) -> None:
+        nonlocal protected
+        if name == "stderr" and re.search(
+            r"\b(?:forbidden|unauthorized|drm|sample-aes)\b|"
+            r"(?:http error|server returned)\s+(?:401|403)\b|"
+            r"referr?er.*(?:denied|forbidden|invalid)",
+            line, re.IGNORECASE,
+        ):
+            protected = True
+        on_line(name, line)
+
     try:
         with selectors.DefaultSelector() as selector:
             for pipe, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
@@ -134,18 +151,20 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
                     if not data:
                         selector.unregister(key.fileobj)
                         if buffers[name]:
-                            on_line(name, buffers[name].decode("utf-8", "replace"))
+                            consume(name, buffers[name].decode("utf-8", "replace"))
                         continue
                     lines = (buffers[name] + data).split(b"\n")
                     buffers[name] = lines.pop()[-16384:]
                     for line in lines:
                         if len(line) <= 16384:
-                            on_line(name, line.decode("utf-8", "replace"))
+                            consume(name, line.decode("utf-8", "replace"))
             while process.poll() is None:
                 _check_cancelled(event)
                 event.wait(.1)
             _check_cancelled(event)
             if process.returncode:
+                if protected:
+                    raise MediaProtectedError("Accesso al video negato o protezione non supportata")
                 raise MediaError("Impossibile elaborare il contenuto multimediale")
     finally:
         _stop_process(process)

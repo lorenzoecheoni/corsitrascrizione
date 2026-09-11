@@ -135,6 +135,10 @@ Pipeline = Callable[[str, ProgressCallback, Event], AcademyReport]
 
 def _safe_error(error: Exception) -> str:
     # Never expose str(error): even a known exception may carry input or secrets.
+    from app.pipeline import PipelineError
+
+    if isinstance(error, PipelineError):
+        return error.user_message
     if isinstance(error, BunnyAuthError):
         return "Accesso a Bunny non autorizzato; verifica la configurazione"
     if isinstance(error, BunnyNotFoundError):

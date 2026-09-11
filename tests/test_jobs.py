@@ -15,6 +15,19 @@ def report() -> AcademyReport:
     return AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
 
 
+def test_pipeline_user_message_reaches_failed_job():
+    from app.pipeline import PipelineError
+    store = JobStore()
+    job = store.create("private source")
+    error = PipelineError("unsupported_duration", "Il video supera il limite di quattro ore")
+    def pipeline(url, progress, cancellation_event):
+        raise error
+    runner = SingleWorkerRunner(store, pipeline)
+    runner.submit(job.id)
+    runner.shutdown(wait=True)
+    assert store.get(job.id).error == "Il video supera il limite di quattro ore"
+
+
 def test_job_reopens_from_same_store_but_not_after_restart() -> None:
     store = JobStore()
     created = store.create("https://player.mediadelivery.net/embed/123/video-id?token=secret")

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Report video · Bunny Video Report</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    <script src="{{ url_for('static', path='job.js') }}" defer></script>
+  </head>
+  <body>
+    <main id="job" data-job-id="{{ job.id }}" data-state="{{ job.state.value }}">
+      <nav class="no-print"><a href="/">← Nuovo report</a></nav>
+      <h1>Report video</h1>
+      <section class="panel no-print" aria-label="Stato del lavoro">
+        <p id="job-message" role="status">{{ job.message }}</p>
+        <label for="job-progress">Avanzamento: <span id="progress-label">{{ job.progress }}%</span></label>
+        <progress id="job-progress" value="{{ job.progress }}" max="100">{{ job.progress }}%</progress>
+        <p id="job-error" role="alert" {% if not job.error %}hidden{% endif %}>{{ job.error or '' }}</p>
+        <p id="poll-error" role="status" hidden></p>
+        <form id="cancel-form" method="post" action="/jobs/{{ job.id }}/cancel"
+              {% if job.state.value not in ['queued', 'processing'] %}hidden{% endif %}>
+          <button type="submit" class="secondary">Annulla</button>
+        </form>
+        <p class="muted">Puoi chiudere questa pagina senza interrompere il lavoro e riaprirla dallo stesso link.
+          Stato e report sono disponibili solo durante il processo corrente del server.</p>
+        <noscript>Aggiorna la pagina per seguire l’elaborazione.</noscript>
+      </section>
+      <section id="report-section" {% if not report_text %}hidden{% endif %} aria-label="Report completo">
+        <div class="actions no-print">
+          <button type="button" id="copy-report">Copia negli appunti</button>
+          <a class="button secondary" href="/jobs/{{ job.id }}/report.md">Download Markdown</a>
+          <a class="button secondary" href="/jobs/{{ job.id }}/report.txt">Download TXT</a>
+          <button type="button" id="print-report" class="secondary">Stampa / Salva PDF</button>
+        </div>
+        <p id="copy-status" role="status" class="no-print"></p>
+        <pre id="report-text">{{ report_text }}</pre>
+      </section>
+    </main>
+  </body>
+</html>

@@ -10,6 +10,15 @@
     <main>
       <h1>Bunny Video Report</h1>
       <p>Analisi interna dei video Bunny Stream.</p>
+      <form action="/jobs" method="post" class="panel">
+        <label for="source-url">Link del video Bunny</label>
+        <input id="source-url" name="source_url" type="url" required autocomplete="off"
+               placeholder="https://iframe.mediadelivery.net/embed/…" aria-describedby="privacy-note">
+        <button type="submit">Genera report</button>
+        <p id="privacy-note">Il video non viene conservato</p>
+        <p class="muted">Durata massima: quattro ore. I file temporanei vengono eliminati dopo l’elaborazione.
+          Il report rimane disponibile solo finché questo processo del server è attivo.</p>
+      </form>
     </main>
   </body>
 </html>

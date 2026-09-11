@@ -1,9 +1,12 @@
+import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 Confidence = Literal["alta", "media", "bassa"]
+GENERIC_SPEAKER_LABEL = re.compile(r"^Relatore [1-9]\d*$")
+IDENTITY_EVIDENCE_KINDS = {"introduzione", "sottopancia", "slide", "metadata"}
 
 
 class ReportModel(BaseModel):
@@ -24,6 +27,18 @@ class SpeakerProfile(ReportModel):
     role: str | None = None
     confidence: Confidence
     evidence: list[Evidence] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def requires_identity_evidence_for_personal_name(self) -> "SpeakerProfile":
+        """Allow named speakers only when the report contains permitted evidence."""
+        if GENERIC_SPEAKER_LABEL.fullmatch(self.display_name):
+            return self
+        if any(evidence.kind in IDENTITY_EVIDENCE_KINDS for evidence in self.evidence):
+            return self
+        raise ValueError(
+            "Un nome personale richiede almeno un'evidenza ammessa: "
+            "introduzione, sottopancia, slide o metadata."
+        )
 
 
 class Intervention(ReportModel):

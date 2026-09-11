@@ -1,8 +1,11 @@
 import json
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from app.costs import estimate_cost
-from app.models import AcademyReport
+from app.models import AcademyReport, SpeakerProfile
 from app.reporting import format_timestamp, render_markdown, render_text
 
 
@@ -31,3 +34,37 @@ def test_markdown_and_text_are_exportable() -> None:
     assert "01:35" in markdown
     assert "Relatori" in plain
     assert format_timestamp(3661) == "1:01:01"
+
+
+def test_speaker_rejects_personal_name_with_inference_only() -> None:
+    with pytest.raises(ValidationError, match="evidenza ammessa"):
+        SpeakerProfile.model_validate(
+            {
+                "id": "relatore-3",
+                "display_name": "Elena Verdi",
+                "confidence": "bassa",
+                "evidence": [
+                    {
+                        "kind": "inferenza",
+                        "note": "Voce distinta senza identificazione supportata.",
+                    }
+                ],
+            }
+        )
+
+
+def test_speaker_accepts_generic_label_without_admissible_evidence() -> None:
+    speaker = SpeakerProfile.model_validate(
+        {
+            "id": "relatore-3",
+            "display_name": "Relatore 3",
+            "confidence": "bassa",
+            "evidence": [
+                {
+                    "kind": "inferenza",
+                    "note": "Voce distinta senza identificazione supportata.",
+                }
+            ],
+        }
+    )
+    assert speaker.display_name == "Relatore 3"

@@ -1,15 +1,9 @@
-<!doctype html>
-<html lang="it">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Conferma analisi · Bunny Video Report</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-  </head>
-  <body><main>
-    <nav><a href="/">← Cambia video</a></nav>
-    <h1>Conferma analisi</h1>
-    <section class="panel">
+{% extends "base.html" %}
+{% block title %}Conferma analisi · Bunny Video Report{% endblock %}
+{% block header_actions %}<nav aria-label="Navigazione"><a class="button secondary" href="/">Cambia video</a></nav>{% endblock %}
+{% block content %}
+    <section class="page-intro"><div><p class="eyebrow">Conferma richiesta</p><h1>Conferma analisi</h1></div></section>
+    <section class="panel confirmation-card">
       <h2>{{ metadata.title }}</h2>
       <p>Durata: {{ duration }}</p>
       <p>Stima preventiva: {{ '%.4f'|format(cost.estimated_low_usd) }}–{{ '%.4f'|format(cost.estimated_high_usd) }} USD, oltre al traffico Bunny.</p>
@@ -20,5 +14,4 @@
         <button type="submit">Conferma e genera report</button>
       </form>
     </section>
-  </main></body>
-</html>
+{% endblock %}

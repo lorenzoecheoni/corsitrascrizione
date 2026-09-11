@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Bunny Video Report{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
+    {% block head %}{% endblock %}
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Bunny Video Report, catalogo">Bunny <span>Video Report</span></a>
+      {% block header_actions %}{% endblock %}
+    </header>
+    <main class="page-shell {% block main_class %}{% endblock %}" {% block main_attributes %}{% endblock %}>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

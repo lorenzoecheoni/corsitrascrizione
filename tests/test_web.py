@@ -113,6 +113,42 @@ def test_dashboard_renders_catalog_totals_and_recent_jobs_without_source_url(cli
     assert 'action="/selections/preview"' in response.text
 
 
+def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(client):
+    client.app.state.bunny.list_videos = lambda: catalog(
+        catalog_video(VIDEO_ID, VIDEO_TITLE, 3600),
+        catalog_video(OTHER_VIDEO_ID, OTHER_VIDEO_TITLE, 1800),
+    )
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "<header" in response.text and "<nav" in response.text and "<main" in response.text
+    assert 'action="/logout"' in response.text and 'method="post"' in response.text
+    assert 'for="catalog-search"' in response.text
+    assert 'id="catalog-search"' in response.text
+    assert 'for="status-filter"' in response.text and 'id="status-filter"' in response.text
+    assert 'for="collection-filter"' in response.text and 'id="collection-filter"' in response.text
+    assert 'data-video-row' in response.text and 'data-video-select' in response.text
+    assert 'loading="lazy"' in response.text
+    assert 'id="analyse-selection"' in response.text and 'disabled' in response.text
+    assert 'catalog.js' in response.text
+
+
+def test_catalog_script_is_limited_to_the_authenticated_dashboard(client):
+    client.app.state.bunny.list_videos = lambda: catalog(catalog_video(VIDEO_ID, VIDEO_TITLE, 3600))
+
+    dashboard = client.get("/")
+    login = client.get("/login")
+    selection = selection_form(client, [VIDEO_ID])
+    job = client.app.state.store.create("https://private.example/source")
+    report = client.get(f"/jobs/{job.id}")
+
+    assert 'catalog.js' in dashboard.text
+    assert 'catalog.js' not in login.text
+    assert 'catalog.js' not in selection.text
+    assert 'catalog.js' not in report.text
+
+
 def test_dashboard_handles_an_empty_catalog(client):
     response = client.get("/")
 

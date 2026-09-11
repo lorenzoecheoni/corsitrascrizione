@@ -1,23 +1,23 @@
-<!doctype html>
-<html lang="it">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Accesso · Bunny Video Report</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-  </head>
-  <body>
-    <main>
-      <h1>Bunny Video Report</h1>
-      <form action="/login" method="post" class="panel">
-        <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+{% extends "base.html" %}
+{% block title %}Accesso · Bunny Video Report{% endblock %}
+{% block main_class %}login-shell{% endblock %}
+{% block content %}
+  <section class="login-card" aria-labelledby="login-title">
+    <p class="eyebrow">Area riservata</p>
+    <h1 id="login-title">Spazio di lavoro Bunny</h1>
+    <p class="muted">Accedi per consultare il catalogo e preparare i report del team.</p>
+    <form action="/login" method="post" class="panel stack">
+      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+      <div>
         <label for="username">Utente</label>
         <input id="username" name="username" type="text" required autocomplete="username">
+      </div>
+      <div>
         <label for="password">Password</label>
         <input id="password" name="password" type="password" required autocomplete="current-password">
-        {% if error %}<p role="alert">{{ error }}</p>{% endif %}
-        <button type="submit">Accedi</button>
-      </form>
-    </main>
-  </body>
-</html>
+      </div>
+      {% if error %}<p class="form-error" role="alert">{{ error }}</p>{% endif %}
+      <button type="submit">Accedi</button>
+    </form>
+  </section>
+{% endblock %}

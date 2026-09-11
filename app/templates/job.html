@@ -1,16 +1,10 @@
-<!doctype html>
-<html lang="it">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Report video · Bunny Video Report</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-    <script src="{{ url_for('static', path='job.js') }}" defer></script>
-  </head>
-  <body>
-    <main id="job" data-job-id="{{ job.id }}" data-state="{{ job.state.value }}">
-      <nav class="no-print"><a href="/">← Nuovo report</a></nav>
-      <h1>Report video</h1>
+{% extends "base.html" %}
+{% block title %}Report video · Bunny Video Report{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='job.js') }}" defer></script>{% endblock %}
+{% block main_attributes %}id="job" data-job-id="{{ job.id }}" data-state="{{ job.state.value }}"{% endblock %}
+{% block header_actions %}<nav class="no-print" aria-label="Navigazione"><a class="button secondary" href="/">Nuovo report</a></nav>{% endblock %}
+{% block content %}
+      <section class="page-intro"><div><p class="eyebrow">Report</p><h1>Report video</h1></div></section>
       <section class="panel no-print" aria-label="Stato del lavoro">
         <p id="job-message" role="status">{{ job.message }}</p>
         <label for="job-progress">Avanzamento: <span id="progress-label">{{ job.progress }}%</span></label>
@@ -36,6 +30,4 @@
         <p id="copy-status" role="status" class="no-print"></p>
         <pre id="report-text">{{ report_text }}</pre>
       </section>
-    </main>
-  </body>
-</html>
+{% endblock %}

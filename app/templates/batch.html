@@ -1,24 +1,14 @@
-<!doctype html>
-<html lang="it">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Coda lavori · Bunny Video Report</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-  </head>
-  <body>
-    <main>
-      <nav><a href="/">← Torna al catalogo</a></nav>
-      <h1>Coda lavori</h1>
-      <p>Il gruppo contiene {{ jobs|length }} lavori.</p>
-      <ul>
-        {% for job in jobs %}
-        <li>
-          <a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a>
-          · {{ job.message }}
-        </li>
-        {% endfor %}
-      </ul>
-    </main>
-  </body>
-</html>
+{% extends "base.html" %}
+{% block title %}Coda lavori · Bunny Video Report{% endblock %}
+{% block header_actions %}<nav aria-label="Navigazione"><a class="button secondary" href="/">Torna al catalogo</a></nav>{% endblock %}
+{% block content %}
+  <section class="page-intro" aria-labelledby="batch-title">
+    <div><p class="eyebrow">Elaborazione</p><h1 id="batch-title">Coda lavori</h1></div>
+    <p class="catalog-total">Il gruppo contiene {{ jobs|length }} lavori.</p>
+  </section>
+  <section class="panel"><ul class="job-list">
+    {% for job in jobs %}
+    <li><a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a><span>{{ job.message }}</span></li>
+    {% endfor %}
+  </ul></section>
+{% endblock %}

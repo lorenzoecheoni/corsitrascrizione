@@ -1,51 +1,94 @@
-<!doctype html>
-<html lang="it">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Catalogo · Bunny Video Report</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}">
-  </head>
-  <body>
-    <main>
-      <h1>Catalogo Bunny</h1>
-      <p>Video disponibili: {{ total_items }} video · Durata complessiva: {{ format_timestamp(total_duration) }}</p>
-      {% if catalog_error %}
-      <p role="alert">{{ catalog_error }}</p>
-      {% elif not videos %}
-      <p>Nessun video disponibile.</p>
-      {% else %}
-      <form action="/selections/preview" method="post" class="panel">
-        <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
-        <fieldset>
-          <legend>Scegli da uno a cinquanta video</legend>
-          {% for video in videos %}
-          <article>
-            <label>
-              <input type="checkbox" name="video_ids" value="{{ video.video_id }}">
-              <strong>{{ video.title }}</strong>
-              <span> · {{ format_timestamp(video.duration_seconds) }}</span>
-            </label>
-            {% if video.description %}<p>{{ video.description }}</p>{% endif %}
-          </article>
-          {% endfor %}
-        </fieldset>
-        <button type="submit">Analizza selezionati</button>
-      </form>
-      {% endif %}
-
-      <section aria-labelledby="recent-jobs">
-        <h2 id="recent-jobs">Lavori recenti</h2>
-        {% if recent_jobs %}
-        <ul>
-          {% for job in recent_jobs %}
-          <li><a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a> · {{ job.message }}</li>
-          {% endfor %}
-        </ul>
-        {% else %}
-        <p>Nessun lavoro recente.</p>
-        {% endif %}
-      </section>
-    </main>
-  </body>
-</html>
+{% extends "base.html" %}
+{% block title %}Catalogo · Bunny Video Report{% endblock %}
+{% block header_actions %}
+  <nav aria-label="Azioni account">
+    <form action="/logout" method="post">
+      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+      <button class="text-button" type="submit">Esci</button>
+    </form>
+  </nav>
+{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='catalog.js') }}" defer></script>{% endblock %}
+{% block content %}
+  <section class="page-intro" aria-labelledby="catalog-title">
+    <div>
+      <p class="eyebrow">Libreria Bunny</p>
+      <h1 id="catalog-title">Catalogo video</h1>
+    </div>
+    <p class="catalog-total">{{ total_items }} video <span aria-hidden="true">·</span> Durata complessiva: {{ format_timestamp(total_duration) }}</p>
+  </section>
+  {% if catalog_error %}
+  <p class="notice form-error" role="alert">{{ catalog_error }}</p>
+  {% elif not videos %}
+  <section class="panel empty-state" aria-labelledby="empty-catalog">
+    <h2 id="empty-catalog">Nessun video disponibile</h2>
+    <p>Quando la libreria Bunny contiene video, compariranno qui.</p>
+  </section>
+  {% else %}
+  <form action="/selections/preview" method="post" class="catalog-form">
+    <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+    <section class="catalog-controls panel" aria-label="Filtra catalogo">
+      <div class="control-search">
+        <label for="catalog-search">Cerca nel catalogo</label>
+        <input id="catalog-search" type="search" placeholder="Titolo o descrizione">
+      </div>
+      <div>
+        <label for="status-filter">Stato Bunny</label>
+        <select id="status-filter">
+          <option value="all">Tutti gli stati</option>
+          {% for video in videos %}<option value="{{ video.status if video.status is not none else 'unknown' }}">Stato {{ video.status if video.status is not none else 'non disponibile' }}</option>{% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="collection-filter">Collezione</label>
+        <select id="collection-filter">
+          <option value="all">Tutte le collezioni</option>
+          {% for video in videos %}<option value="{{ video.collection_id or 'none' }}">{{ video.collection_id or 'Senza collezione' }}</option>{% endfor %}
+        </select>
+      </div>
+      <label class="check-control" for="selected-only">
+        <input id="selected-only" type="checkbox"> Solo selezionati
+      </label>
+      <div class="catalog-control-actions">
+        <button id="select-visible" type="button" class="secondary">Seleziona visibili</button>
+        <button id="clear-selection" type="button" class="secondary">Azzera</button>
+      </div>
+    </section>
+    <fieldset class="catalog-grid">
+      <legend class="sr-only">Scegli da uno a cinquanta video</legend>
+      {% for video in videos %}
+      <article class="video-card" data-video-row data-title="{{ video.title }}" data-description="{{ video.description or '' }}" data-status="{{ video.status if video.status is not none else 'unknown' }}" data-collection="{{ video.collection_id or 'none' }}" data-duration="{{ video.duration_seconds }}">
+        <div class="video-select">
+          <input id="video-{{ loop.index }}" data-video-select type="checkbox" name="video_ids" value="{{ video.video_id }}">
+          <label for="video-{{ loop.index }}">Seleziona {{ video.title }}</label>
+        </div>
+        {% if video.thumbnail_url %}<img src="{{ video.thumbnail_url }}" alt="" loading="lazy">{% endif %}
+        <div class="video-card-body">
+          <p class="video-meta">Stato {{ video.status if video.status is not none else 'non disponibile' }} · {{ video.collection_id or 'Senza collezione' }}</p>
+          <h2>{{ video.title }}</h2>
+          <p class="duration">{{ format_timestamp(video.duration_seconds) }}</p>
+          {% if video.uploaded_at %}<p class="video-meta">Caricato {{ video.uploaded_at.strftime('%d/%m/%Y') }}</p>{% endif %}
+          {% if video.description %}<p>{{ video.description }}</p>{% endif %}
+        </div>
+      </article>
+      {% endfor %}
+    </fieldset>
+    <aside id="selection-bar" class="selection-bar" aria-live="polite" hidden>
+      <p><strong id="selection-count">0</strong> video selezionati <span aria-hidden="true">·</span> <span id="selection-duration">00:00</span></p>
+      <button id="analyse-selection" type="submit" disabled>Analizza selezionati</button>
+    </aside>
+  </form>
+  {% endif %}
+  <section class="recent-jobs panel" aria-labelledby="recent-jobs">
+    <h2 id="recent-jobs">Lavori recenti</h2>
+    {% if recent_jobs %}
+    <ul class="job-list">
+      {% for job in recent_jobs %}
+      <li><a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a><span>{{ job.message }}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>Nessun lavoro recente.</p>
+    {% endif %}
+  </section>
+{% endblock %}

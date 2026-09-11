@@ -1,0 +1,63 @@
+{
+  "title": "Introduzione alla piattaforma Academy",
+  "duration_seconds": 3720,
+  "detected_language": "it",
+  "synopsis": "Sessione introduttiva sulle funzionalità della piattaforma Academy.",
+  "extended_description": "Il presentatore introduce due relatori, che illustrano il flusso di pubblicazione e rispondono insieme alle domande finali.",
+  "target_audience": ["team academy", "content manager"],
+  "prerequisites": ["Conoscenza base della piattaforma"],
+  "learning_objectives": ["Pubblicare un corso", "Comprendere il flusso di revisione"],
+  "speakers": [
+    {
+      "id": "presentatore",
+      "display_name": "Giulia Bianchi",
+      "role": "Presentatrice",
+      "confidence": "alta",
+      "evidence": [
+        {"kind": "introduzione", "timestamp_seconds": 12, "note": "Si presenta come Giulia Bianchi."}
+      ]
+    },
+    {
+      "id": "relatore-1",
+      "display_name": "Marco Rossi",
+      "role": "Relatore",
+      "confidence": "alta",
+      "evidence": [
+        {"kind": "sottopancia", "timestamp_seconds": 48, "note": "Sottopancia: Marco Rossi, Product Manager."}
+      ]
+    },
+    {
+      "id": "relatore-2",
+      "display_name": "Relatore 2",
+      "role": "Relatrice tecnica",
+      "confidence": "bassa",
+      "evidence": [
+        {"kind": "inferenza", "timestamp_seconds": 420, "note": "Voce distinta, nome non supportato da introduzione, sottopancia, slide o metadata."}
+      ]
+    }
+  ],
+  "interventions": [
+    {"start_seconds": 0, "end_seconds": 44, "speaker_ids": ["presentatore"], "summary": "Apertura e presentazione della sessione."},
+    {"start_seconds": 2100, "end_seconds": 2280, "speaker_ids": ["relatore-1", "relatore-2"], "summary": "Risposta congiunta alle domande sulla revisione."}
+  ],
+  "chapters": [
+    {"start_seconds": 0, "end_seconds": 600, "title": "Introduzione", "summary": "Obiettivi e relatori."},
+    {"start_seconds": 600, "end_seconds": 3720, "title": "Pubblicazione", "summary": "Procedura e domande finali."}
+  ],
+  "slides": [
+    {"timestamp_seconds": 95, "title": "Agenda", "visible_content": ["Obiettivi", "Flusso di pubblicazione"], "confidence": "alta"},
+    {"timestamp_seconds": 720, "title": "Revisione dei contenuti", "visible_content": ["Bozza", "Approvazione"], "confidence": "media"}
+  ],
+  "topics": ["academy", "pubblicazione", "revisione"],
+  "keywords": ["corso", "contenuti", "approvazione"],
+  "key_takeaways": ["La revisione precede la pubblicazione.", "La responsabilità è condivisa dal team."],
+  "uncertainties": ["Il nome del Relatore 2 non è supportato da evidenze non biometriche."],
+  "cost": {
+    "estimated_low_usd": 0.42,
+    "estimated_high_usd": 0.71,
+    "bunny_bandwidth_usd": 0.0045,
+    "transcription_usd": 0.45,
+    "analysis_usd": 0.11,
+    "basis": "Stima iniziale da durata e byte letti; calibrare con gli usage reali."
+  }
+}

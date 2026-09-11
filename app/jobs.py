@@ -23,6 +23,7 @@ from app.bunny import (
     BunnyUrlError,
 )
 from app.models import AcademyReport
+from app.logging_config import job_log_context
 
 
 class JobState(StrEnum):
@@ -210,7 +211,8 @@ class SingleWorkerRunner:
         error = None
         cancelled = False
         try:
-            report = self._pipeline(record.source_url, progress_callback, event)
+            with job_log_context(job_id):
+                report = self._pipeline(record.source_url, progress_callback, event)
             if not isinstance(report, AcademyReport):
                 raise ValueError("La pipeline deve restituire un report Academy")
         except CancelledError:

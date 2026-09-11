@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+from time import monotonic
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
@@ -11,6 +13,7 @@ from app.auth import basic, require_team
 from app.bunny import BunnyClient
 from app.config import Settings
 from app.jobs import JobStore, SingleWorkerRunner
+from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
 from app.pipeline import AnalysisPipeline
 from app.transcription import OpenAITranscriber
@@ -22,6 +25,7 @@ APP_DIRECTORY = Path(__file__).parent
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or Settings()
+    configure_logging(app_settings)
     bunny = BunnyClient(app_settings)
     media = FFmpegProcessor()
     openai = OpenAI(api_key=app_settings.openai_api_key, max_retries=0)
@@ -53,14 +57,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.runner = runner
     authenticate = require_team(app_settings.app_password)
 
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        return JSONResponse({"detail": "Dati della richiesta non validi"}, status_code=422)
+
     @app.middleware("http")
     async def protect_application(request: Request, call_next):
+        started = monotonic()
         if request.url.path != "/healthz":
             try:
                 authenticate(await basic(request))
             except HTTPException as exc:
+                log_event("http", elapsed_seconds=monotonic() - started,
+                          status_code=exc.status_code, error_code="unauthorized",
+                          route="unmatched", method=request.method)
                 return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = JSONResponse({"detail": "Impossibile completare la richiesta"}, status_code=500)
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        log_event("http", elapsed_seconds=monotonic() - started,
+                  status_code=response.status_code,
+                  error_code="temporary_failure" if response.status_code >= 500 else
+                             "invalid_request" if response.status_code == 422 else "ok",
+                  route=route, method=request.method)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"

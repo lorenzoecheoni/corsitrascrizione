@@ -16,6 +16,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import Settings
+from app.logging_config import log_event
 
 
 class BunnyError(Exception):
@@ -166,16 +167,21 @@ class BunnyClient:
         if library_id <= 0:
             raise BunnyUrlError("Identificativo libreria Bunny non valido")
         url = f"https://video.bunnycdn.com/library/{library_id}/videos/{validated_id}"
+        started = time.monotonic()
         try:
             # Do not forward AccessKey through redirects or environment proxies.
             with httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False) as client:
                 response = client.get(url, headers={"AccessKey": self._settings.bunny_stream_api_key})
         except httpx.TimeoutException:
+            log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1, error_code="timeout")
             raise BunnyTimeoutError("Bunny non ha risposto entro il tempo previsto") from None
         except httpx.RequestError:
+            log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1, error_code="transport")
             raise BunnyTransportError("Impossibile contattare Bunny; riprova più tardi") from None
 
         status = response.status_code
+        log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1,
+                  status_code=status, error_code="ok" if status == 200 else "remote_response")
         if status in (401, 403):
             raise BunnyAuthError("Accesso a Bunny non autorizzato; verifica la configurazione", status_code=status)
         if status == 404:

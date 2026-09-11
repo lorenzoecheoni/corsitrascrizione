@@ -49,6 +49,14 @@ def assert_private(caplog, sentinels, response=""):
         assert value not in rendered
 
 
+def authenticate(client, password):
+    response = client.post("/login", data={
+        "username": "team", "password": password,
+        "csrf_token": client.app.state.csrf_token,
+    }, follow_redirects=False)
+    assert response.status_code == 303
+
+
 def failing_pipeline(settings, sentinels, tmp_path, phase):
     errors = {"metadata": BunnyAuthError, "media": MediaError,
               "transcription": TranscriptionError, "analysis": AnalysisError}
@@ -97,10 +105,10 @@ def test_http_failed_job_has_safe_correlated_event(caplog, settings, sentinels, 
     pipeline = failing_pipeline(settings, sentinels, tmp_path, phase)
     app.state.runner._pipeline = pipeline.run
     with TestClient(app) as client:
+        authenticate(client, sentinels.password)
         job = app.state.store.create(sentinels.source_url)
         app.state.runner.submit(job.id).result(timeout=5)
-        response = client.get(f"/api/jobs/{job.id}?token={sentinels.token}",
-                              auth=("team", sentinels.password))
+        response = client.get(f"/api/jobs/{job.id}?token={sentinels.token}")
     app.state.runner.shutdown()
     assert response.status_code == 200
     assert response.json()["state"] == "failed"
@@ -138,8 +146,9 @@ def test_repeated_app_creation_is_idempotent_and_access_uses_template(caplog, se
     assert tuple(logging.getLogger().handlers) == handlers
     caplog.clear()
     with TestClient(second) as client:
-        response = client.get(f"/api/jobs/{sentinels.body}?token={sentinels.token}",
-                              auth=("team", sentinels.password))
+        authenticate(client, sentinels.password)
+        caplog.clear()
+        response = client.get(f"/api/jobs/{sentinels.body}?token={sentinels.token}")
     first.state.runner.shutdown()
     second.state.runner.shutdown()
     assert_private(caplog, sentinels, response.text)
@@ -158,10 +167,10 @@ def test_unexpected_http_and_validation_errors_are_fixed(caplog, settings, senti
         raise RuntimeError(" ".join(sentinels.all))
 
     with TestClient(app, raise_server_exceptions=False) as client:
-        responses = [client.get("/fake-error", auth=("team", sentinels.password)),
+        authenticate(client, sentinels.password)
+        responses = [client.get("/fake-error"),
                      client.post("/preview", files={"source_url": (sentinels.body, sentinels.image)},
-                                 headers={"X-CSRF-Token": app.state.csrf_token},
-                                 auth=("team", sentinels.password))]
+                                 headers={"X-CSRF-Token": app.state.csrf_token})]
     app.state.runner.shutdown()
     assert [r.status_code for r in responses] == [500, 422]
     assert_private(caplog, sentinels, "".join(r.text for r in responses))
@@ -237,9 +246,9 @@ def test_invalid_source_has_safe_validation_error_in_pipeline_and_http(caplog, s
         pipeline.run(invalid_source, lambda *_: None)
     assert caught.value.code == "invalid_link"
     with TestClient(app) as client:
+        authenticate(client, sentinels.password)
         response = client.post("/preview", data={"source_url": invalid_source},
-                               headers={"X-CSRF-Token": app.state.csrf_token},
-                               auth=("team", sentinels.password))
+                               headers={"X-CSRF-Token": app.state.csrf_token})
     app.state.runner.shutdown()
     assert response.status_code == 422
     assert_private(caplog, sentinels, response.text + str(caught.value))

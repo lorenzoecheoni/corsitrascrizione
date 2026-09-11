@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
@@ -23,17 +24,35 @@ from app.web import router
 APP_DIRECTORY = Path(__file__).parent
 
 
+@dataclass(frozen=True)
+class Services:
+    bunny: BunnyClient
+    media: FFmpegProcessor
+    openai: OpenAI
+    transcriber: OpenAITranscriber
+    analyzer: OpenAIAnalyzer
+    pipeline: AnalysisPipeline
+    store: JobStore
+    runner: SingleWorkerRunner
+
+
+def build_services(settings: Settings) -> Services:
+    """Build the production graph; remote boundaries may be substituted in tests."""
+    bunny = BunnyClient(settings)
+    media = FFmpegProcessor()
+    openai = OpenAI(api_key=settings.openai_api_key, max_retries=0)
+    transcriber = OpenAITranscriber(openai)
+    analyzer = OpenAIAnalyzer(openai)
+    pipeline = AnalysisPipeline(settings, bunny, media, transcriber, analyzer)
+    store = JobStore()
+    runner = SingleWorkerRunner(store, pipeline.run)
+    return Services(bunny, media, openai, transcriber, analyzer, pipeline, store, runner)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or Settings()
     configure_logging(app_settings)
-    bunny = BunnyClient(app_settings)
-    media = FFmpegProcessor()
-    openai = OpenAI(api_key=app_settings.openai_api_key, max_retries=0)
-    transcriber = OpenAITranscriber(openai)
-    analyzer = OpenAIAnalyzer(openai)
-    pipeline = AnalysisPipeline(app_settings, bunny, media, transcriber, analyzer)
-    store = JobStore()
-    runner = SingleWorkerRunner(store, pipeline.run)
+    services = build_services(app_settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -42,19 +61,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             # The active worker owns media cleanup; allow it to finish without
             # blocking the event loop or closing its remote client prematurely.
-            runner.shutdown(wait=False)
+            services.runner.shutdown(wait=False)
 
     app = FastAPI(title="Bunny Video Report", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = app_settings
-    app.state.bunny = bunny
-    app.state.media = media
-    app.state.openai = openai
-    app.state.transcriber = transcriber
-    app.state.analyzer = analyzer
-    app.state.pipeline = pipeline
-    app.state.store = store
-    app.state.runner = runner
+    app.state.bunny = services.bunny
+    app.state.media = services.media
+    app.state.openai = services.openai
+    app.state.transcriber = services.transcriber
+    app.state.analyzer = services.analyzer
+    app.state.pipeline = services.pipeline
+    app.state.store = services.store
+    app.state.runner = services.runner
     authenticate = require_team(app_settings.app_password)
 
     @app.exception_handler(RequestValidationError)

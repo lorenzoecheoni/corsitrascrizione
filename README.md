@@ -1,6 +1,6 @@
 # Bunny Video Report
 
-Applicazione interna per trasformare video Bunny Stream in report Academy in italiano: descrizione, destinatari, obiettivi, relatori con evidenze e incertezze, interventi, capitoli, slide e stima dei costi. Anche quando pubblicata online rimane uno strumento a uso interno del team, protetto da HTTP Basic Auth e HTTPS.
+Applicazione interna per trasformare video Bunny Stream in report Academy in italiano: descrizione, destinatari, obiettivi, relatori con evidenze e incertezze, interventi, capitoli, slide e stima dei costi. Anche quando pubblicata online rimane uno strumento a uso interno del team, protetto da login web, cookie di sessione e HTTPS.
 
 ## Avvio locale
 
@@ -15,14 +15,16 @@ chmod 600 .env
 .venv/bin/python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-Aprire `http://127.0.0.1:8000`. Utente Basic Auth: `team`; password: `APP_PASSWORD`. Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente hanno precedenza. Non attivare access log, debug con variabili locali o logging dei corpi delle richieste. Nessuna chiamata remota viene effettuata all'import del modulo; `create_app` è una factory e `build_services(settings)` costruisce le dipendenze sostituibili.
+Aprire `http://127.0.0.1:8000/login`. L'utente è fisso: `team`; la password è `APP_PASSWORD`. Un accesso valido rilascia un cookie firmato, `HttpOnly` e `SameSite=Strict`, valido 12 ore; su HTTPS è anche `Secure`. Logout e ogni azione che crea, annulla o conferma un lavoro richiedono CSRF. Un riavvio invalida cookie, coda e conferme in memoria.
+
+Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente hanno precedenza. Non attivare access log, debug con variabili locali o logging dei corpi delle richieste. Nessuna chiamata remota viene effettuata all'import del modulo; `create_app` è una factory e `build_services(settings)` costruisce le dipendenze sostituibili.
 
 ## Configurazione
 
 | Variabile | Valore richiesto |
 | --- | --- |
 | `BUNNY_LIBRARY_ID` | ID numerico positivo della libreria autorizzata |
-| `BUNNY_STREAM_API_KEY` | Chiave API Stream read-only della stessa libreria |
+| `BUNNY_STREAM_API_KEY` | Chiave API Stream read-only della stessa libreria, ottenuta dalle impostazioni della libreria Bunny |
 | `BUNNY_CDN_HOSTNAME` | Hostname CDN della libreria, senza `https://`, porta o percorso |
 | `BUNNY_TOKEN_AUTH_KEY` | Chiave token CDN opzionale; lasciare vuota se token authentication è disabilitata |
 | `OPENAI_API_KEY` | Chiave OpenAI del progetto autorizzato alla trascrizione e analisi |
@@ -30,9 +32,15 @@ Aprire `http://127.0.0.1:8000`. Utente Basic Auth: `team`; password: `APP_PASSWO
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 
+La chiave Stream va creata o recuperata nelle impostazioni della **libreria** configurata e deve essere limitata alla lettura. Non usare una chiave di un'altra libreria né una chiave con permessi di scrittura. `OPENAI_API_KEY` richiede fatturazione o crediti per la **OpenAI API**: è separata da un eventuale abbonamento ChatGPT.
+
 La chiave Bunny deve avere permessi di sola lettura. L'applicazione legge i metadati con GET e il flusso HLS; non crea, modifica o elimina video, capitoli, sottotitoli o configurazioni Bunny. Audio e frame selezionati vengono inviati a OpenAI per l'analisi; le chiamate Responses usano `store=False`. Questo non equivale a una garanzia sulla conservazione lato fornitore: applicare le policy del proprio account.
 
-## Video e utilizzo
+## Catalogo, selezione e utilizzo
+
+Dopo il login, la dashboard legge il catalogo della sola libreria Bunny configurata a ogni apertura o aggiornamento. Non salva il catalogo: il limite operativo è **10.000 video per caricamento**; una libreria più grande richiede paginazione lato server prima di poter proseguire. Ricerca, filtri e selezione agiscono nel browser sui dati visualizzati.
+
+Selezionare da **1 a 50 video** e scegliere `Analizza selezionati`. Il server rilegge i metadati Bunny e mostra durata e stima totale prima di creare alcun lavoro. Solo `Conferma e genera report` accoda un lavoro indipendente per ogni video; più di 50 report richiedono gruppi successivi. La conferma firmata scade dopo dieci minuti. Un errore di un video non deve bloccare gli altri lavori del gruppo.
 
 Sono accettati link HTTPS nei seguenti formati, esclusivamente per la libreria e il CDN configurati:
 
@@ -42,7 +50,7 @@ Sono accettati link HTTPS nei seguenti formati, esclusivamente per la libreria e
 
 Eventuali query del link incollato vengono scartate. Il playback viene ricostruito usando la configurazione del server e, se presente, la chiave token CDN. Link dashboard, URL arbitrari e video di altre librerie non sono supportati. DRM e restrizioni referrer che impediscono l'accesso server sono esclusi: non vengono aggirati. La compatibilità dei token e delle protezioni della propria libreria deve essere verificata con il test live.
 
-Il form autenticato mostra prima il titolo originale Bunny, la durata e la stima del costo; soltanto la conferma accoda il lavoro. Entrambi i form e l’annullamento richiedono un token CSRF casuale valido per la vita del processo. La conferma scade dopo dieci minuti. Il worker rilegge i metadati e verifica nuovamente la disponibilità: gli stati Bunny 3 (Finished) e 4 (Resolution finished) sono accettati solo con risoluzioni disponibili. Descrizione, capitoli e didascalie esistenti sono usati come evidenze nell’analisi.
+Il form autenticato mostra prima il titolo originale Bunny, la durata e la stima del costo; soltanto la conferma accoda il lavoro. Il worker rilegge i metadati e verifica nuovamente la disponibilità: gli stati Bunny 3 (Finished) e 4 (Resolution finished) sono accettati solo con risoluzioni disponibili. Descrizione, capitoli e didascalie esistenti sono usati come evidenze nell’analisi.
 
 La playlist master viene letta entro 1 MB e viene scelta la variante alla risoluzione minima disponibile, al massimo 720p; a parità di risoluzione viene scelto il bitrate minore. Se mancano varianti ridotte, abilitare una risoluzione SD nella codifica Bunny. Le varianti devono restare nella directory autorizzata sul CDN configurato. Playlist con tracce audio esterne separate non sono supportate in questa versione. FFmpeg legge una sola variante completa e produce audio e immagini dalla stessa lettura; il ritorno a una slide precedente conserva il nuovo timestamp.
 
@@ -52,9 +60,9 @@ Il target operativo è costituito da video di **1-4 ore**; i video brevi sono ac
 
 Nomi e ruoli richiedono evidenze testuali o visive; in caso di dubbio compaiono etichette generiche e incertezze. L'identità dei relatori non viene dedotta biometricamente dalla voce. Il report richiede revisione umana prima dell'uso editoriale.
 
-## Dati temporanei e riavvio
+## Dati temporanei, persistenza e riavvio
 
-Audio e frame sono salvati in directory temporanee per la durata del lavoro e rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline. I report e la coda restano nella memoria del singolo processo: **un riavvio perde tutti i lavori e report**, e i vecchi URL restituiscono 404. Scaricare gli export prima della manutenzione; i file scaricati sul computer dell'utente restano finché l'utente li elimina.
+Non sono presenti database, storage persistente o storage video applicativo. Il catalogo Bunny non viene memorizzato. Audio e frame sono salvati in directory temporanee per la durata del lavoro e rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline. I report, la coda, i batch e le sessioni restano nella memoria del singolo processo: **un riavvio perde tutti i lavori e report**, e i vecchi URL restituiscono 404. Scaricare gli export prima della manutenzione; i file scaricati sul computer dell'utente restano finché l'utente li elimina.
 
 L'annullamento attende che la fase in corso riconosca la richiesta e pulisca i file; una chiamata remota già in corso può terminare prima dell'annullamento. Durante l'arresto ordinato il worker può finire i lavori già accodati. Prima di riavviare, annullare o attendere tutti i lavori. Un arresto forzato, un crash o la perdita dell'host possono impedire la pulizia: usare storage temporaneo effimero, senza backup, e rimuovere le sole directory residue `bunny-video-*` quando nessun worker è attivo. Non promettere pulizia Python dopo SIGKILL.
 
@@ -68,22 +76,28 @@ docker run --rm --env-file .env -p 127.0.0.1:8000:8000 bunny-video-report:local
 
 L'immagine include FFmpeg, template e asset statici, esegue l'app come `appuser` non root e avvia `uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log`. I segreti entrano soltanto a runtime attraverso `--env-file` o il secret manager del servizio scelto; non usare build argument o `ENV` nel Dockerfile per le credenziali. La directory di build è filtrata da `.dockerignore`.
 
-Il provider non è ancora scelto. Per pubblicare, configurare un reverse proxy con certificato TLS valido davanti alla porta privata 8000 e usare sempre **HTTPS** per l'accesso remoto: Basic Auth trasporta credenziali e non cifra il traffico. Impedire l'accesso pubblico diretto alla porta del container e inoltrare gli header proxy soltanto da proxy fidati. Disabilitare anche sul proxy il logging di header Authorization, body, query e URL completi sensibili.
+La distribuzione prevista è Railway. Per pubblicare, configurare il dominio con TLS valido e usare sempre **HTTPS** per l'accesso remoto, così il cookie di sessione viene emesso con `Secure`. Impedire l'accesso pubblico diretto alla porta del container e inoltrare gli header proxy soltanto da proxy fidati. Disabilitare anche sul proxy il logging di cookie, body, query e URL completi sensibili.
 
 Usare **esattamente una replica e un processo Uvicorn**, senza `--workers` multipli, autoscaling o rolling overlap: queue e report sono in memoria e non sono condivisi fra processi. Configurare il provider senza sospensione automatica durante i lavori, con risorse CPU/RAM e spazio temporaneo adeguati ai video lunghi. Misurare il fabbisogno sul primo video reale; non è stato ancora calibrato.
 
-`GET /healthz` è pubblico e restituisce `{"status":"ok"}`; tutte le altre rotte, inclusi asset e download, richiedono autenticazione. L'healthcheck prova che il processo HTTP risponde, non che Bunny/OpenAI siano raggiungibili o che le credenziali siano corrette. Il Dockerfile include questa verifica di salute.
+`GET /healthz`, `/login` e gli asset statici sono pubblici; dashboard, batch, lavori, download e API richiedono una sessione. L'healthcheck prova che il processo HTTP risponde, non che Bunny/OpenAI siano raggiungibili o che le credenziali siano corrette. Il Dockerfile include questa verifica di salute.
 
 ## Costi e collaudo
+
+Le tariffe seguenti sono riferimenti indicativi, non un preventivo né una garanzia di fatturazione: piani, valute, tassazione, regioni, modelli e condizioni commerciali possono cambiare. Prima di impegnare budget, verificare sempre le pagine ufficiali e la fattura del proprio account.
+
+- **Bunny Stream:** richiede un account Bunny e una libreria che contenga i video. Il minimo dell'account è indicativamente **$1/mese**; lo standard encoding è incluso. Come riferimento, lo storage Stream a Francoforte è **$0,01/GB** e la CDN standard in Europa/Nord America è **$0,01/GB**. L'app non usa Bunny AI Transcription (indicativamente **$0,10/min**): usa OpenAI per la trascrizione. Consultare [prezzi Bunny](https://bunny.net/pricing).
+- **OpenAI API:** fatturazione e crediti API sono separati da ChatGPT. `gpt-4o-transcribe` è circa **$0,006/min** (**$0,36/ora**); il modello di diarizzazione usato dall'app, `gpt-4o-transcribe-diarize`, è quotato a **$2,50/M token input** e **$10/M token output**. L'analisi usa `gpt-5.6-luna`, stimata a **$0,20/M input** e **$1,20/M output**. Consultare [prezzi OpenAI API](https://openai.com/api/pricing/) e la [scheda del modello di diarizzazione](https://developers.openai.com/api/docs/models/gpt-4o-transcribe-diarize).
+- **Railway:** il Trial assegna indicativamente **$5 una tantum** per al massimo **30 giorni**; il piano Free offre **$1 di credito/mese**. Hobby costa **$5/mese**, include $5 di risorse e il consumo eccedente viene addebitato. Consultare [piani Railway](https://docs.railway.com/pricing/plans) e [prezzi Railway](https://railway.com/pricing).
 
 La stima iniziale è **$0.40-$0.70 per ora di video**, da ricalibrare sul primo video reale usando usage API e traffico Bunny. Non è un preventivo: modello, numero di frame, retry, contenuti e tariffe possono cambiare il costo. Il traffico mostrato è una stima dai byte dei pacchetti di input FFmpeg con margine del 20%, non traffico di rete misurato. Le costanti iniziali sono in `app/costs.py`; aggiornarle soltanto sulla base di misure reali insieme a questo README.
 
 Il report conserva separatamente titolo Bunny e titolo didattico suggerito. Nei download e nella pagina compaiono i contatori numerici restituiti da trascrizione e Responses per ogni tentativo, inclusi batch, retry e riparazioni quando disponibili. I contatori mancanti sono dichiarati; la stima usa quelli disponibili e aggiunge una quota da durata quando non è possibile calcolare un tentativo. Non sostituisce la fattura. Il traffico di un tentativo FFmpeg fallito non è misurabile dalla sintesi finale ed è escluso dalla stima di banda.
 
-Suite offline, senza credenziali reali né accesso ai servizi:
+Suite offline, senza credenziali reali né accesso ai servizi (fornire FFmpeg e FFprobe nel `PATH`):
 
 ```sh
-.venv/bin/python -m pytest -m 'not live' -q
+PATH='/percorso/a/ffmpeg:'"$PATH" .venv/bin/python -m pytest -m 'not live' -q
 ```
 
 Lo smoke `tests/test_end_to_end.py` genera un video sintetico con FFmpeg, usa confini Bunny/OpenAI finti e attraversa form, worker, schema, download e pulizia temporanea entro 15 secondi. Verifica anche autenticazione, healthcheck e perdita del lavoro al riavvio. FFmpeg e FFprobe devono essere disponibili nel `PATH`.

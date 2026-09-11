@@ -366,29 +366,29 @@
 - Consumes: tutte le API e rotte dei task precedenti.
 - Produces: istruzioni operative aggiornate e versione Railway verificata.
 
-- [ ] **Step 1: Aggiornare la documentazione operativa**
+- [x] **Step 1: Aggiornare la documentazione operativa**
 
   Sostituire Basic Auth con login/cookie, documentare catalogo e limite 50, precisare che Bunny Stream API key proviene dalle impostazioni della libreria e che OpenAI API billing è separato da ChatGPT. Riportare come riferimenti verificati: Bunny Stream minimo mensile e tariffe storage/CDN, OpenAI diarized transcription e Luna per token, Railway Trial/Hobby e billing a consumo. Conservare l'avvertenza che le tariffe possono cambiare.
 
-- [ ] **Step 2: Eseguire la suite completa con FFmpeg**
+- [x] **Step 2: Eseguire la suite completa con FFmpeg**
 
   Run: `PATH='/Users/lorenzo/.Trash/bunny-video-report-sdd-20260911-01/tools:'$PATH .venv/bin/python -m pytest -m 'not live' -q`
 
   Expected: tutti i test offline PASS e un solo test live deselected.
 
-- [ ] **Step 3: Eseguire i test browser senza provider**
+- [x] **Step 3: Eseguire i test browser senza provider**
 
   Run: `node tests/catalog_ui.cjs && node tests/job_ui.cjs`
 
   Expected: due righe PASS, nessun errore.
 
-- [ ] **Step 4: Verificare artefatto Python e Dockerfile**
+- [x] **Step 4: Verificare artefatto Python e Dockerfile**
 
   Run: `.venv/bin/python -m build --wheel`
 
   Expected: wheel creata e contenente template/static. Ispezionare `Dockerfile` e lasciare la build reale a Railway se Docker locale non è disponibile.
 
-- [ ] **Step 5: Commit della documentazione**
+- [x] **Step 5: Commit della documentazione**
 
   ```bash
   git add README.md .env.example docs/superpowers/plans/2026-09-11-catalog-login-redesign.md
@@ -414,4 +414,3 @@
 - [ ] **Step 8: Collaudo provider con credenziali reali**
 
   Inserire i valori reali nel secret manager Railway, senza commit o output terminale. Verificare il catalogo completo; selezionare un video breve; controllare costo, coda, report ed export. Solo dopo il video breve, provare un contenuto reale da 1–4 ore e registrare durata/costo senza contenuti sensibili.
-

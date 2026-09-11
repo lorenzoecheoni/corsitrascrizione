@@ -29,6 +29,8 @@ from app.config import Settings
 VIDEO_ID = "11111111-2222-3333-4444-555555555555"
 CDN = "academy.example.b-cdn.net"
 METADATA_URL = f"https://video.bunnycdn.com/library/123/videos/{VIDEO_ID}"
+OTHER_VIDEO_ID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+CATALOG_URL = "https://video.bunnycdn.com/library/123/videos"
 
 
 @pytest.fixture
@@ -46,6 +48,208 @@ def settings() -> Settings:
 
 def parse(url: str):
     return parse_bunny_url(url, expected_library_id=123, cdn_hostname=CDN)
+
+
+def catalog_item(video_id: str, **overrides: object) -> dict[str, object]:
+    item: dict[str, object] = {
+        "guid": video_id,
+        "title": f"Corso {video_id[:8]}",
+        "length": 120.5,
+        "status": 4,
+        "description": "Descrizione catalogo",
+        "dateUploaded": "2026-09-11T10:30:00Z",
+        "collectionId": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+        "thumbnailFileName": "thumbnail.jpg",
+    }
+    item.update(overrides)
+    return item
+
+
+def catalog_page(items: list[dict[str, object]], *, total: int, page: int, per_page: int = 100) -> dict[str, object]:
+    return {
+        "totalItems": total,
+        "currentPage": page,
+        "itemsPerPage": per_page,
+        "items": items,
+    }
+
+
+@respx.mock
+def test_list_videos_reads_every_page_once_in_provider_order(settings, monkeypatch) -> None:
+    created_clients: list[dict[str, object]] = []
+    real_client = httpx.Client
+
+    def observing_client(*args, **kwargs):
+        created_clients.append(kwargs)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("app.bunny.httpx.Client", observing_client)
+    first = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([catalog_item(VIDEO_ID)], total=2, page=1)
+    )
+    second = respx.get(CATALOG_URL, params={"page": 2, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([catalog_item(OTHER_VIDEO_ID)], total=2, page=2)
+    )
+
+    result = BunnyClient(settings).list_videos()
+
+    assert [str(video.video_id) for video in result.videos] == [VIDEO_ID, OTHER_VIDEO_ID]
+    assert result.total_items == 2
+    assert first.call_count == second.call_count == 1
+    assert len(respx.calls) == 2
+    assert all(call.request.headers["AccessKey"] == "bunny-secret" for call in respx.calls)
+    assert created_clients == [{"timeout": 30.0, "follow_redirects": False, "trust_env": False}] * 2
+
+
+@respx.mock
+def test_list_videos_returns_an_empty_catalog_after_its_first_page(settings) -> None:
+    route = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([], total=0, page=1)
+    )
+
+    result = BunnyClient(settings).list_videos()
+
+    assert result.videos == []
+    assert result.total_items == 0
+    assert route.call_count == len(respx.calls) == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("payload", [
+    catalog_page([catalog_item(VIDEO_ID)], total=2, page=2),
+    catalog_page([catalog_item(VIDEO_ID)], total=2, page=1, per_page=-1),
+    catalog_page([catalog_item(VIDEO_ID)], total=-1, page=1),
+    catalog_page([catalog_item(VIDEO_ID)], total=0, page=1),
+    {"totalItems": 1, "currentPage": 1, "itemsPerPage": 100, "items": "not-a-list"},
+])
+def test_list_videos_rejects_incoherent_page_counters_and_items(settings, payload) -> None:
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(200, json=payload)
+
+    with pytest.raises(BunnyResponseError):
+        BunnyClient(settings).list_videos()
+
+
+@respx.mock
+def test_list_videos_rejects_duplicate_ids_across_pages(settings) -> None:
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([catalog_item(VIDEO_ID)], total=2, page=1)
+    )
+    respx.get(CATALOG_URL, params={"page": 2, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([catalog_item(VIDEO_ID)], total=2, page=2)
+    )
+
+    with pytest.raises(BunnyResponseError) as caught:
+        BunnyClient(settings).list_videos()
+
+    assert "11111111" not in str(caught.value)
+
+
+@respx.mock
+def test_list_videos_rejects_catalogues_over_the_operational_limit(settings) -> None:
+    route = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        200, json=catalog_page([], total=10_001, page=1)
+    )
+
+    with pytest.raises(BunnyResponseError, match="Catalogo Bunny troppo grande; usa la paginazione"):
+        BunnyClient(settings).list_videos()
+
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("overrides", [
+    {"guid": "not-a-uuid"},
+    {"length": -0.01},
+    {"length": "NaN"},
+    {"dateUploaded": "not-a-date"},
+    {"thumbnailFileName": "../secret.jpg"},
+])
+def test_list_videos_redacts_invalid_provider_item_fields(settings, overrides, caplog) -> None:
+    caplog.set_level(logging.DEBUG)
+    payload = catalog_page([catalog_item(VIDEO_ID, **overrides)], total=1, page=1)
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(200, json=payload)
+
+    with pytest.raises(BunnyResponseError) as caught:
+        BunnyClient(settings).list_videos()
+
+    rendered = str(caught.value) + caplog.text
+    assert "not-a-uuid" not in rendered
+    assert "secret.jpg" not in rendered
+
+
+@respx.mock
+@pytest.mark.parametrize("status, error_type, retryable", [
+    (401, BunnyAuthError, False),
+    (403, BunnyAuthError, False),
+    (429, BunnyRateLimitError, True),
+    (500, BunnyServerError, True),
+])
+def test_list_videos_classifies_http_failures_without_leaking_provider_data(settings, status, error_type, retryable, caplog) -> None:
+    caplog.set_level(logging.DEBUG)
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        status, text="bunny-secret upstream-body ?token=never-echo-this"
+    )
+
+    with pytest.raises(error_type) as caught:
+        BunnyClient(settings).list_videos()
+
+    assert caught.value.retryable is retryable
+    assert not any(secret in str(caught.value) + caplog.text for secret in ["bunny-secret", "upstream-body", "never-echo-this"])
+
+
+@respx.mock
+def test_list_videos_redacts_timeout_responses(settings) -> None:
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).mock(
+        side_effect=httpx.ReadTimeout("bunny-secret upstream-body")
+    )
+    with pytest.raises(BunnyTimeoutError) as timeout:
+        BunnyClient(settings).list_videos()
+    assert "bunny-secret" not in str(timeout.value)
+
+
+@respx.mock
+def test_list_videos_redacts_non_json_responses(settings) -> None:
+    respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(200, text="bunny-secret upstream-body")
+    with pytest.raises(BunnyResponseError) as non_json:
+        BunnyClient(settings).list_videos()
+    assert "upstream-body" not in str(non_json.value)
+
+
+@respx.mock
+def test_list_videos_does_not_follow_redirects(settings) -> None:
+    route = respx.get(CATALOG_URL, params={"page": 1, "itemsPerPage": 100}).respond(
+        302, headers={"Location": "https://evil.example"}
+    )
+    with pytest.raises(BunnyResponseError):
+        BunnyClient(settings).list_videos()
+    assert route.call_count == 1
+
+
+def test_build_thumbnail_url_uses_only_validated_configured_components(settings) -> None:
+    assert BunnyClient(settings).build_thumbnail_url(VIDEO_ID, "cover-image_1.jpg") == (
+        f"https://{CDN}/{VIDEO_ID}/cover-image_1.jpg"
+    )
+
+
+@pytest.mark.parametrize("filename", ["", ".cover.jpg", "../cover.jpg", "cover/other.jpg", "cover space.jpg", "café.jpg", "a" * 256])
+def test_build_thumbnail_url_rejects_untrusted_filename(settings, filename) -> None:
+    with pytest.raises(BunnyUrlError) as caught:
+        BunnyClient(settings).build_thumbnail_url(VIDEO_ID, filename)
+    if filename:
+        assert filename not in str(caught.value)
+
+
+def test_build_thumbnail_url_reuses_directory_token_without_exposing_key(settings, monkeypatch) -> None:
+    settings.bunny_token_auth_key = "token-secret"
+    monkeypatch.setattr("app.bunny.time.time", lambda: 1_999_996_400)
+
+    url = BunnyClient(settings).build_thumbnail_url(VIDEO_ID, "thumbnail.jpg")
+
+    assert url == (
+        f"https://{CDN}/bcdn_token=HS256-ikLY_L4iDZop_kRgJ8YMBA3raTIjo3sjthRORMkkWbY"
+        f"&expires=2000000000&token_path=%2F{VIDEO_ID}%2F/{VIDEO_ID}/thumbnail.jpg"
+    )
+    assert "token-secret" not in url
 
 
 @pytest.mark.parametrize("host", ["iframe.mediadelivery.net", "player.mediadelivery.net"])

@@ -7,14 +7,16 @@ URLs, credentials, response bodies, or raw transport/validation exceptions.
 import base64
 import hashlib
 import hmac
+import math
 import re
 import time
+from datetime import datetime
 from urllib.parse import quote, unquote, urlsplit, urljoin
 from threading import Event, Lock
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from app.config import Settings
 from app.logging_config import log_event
@@ -104,6 +106,32 @@ class BunnyVideoMetadata(BaseModel):
             raise BunnyReadinessError("unsupported_duration")
 
 
+class BunnyCatalogVideo(BaseModel):
+    """Validated, read-only video data intended for the catalog UI."""
+
+    video_id: UUID
+    title: str
+    duration_seconds: float = Field(ge=0, allow_inf_nan=False)
+    status: int | None = None
+    description: str | None = None
+    uploaded_at: datetime | None = None
+    collection_id: UUID | None = None
+    thumbnail_file_name: str | None = None
+    thumbnail_url: str | None = None
+
+    @field_validator("duration_seconds", mode="before")
+    @classmethod
+    def duration_must_be_a_finite_number(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError("duration must be a finite number")
+        return value
+
+
+class BunnyCatalog(BaseModel):
+    videos: list[BunnyCatalogVideo]
+    total_items: int = Field(ge=0)
+
+
 def read_metadata(client: "BunnyClient", video_id: str, event: Event | None = None) -> BunnyVideoMetadata:
     metadata = retry_remote(lambda: client.get_metadata(video_id),
         retryable=lambda exc: isinstance(exc, BunnyError) and exc.retryable,
@@ -114,6 +142,7 @@ def read_metadata(client: "BunnyClient", video_id: str, event: Event | None = No
 
 _UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_THUMBNAIL_FILENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}")
 _EMBED_HOSTS = {"iframe.mediadelivery.net", "player.mediadelivery.net"}
 
 
@@ -200,6 +229,35 @@ class BunnyClient:
         self._token_lock = Lock()
         self._last_token_expiry = 0
 
+    def _get(self, url: str, *, operation: str, not_found_message: str, unexpected_message: str) -> httpx.Response:
+        """Perform one protected GET with the shared safe transport classification."""
+        started = time.monotonic()
+        try:
+            # Do not forward AccessKey through redirects or environment proxies.
+            with httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False) as client:
+                response = client.get(url, headers={"AccessKey": self._settings.bunny_stream_api_key})
+        except httpx.TimeoutException:
+            log_event(operation, elapsed_seconds=time.monotonic() - started, attempt=1, error_code="timeout")
+            raise BunnyTimeoutError("Bunny non ha risposto entro il tempo previsto") from None
+        except httpx.RequestError:
+            log_event(operation, elapsed_seconds=time.monotonic() - started, attempt=1, error_code="transport")
+            raise BunnyTransportError("Impossibile contattare Bunny; riprova più tardi") from None
+
+        status = response.status_code
+        log_event(operation, elapsed_seconds=time.monotonic() - started, attempt=1,
+                  status_code=status, error_code="ok" if status == 200 else "remote_response")
+        if status in (401, 403):
+            raise BunnyAuthError("Accesso a Bunny non autorizzato; verifica la configurazione", status_code=status)
+        if status == 404:
+            raise BunnyNotFoundError(not_found_message, status_code=status)
+        if status == 429:
+            raise BunnyRateLimitError("Limite di richieste Bunny raggiunto; riprova più tardi", status_code=status)
+        if 500 <= status <= 599:
+            raise BunnyServerError("Servizio Bunny temporaneamente non disponibile", status_code=status)
+        if status != 200:
+            raise BunnyResponseError(unexpected_message, status_code=status)
+        return response
+
     def get_metadata(self, video_id: str | UUID) -> BunnyVideoMetadata:
         """Perform one GET. Errors contain no raw upstream data or credentials."""
         validated_id = _video_uuid(video_id)
@@ -207,31 +265,13 @@ class BunnyClient:
         if library_id <= 0:
             raise BunnyUrlError("Identificativo libreria Bunny non valido")
         url = f"https://video.bunnycdn.com/library/{library_id}/videos/{validated_id}"
-        started = time.monotonic()
-        try:
-            # Do not forward AccessKey through redirects or environment proxies.
-            with httpx.Client(timeout=30.0, follow_redirects=False, trust_env=False) as client:
-                response = client.get(url, headers={"AccessKey": self._settings.bunny_stream_api_key})
-        except httpx.TimeoutException:
-            log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1, error_code="timeout")
-            raise BunnyTimeoutError("Bunny non ha risposto entro il tempo previsto") from None
-        except httpx.RequestError:
-            log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1, error_code="transport")
-            raise BunnyTransportError("Impossibile contattare Bunny; riprova più tardi") from None
-
+        response = self._get(
+            url,
+            operation="metadata",
+            not_found_message="Video non trovato nella libreria Bunny",
+            unexpected_message="Risposta Bunny inattesa durante la lettura del video",
+        )
         status = response.status_code
-        log_event("metadata", elapsed_seconds=time.monotonic() - started, attempt=1,
-                  status_code=status, error_code="ok" if status == 200 else "remote_response")
-        if status in (401, 403):
-            raise BunnyAuthError("Accesso a Bunny non autorizzato; verifica la configurazione", status_code=status)
-        if status == 404:
-            raise BunnyNotFoundError("Video non trovato nella libreria Bunny", status_code=status)
-        if status == 429:
-            raise BunnyRateLimitError("Limite di richieste Bunny raggiunto; riprova più tardi", status_code=status)
-        if 500 <= status <= 599:
-            raise BunnyServerError("Servizio Bunny temporaneamente non disponibile", status_code=status)
-        if status != 200:
-            raise BunnyResponseError("Risposta Bunny inattesa durante la lettura del video", status_code=status)
 
         try:
             payload = response.json()
@@ -256,6 +296,85 @@ class BunnyClient:
         if metadata.video_id != validated_id:
             raise BunnyResponseError("I metadati Bunny non corrispondono al video richiesto", status_code=status)
         return metadata
+
+    def list_videos(self, *, max_items: int = 10_000) -> BunnyCatalog:
+        """Read every bounded catalog page once, preserving Bunny's provider order."""
+        if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items <= 0:
+            raise BunnyResponseError("Limite catalogo Bunny non valido")
+        library_id = self._settings.bunny_library_id
+        if library_id <= 0:
+            raise BunnyUrlError("Identificativo libreria Bunny non valido")
+
+        url = f"https://video.bunnycdn.com/library/{library_id}/videos"
+        videos: list[BunnyCatalogVideo] = []
+        seen_ids: set[UUID] = set()
+        expected_total: int | None = None
+        page = 1
+
+        while True:
+            # Build the query locally so no page parameter can come from untrusted input.
+            response = self._get(
+                f"{url}?page={page}&itemsPerPage=100",
+                operation="catalog",
+                not_found_message="Catalogo Bunny non trovato nella libreria",
+                unexpected_message="Risposta Bunny inattesa durante la lettura del catalogo",
+            )
+            try:
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError
+                total_items = payload["totalItems"]
+                current_page = payload["currentPage"]
+                items_per_page = payload["itemsPerPage"]
+                items = payload["items"]
+                if (
+                    any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                        for value in (total_items, current_page, items_per_page))
+                    or current_page != page
+                    or not isinstance(items, list)
+                    or len(items) > items_per_page
+                ):
+                    raise ValueError
+            except (ValueError, KeyError, TypeError):
+                raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code) from None
+
+            if expected_total is None:
+                expected_total = total_items
+                if expected_total > max_items:
+                    raise BunnyResponseError("Catalogo Bunny troppo grande; usa la paginazione", status_code=response.status_code)
+            elif total_items != expected_total:
+                raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code)
+
+            for item in items:
+                try:
+                    if not isinstance(item, dict):
+                        raise ValueError
+                    filename = item.get("thumbnailFileName")
+                    video = BunnyCatalogVideo(
+                        video_id=item["guid"],
+                        title=item["title"],
+                        duration_seconds=item["length"],
+                        status=item.get("status"),
+                        description=item.get("description"),
+                        uploaded_at=item.get("dateUploaded"),
+                        collection_id=item.get("collectionId"),
+                        thumbnail_file_name=filename,
+                        thumbnail_url=(self.build_thumbnail_url(item["guid"], filename) if filename is not None else None),
+                    )
+                except (BunnyUrlError, KeyError, TypeError, ValidationError, ValueError):
+                    raise BunnyResponseError("Elementi del catalogo Bunny non validi", status_code=response.status_code) from None
+                if video.video_id in seen_ids:
+                    raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code)
+                seen_ids.add(video.video_id)
+                videos.append(video)
+
+            if len(videos) > total_items:
+                raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code)
+            if len(videos) == total_items:
+                return BunnyCatalog(videos=videos, total_items=total_items)
+            if not items:
+                raise BunnyResponseError("Pagina catalogo Bunny non valida", status_code=response.status_code)
+            page += 1
 
     def select_hls_url(self, metadata: BunnyVideoMetadata, *, cancellation_event: Event | None = None) -> str:
         """Read only the bounded master manifest and choose its lowest variant.
@@ -333,3 +452,23 @@ class BunnyClient:
                 expires=expires,
             )
         return f"https://{hostname}/{validated_id}/playlist.m3u8"
+
+    def build_thumbnail_url(self, video_id: str | UUID, filename: str) -> str:
+        """Create a safe thumbnail URL from configured CDN data only."""
+        validated_id = _video_uuid(video_id)
+        if not isinstance(filename, str) or not _THUMBNAIL_FILENAME.fullmatch(filename) or ".." in filename:
+            raise BunnyUrlError("Nome miniatura Bunny non valido")
+        hostname = _cdn_hostname(self._settings.bunny_cdn_hostname)
+        key = self._settings.bunny_token_auth_key
+        if key:
+            with self._token_lock:
+                expires = max(int(time.time()) + 3600, self._last_token_expiry + 1)
+                self._last_token_expiry = expires
+            playlist = build_cdn_token_url(
+                hostname=hostname,
+                video_id=validated_id,
+                key=key,
+                expires=expires,
+            )
+            return playlist.removesuffix("playlist.m3u8") + filename
+        return f"https://{hostname}/{validated_id}/{filename}"

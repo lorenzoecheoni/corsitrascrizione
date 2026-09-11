@@ -1,0 +1,284 @@
+"""Ephemeral media extraction. Only the workspace context owns media cleanup.
+
+The caller must supply a trusted, regenerated Bunny URL, not an arbitrary user
+URL. Progress callbacks receive monotonic processed seconds, not percentages.
+FFmpeg diagnostics are consumed privately and never logged or included in errors.
+"""
+
+from collections.abc import Callable, Iterator
+from concurrent.futures import CancelledError
+from contextlib import contextmanager
+import csv
+from dataclasses import dataclass
+import json
+import math
+import os
+from pathlib import Path
+import re
+import selectors
+import shutil
+import subprocess
+import tempfile
+from threading import Event
+
+import imagehash
+from PIL import Image
+
+
+@dataclass(frozen=True)
+class AudioChunk:
+    path: Path
+    start_seconds: float
+    duration_seconds: float
+
+
+@dataclass(frozen=True)
+class FrameCandidate:
+    path: Path
+    timestamp_seconds: float
+
+
+@dataclass(frozen=True)
+class MediaArtifacts:
+    audio_chunks: list[AudioChunk]
+    frame_candidates: list[FrameCandidate]
+    downloaded_bytes: int
+    # Conservative estimate: ceil(encoded input packet bytes * 1.20), gathered
+    # from FFmpeg's single-pass input summary. Includes a 20% allowance for HLS
+    # container/HTTP overhead. It is NOT measured network traffic or a guaranteed
+    # upper bound: playlists, retries, encryption and transport overhead vary.
+    # Output media sizes must never be substituted for input traffic.
+
+
+class MediaError(RuntimeError):
+    """Safe application-authored media error without upstream diagnostics."""
+
+
+@contextmanager
+def temporary_workspace(root: Path | None = None) -> Iterator[Path]:
+    workspace = Path(tempfile.mkdtemp(prefix="bunny-video-", dir=root))
+    try:
+        yield workspace
+    finally:
+        shutil.rmtree(workspace)
+
+
+def deduplicate_frames(
+    candidates: list[FrameCandidate], cancellation_event: Event | None = None,
+) -> list[FrameCandidate]:
+    """Globally deduplicate slides by pHash (distance <= 8), with a 2s gap.
+
+    pHash measures structure, so flat screens differing only in color may merge.
+    More than 600 surviving frames are sampled uniformly, including both ends.
+    """
+    kept: list[FrameCandidate] = []
+    hashes: list[imagehash.ImageHash] = []
+    for candidate in sorted(candidates, key=lambda item: item.timestamp_seconds):
+        if cancellation_event is not None:
+            _check_cancelled(cancellation_event)
+        if kept and candidate.timestamp_seconds - kept[-1].timestamp_seconds < 2:
+            continue
+        with Image.open(candidate.path) as image:
+            fingerprint = imagehash.phash(image)
+        if any(fingerprint - previous <= 8 for previous in hashes):
+            continue
+        kept.append(candidate)
+        hashes.append(fingerprint)
+    if cancellation_event is not None:
+        _check_cancelled(cancellation_event)
+    if len(kept) > 600:
+        kept = [kept[round(i * (len(kept) - 1) / 599)] for i in range(600)]
+    return kept
+
+
+def _check_cancelled(event: Event) -> None:
+    if event.is_set():
+        raise CancelledError("Elaborazione annullata")
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], None]) -> None:
+    """Drain both pipes without blocking cancellation on a stalled input.
+
+    Selectors support our macOS/Linux hosts. Bounded buffers discard overlong
+    diagnostic lines; we only parse short numeric FFmpeg records.
+    """
+    _check_cancelled(event)
+    try:
+        process = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, shell=False,
+        )
+    except OSError:
+        raise MediaError("Impossibile avviare FFmpeg/FFprobe; verificare l'installazione") from None
+    buffers: dict[str, bytes] = {"stdout": b"", "stderr": b""}
+    try:
+        with selectors.DefaultSelector() as selector:
+            for pipe, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, name)
+            while selector.get_map():
+                _check_cancelled(event)
+                for key, _ in selector.select(timeout=.1):
+                    data = os.read(key.fd, 65536)
+                    name = key.data
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        if buffers[name]:
+                            on_line(name, buffers[name].decode("utf-8", "replace"))
+                        continue
+                    lines = (buffers[name] + data).split(b"\n")
+                    buffers[name] = lines.pop()[-16384:]
+                    for line in lines:
+                        if len(line) <= 16384:
+                            on_line(name, line.decode("utf-8", "replace"))
+            while process.poll() is None:
+                _check_cancelled(event)
+                event.wait(.1)
+            _check_cancelled(event)
+            if process.returncode:
+                raise MediaError("Impossibile elaborare il contenuto multimediale")
+    finally:
+        _stop_process(process)
+        process.stdout.close()
+        process.stderr.close()
+
+
+_FRAME_INFO = re.compile(r"\[.*showinfo.*\].*\bn:\s*(\d+).*\bpts_time:([\d.eE+-]+)")
+_INPUT_BYTES = re.compile(r"Input stream #0:\d+.*?\d+ packets read \((\d+) bytes\)")
+
+
+class FFmpegProcessor:
+    def __init__(self, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> None:
+        self.ffmpeg = ffmpeg
+        self.ffprobe = ffprobe
+
+    def extract(
+        self, source_url: str, workspace: Path,
+        progress_callback: Callable[[float], None], cancellation_event: Event,
+    ) -> MediaArtifacts:
+        """Decode the source once; all later probes operate on local outputs."""
+        _check_cancelled(cancellation_event)
+        output = Path(tempfile.mkdtemp(prefix="media-", dir=workspace))
+        timestamps: dict[int, float] = {}
+        input_bytes = 0
+        saw_input_bytes = False
+        processed_seconds = 0.0
+
+        def consume(name: str, line: str) -> None:
+            nonlocal input_bytes, saw_input_bytes, processed_seconds
+            if name == "stderr":
+                frame = _FRAME_INFO.search(line)
+                if frame:
+                    timestamps[int(frame[1])] = float(frame[2])
+                count = _INPUT_BYTES.search(line)
+                if count:
+                    input_bytes += int(count[1])
+                    saw_input_bytes = True
+            elif line.startswith("out_time_us="):
+                try:
+                    seconds = max(0.0, int(line.split("=", 1)[1]) / 1_000_000)
+                except ValueError:
+                    return
+                if seconds > processed_seconds:
+                    processed_seconds = seconds
+                    progress_callback(seconds)
+
+        _run_process([
+            self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose",
+            "-nostats", "-progress", "pipe:1", "-i", source_url,
+            "-map", "0:a:0", "-vn", "-c:a", "aac", "-ac", "1", "-ar", "16000",
+            "-b:a", "24k", "-f", "segment", "-segment_time", "5400",
+            "-reset_timestamps", "1", "-segment_format", "mp4",
+            "-segment_list", str(output / "audio.csv"), "-segment_list_type", "csv",
+            str(output / "audio-%05d.m4a"),
+            "-map", "0:v:0", "-an", "-vf",
+            "select='eq(n,0)+gt(scene,0.18)',scale=w='min(960,iw)':h=-2,showinfo",
+            "-fps_mode", "vfr", "-c:v", "mjpeg", "-q:v", "3",
+            str(output / "frame-%06d.jpg"),
+        ], cancellation_event, consume)
+        _check_cancelled(cancellation_event)
+        frames = sorted(output.glob("frame-*.jpg"))
+        if (
+            not saw_input_bytes or not frames
+            or sorted(timestamps) != list(range(len(frames)))
+            or any(not math.isfinite(t) or t < 0 for t in timestamps.values())
+            or any(timestamps[i] <= timestamps[i - 1] for i in range(1, len(frames)))
+        ):
+            raise MediaError("Impossibile verificare i fotogrammi o la lettura del video")
+        audio_chunks = self._read_chunks(output, cancellation_event)
+        frame_candidates = deduplicate_frames([
+            FrameCandidate(path, timestamps[i]) for i, path in enumerate(frames)
+        ], cancellation_event)
+        _check_cancelled(cancellation_event)
+        return MediaArtifacts(audio_chunks, frame_candidates, (input_bytes * 120 + 99) // 100)
+
+    def _read_chunks(self, output: Path, event: Event) -> list[AudioChunk]:
+        chunks = []
+        with (output / "audio.csv").open(newline="") as file:
+            for filename, start, _ in csv.reader(file):
+                path = output / Path(filename).name
+                duration, size = self._probe_audio(path, event)
+                chunks.extend(self._fit_chunk(AudioChunk(path, float(start), duration), size, event))
+        if not chunks:
+            raise MediaError("Il video non contiene audio utilizzabile")
+        return chunks
+
+    def _fit_chunk(self, chunk: AudioChunk, size: int, event: Event) -> list[AudioChunk]:
+        """Remux only local AAC if a segment breaches either delivery limit.
+
+        The segment muxer cuts at packet boundaries; even a 5400s target can
+        exceed 5400s slightly. Recheck every child, including container overhead.
+        """
+        _check_cancelled(event)
+        if size <= 24_000_000 and chunk.duration_seconds <= 5400:
+            return [chunk]
+        if chunk.duration_seconds <= .128:
+            raise MediaError("Il segmento audio supera il limite consentito")
+        parts = max(2, math.ceil(size / 24_000_000), math.ceil(chunk.duration_seconds / 5400))
+        output = Path(tempfile.mkdtemp(prefix="split-", dir=chunk.path.parent))
+        _run_process([
+            self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+            "-i", str(chunk.path), "-map", "0:a:0", "-c:a", "copy",
+            "-f", "segment", "-segment_time", str(chunk.duration_seconds / parts),
+            "-reset_timestamps", "1", "-segment_format", "mp4",
+            "-segment_list", str(output / "audio.csv"), "-segment_list_type", "csv",
+            str(output / "audio-%05d.m4a"),
+        ], event, lambda name, line: None)
+        children = []
+        with (output / "audio.csv").open(newline="") as file:
+            for filename, start, _ in csv.reader(file):
+                path = output / Path(filename).name
+                duration, child_size = self._probe_audio(path, event)
+                if duration >= chunk.duration_seconds or child_size >= size:
+                    raise MediaError("Impossibile suddividere il segmento audio")
+                child = AudioChunk(path, chunk.start_seconds + float(start), duration)
+                children.extend(self._fit_chunk(child, child_size, event))
+        if not children:
+            raise MediaError("Impossibile suddividere il segmento audio")
+        chunk.path.unlink()
+        return children
+
+    def _probe_audio(self, path: Path, event: Event) -> tuple[float, int]:
+        lines = []
+        _run_process([
+            self.ffprobe, "-v", "error", "-show_entries", "format=duration,size",
+            "-of", "json", str(path),
+        ], event, lambda name, line: lines.append(line) if name == "stdout" else None)
+        try:
+            data = json.loads("\n".join(lines))["format"]
+            duration, size = float(data["duration"]), int(data["size"])
+            if not math.isfinite(duration) or duration <= 0 or size <= 0:
+                raise ValueError
+            return duration, size
+        except (ValueError, KeyError, TypeError):
+            raise MediaError("Impossibile verificare il segmento audio") from None

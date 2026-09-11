@@ -107,7 +107,8 @@ pre { overflow-wrap: anywhere; padding: clamp(1rem, 3vw, 1.5rem); border-radius:
   .page-intro, .selection-bar { align-items: stretch; flex-direction: column; }
   .catalog-controls, .summary-list { grid-template-columns: 1fr; }
   .control-search { grid-column: auto; }
-  .catalog-control-actions { display: grid !important; grid-template-columns: 1fr 1fr; }
+  .catalog-control-actions { display: grid !important; grid-template-columns: 1fr; }
+  .catalog-control-actions > * { width: 100%; }
   .selection-bar button, .actions > *, .confirmation-card form button { width: 100%; }
   .job-list li, .selection-list li { align-items: flex-start; flex-direction: column; gap: .25rem; }
 }

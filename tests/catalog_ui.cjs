@@ -62,6 +62,13 @@ function fire(element, type) {
   element.handlers[type]();
 }
 
+assert.doesNotThrow(() => vm.runInNewContext(source, {
+  document: {
+    getElementById() { return null; },
+    querySelectorAll() { return []; },
+  },
+}), 'Catalog script ignores dashboard states without catalog controls');
+
 const ui = setup();
 const search = ui.elements.get('catalog-search');
 const status = ui.elements.get('status-filter');

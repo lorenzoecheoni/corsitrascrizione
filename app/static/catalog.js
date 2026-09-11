@@ -9,6 +9,8 @@
   const selectionDuration = document.getElementById('selection-duration');
   const selectionBar = document.getElementById('selection-bar');
   const submitSelection = document.getElementById('analyse-selection');
+  if (!search || !statusFilter || !collectionFilter || !selectedOnly || !selectVisible
+      || !clearSelection || !selectionCount || !selectionDuration || !selectionBar) return;
   const rows = [...document.querySelectorAll('[data-video-row]')];
   const selects = [...document.querySelectorAll('[data-video-select]')];
 

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bunny-video-report"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "jinja2>=3.1,<4",
+  "openai>=1.99,<3",
+  "pillow>=11,<13",
+  "imagehash>=4.3,<5",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+  "respx>=0.22,<1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: richiede credenziali reali e accesso a Bunny/OpenAI"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

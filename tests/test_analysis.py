@@ -126,7 +126,7 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     assert [call["max_output_tokens"] for call in window_calls] == [2000] * len(window_calls)
     assert final_call["max_output_tokens"] == 4000
     assert all(call["model"] == "gpt-4o-mini" and call["store"] is False for call in client.calls)
-    assert progress == [("transcript", i, 10) for i in range(1, 11)]
+    assert progress == [("transcript", i, 10) for i in range(1, 11)] + [("consolidation", 0, 1)]
     assert result.usage.requests == 11
     assert result.usage.input_tokens == 110
     assert result.usage.output_tokens == 22
@@ -147,6 +147,32 @@ def test_window_progress_reports_completed_windows_and_can_cancel(inputs, conten
         OpenAIAnalyzer(client).analyze(**inputs, cancellation_event=event, progress_callback=completed)
     assert progress == [("transcript", 1, 1)]
     assert len(client.calls) == 1
+
+
+def test_progress_reports_visual_batches_windows_and_consolidation_start(inputs, content):
+    path = inputs["frames"][0].path
+    inputs["metadata"].duration_seconds = 400
+    content["duration_seconds"] = 400
+    inputs["frames"] = [FrameCandidate(path, index * 2) for index in range(51)]
+    visual_outcomes = [
+        {"frames": [
+            {"timestamp_seconds": index * 2, "kind": "camera_change", "confidence": "alta"}
+            for index in range(start, min(start + 25, 51))
+        ]}
+        for start in (0, 25, 50)
+    ]
+    progress = []
+    client = FakeClient(*visual_outcomes, window_result(), content)
+
+    OpenAIAnalyzer(client).analyze(**inputs, progress_callback=lambda *event: progress.append(event))
+
+    assert progress == [
+        ("slides", 1, 3),
+        ("slides", 2, 3),
+        ("slides", 3, 3),
+        ("transcript", 1, 1),
+        ("consolidation", 0, 1),
+    ]
 
 
 def test_all_visual_slides_survive_bounded_final_context(inputs, content):

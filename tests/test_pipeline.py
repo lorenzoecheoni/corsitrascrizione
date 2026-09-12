@@ -65,11 +65,13 @@ def components(tmp_path):
         stage("transcription")
         return TranscriptionResult(text="private raw transcript", segments=[], audio_seconds=3600)
 
-    def analyze(meta, transcript, frames, *, cancellation_event):
+    def analyze(meta, transcript, frames, *, cancellation_event, progress_callback):
         assert cancellation_event is state.event
         assert transcript.text == "private raw transcript"
         assert frames[0].path.exists()
         stage("analysis")
+        progress_callback("slides", 2, 5)
+        progress_callback("transcript", 7, 10)
         return content
 
     state.pipeline = AnalysisPipeline(settings, SimpleNamespace(get_metadata=get_metadata, select_hls_url=hls),
@@ -79,8 +81,10 @@ def components(tmp_path):
 
 
 def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, tmp_path):
-    values = []
-    report = components.pipeline.run(SOURCE, lambda p, m: values.append(p), components.event)
+    updates = []
+    report = components.pipeline.run(SOURCE, lambda p, m: updates.append((p, m)), components.event)
+    values = [percent for percent, _ in updates]
+    messages = [message for _, message in updates]
     assert components.calls == ["metadata", "hls", "media", "transcription", "analysis"]
     assert report.title == components.content.title
     assert report.bunny_title == "Corso di prova"
@@ -88,9 +92,12 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert report.cost.estimated_low_usd == .41
     assert report.cost.estimated_high_usd == .69
     assert values == sorted(values)
-    assert all(p in values for p in (5, 10, 27, 45, 50, 72, 75, 85, 88, 98, 100))
+    assert all(p in values for p in (5, 10, 27, 45, 50, 72, 75, 98, 100))
+    assert "Slide 2/5" in messages
+    assert "Relatori 7/10" in messages
     assert list(tmp_path.iterdir()) == []
     assert "private raw transcript" not in report.model_dump_json()
+    assert "private raw transcript" not in " ".join(messages)
 
 
 @pytest.mark.parametrize("stage,error,code", [

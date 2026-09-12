@@ -446,7 +446,12 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         assert response.headers["content-type"].startswith(mime)
         assert "attachment" in response.headers["content-disposition"]
         assert report.synopsis in response.text
+        for section in ("Sinossi", "Relatori", "Slide"):
+            assert section in response.text
+        for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
+            assert obsolete_section not in response.text
     page = client.get(f"/jobs/{job.id}")
     assert "<script>alert('unsafe')</script>" not in page.text
     assert "&lt;script&gt;" in page.text
-    assert "Stampa / Salva PDF" in page.text
+    for control in ("Download Markdown", "Download TXT", "Stampa / Salva PDF"):
+        assert control in page.text

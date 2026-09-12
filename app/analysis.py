@@ -268,7 +268,8 @@ class OpenAIAnalyzer:
             raise AnalysisError("frames", stage="visual")
         slides: list[SlideChange] = []
         uncertain_count = 0
-        for offset in range(0, len(frames), _VISUAL_BATCH_SIZE):
+        total_batches = math.ceil(len(frames) / _VISUAL_BATCH_SIZE)
+        for batch_number, offset in enumerate(range(0, len(frames), _VISUAL_BATCH_SIZE), start=1):
             check_cancelled(cancellation_event)
             batch = frames[offset:offset + _VISUAL_BATCH_SIZE]
             expected = [frame.timestamp_seconds for frame in batch]
@@ -300,6 +301,8 @@ class OpenAIAnalyzer:
                     slides.append(SlideChange(**frame.model_dump(exclude={"kind"})))
                 elif frame.kind == "uncertain":
                     uncertain_count += 1
+            if progress_callback is not None:
+                progress_callback("slides", batch_number, total_batches)
         check_cancelled(cancellation_event)
         slide_data = [slide.model_dump(mode="json") for slide in slides]
         try:
@@ -324,6 +327,8 @@ class OpenAIAnalyzer:
             payload = build_consolidation_payload(metadata, analyses, slides)
         except ValueError:
             raise AnalysisError("response", stage="consolidation") from None
+        if progress_callback is not None:
+            progress_callback("consolidation", 0, 1)
 
         result = self._structured(
             text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,

@@ -34,7 +34,11 @@ def test_markdown_and_text_are_exportable() -> None:
     report = load_report()
     markdown = render_markdown(report)
     plain = render_text(report)
+    assert "## Sinossi" in markdown
     assert "## Relatori" in markdown
+    assert "## Slide" in markdown
+    assert "## Punti chiave" not in markdown
+    assert "## Obiettivi formativi" not in markdown
     assert "01:35" in markdown
     assert "## Descrizione estesa" not in markdown
     assert "## Capitoli" not in markdown
@@ -117,4 +121,5 @@ def test_original_title_usage_and_refined_cost_are_rendered():
     for rendered in (render_markdown(report), render_text(report)):
         assert "Titolo originale Bunny" in rendered
         assert "1000" in rendered and "2000" in rendered
-        assert "fattura" in rendered
+        assert "stima applicativa" in rendered
+        assert "non sostituisce la fattura" in rendered

@@ -129,10 +129,19 @@ class AnalysisPipeline:
                 progress(72, "Trascrizione completata")
                 progress(75, "Analisi delle slide e dei contenuti")
                 next_phase("analysis")
+
+                def analysis_progress(stage: str, completed: int, total: int) -> None:
+                    fraction = min(1, max(0, completed / max(1, total)))
+                    if stage == "slides":
+                        progress(75 + int(7 * fraction), f"Slide {completed}/{total}")
+                    elif stage == "transcript":
+                        progress(82 + int(7 * fraction), f"Relatori {completed}/{total}")
+                    elif stage == "consolidation":
+                        progress(90, "Consolidamento del report")
+
                 content = self.analyzer.analyze(metadata, transcript, media.frame_candidates,
-                                                cancellation_event=event)
-                progress(85, "Analisi completata")
-                progress(88, "Preparazione del report")
+                                                cancellation_event=event, progress_callback=analysis_progress)
+                progress(92, "Preparazione del report")
                 next_phase("report")
                 usage = APIUsage(transcription=transcript.usage,
                                  responses=getattr(content, "usage", ProviderUsage()))

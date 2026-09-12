@@ -28,7 +28,7 @@ def render_markdown(report: AcademyReport) -> str:
         f"Durata: {format_timestamp(report.duration_seconds)}",
         f"Lingua rilevata: {report.detected_language}",
         "",
-        "## Sintesi",
+        "## Sinossi",
         report.synopsis,
         "",
         "## Relatori",

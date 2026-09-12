@@ -523,7 +523,9 @@ git commit -m "fix: pace OpenAI analysis by provider limits"
 
 **Files:**
 
+- Modify: `app/analysis.py`
 - Modify: `app/pipeline.py`
+- Modify: `tests/test_analysis.py`
 - Modify: `tests/test_pipeline.py`
 - Modify: `tests/test_models_reporting.py`
 - Modify: `tests/test_web.py`
@@ -532,6 +534,8 @@ git commit -m "fix: pace OpenAI analysis by provider limits"
 
 - Preserves: catalogo, selezione, `/jobs/{id}`, `/report.md`, `/report.txt` e stampa PDF.
 - Produces: messaggi di avanzamento con numero batch/blocco, senza contenuto del video.
+- Extends: `progress_callback(stage, completed, total)` con gli eventi `slides`,
+  `transcript` e `consolidation`, senza cambiare i risultati dell'analisi.
 
 - [ ] **Step 1: Scrivere test fallenti per avanzamento e report minimo**
 
@@ -552,9 +556,11 @@ Expected: FAIL perché la pipeline non inoltra ancora il callback di analisi.
 
 - [ ] **Step 3: Mappare il progresso analitico nel tratto 75–90%**
 
-Passare un callback ad `analyzer.analyze`. Calcolare una frazione monotona dal
-numero completato/totale senza includere titoli o contenuti nel messaggio.
-Riservare 75–82% alle slide, 82–89% alle finestre e 90% al consolidamento.
+Emettere dall'analizzatore un evento dopo ogni batch visivo, dopo ogni finestra
+testuale e all'avvio del consolidamento. Passare il callback ad
+`analyzer.analyze`. Calcolare una frazione monotona dal numero completato/totale
+senza includere titoli o contenuti nel messaggio. Riservare 75–82% alle slide,
+82–89% alle finestre e 90% al consolidamento.
 
 - [ ] **Step 4: Verificare la stima del costo esistente**
 
@@ -573,7 +579,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add app/pipeline.py tests/test_pipeline.py tests/test_models_reporting.py tests/test_web.py
+git add app/analysis.py app/pipeline.py tests/test_analysis.py tests/test_pipeline.py tests/test_models_reporting.py tests/test_web.py
 git commit -m "feat: report chunked analysis progress"
 ```
 

@@ -174,6 +174,20 @@ def test_rate_limit_honors_retry_after_before_retrying(inputs, content, monkeypa
     assert sleeps == [12.5]
 
 
+def test_rate_limit_without_retry_after_waits_for_the_token_window(inputs, content, monkeypatch):
+    inputs["frames"] = []
+    sleeps = []
+    monkeypatch.setattr("app.retry.time.sleep", sleeps.append)
+    response = httpx.Response(
+        429, request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    error = APIStatusError("safe", response=response, body={"error": {"code": "rate_limit_exceeded"}})
+    client = FakeClient(error, error, content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert result.title == "Pubblicazione Academy"
+    assert sleeps == [30.0, 60.0]
+
+
 def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, content):
     inputs["frames"] = []
     content["speakers"][1].update(display_name="Nome Inventato", role="CEO", confidence="bassa",

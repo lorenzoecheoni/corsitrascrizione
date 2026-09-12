@@ -87,8 +87,12 @@ def _remote_error(exc: Exception) -> AnalysisError:
 
 
 def _analysis_retry_delay(exc: Exception, default_delay: float) -> float:
-    if isinstance(exc, AnalysisError) and exc.retry_after_seconds is not None:
-        return max(default_delay, exc.retry_after_seconds)
+    if isinstance(exc, AnalysisError) and exc.code == "rate_limit":
+        if exc.retry_after_seconds is not None:
+            return max(default_delay, exc.retry_after_seconds)
+        # Leave enough time for the minute token window to recover. A 1–2s
+        # transport backoff only repeats the same 429 after an expensive job.
+        return 30 * default_delay
     return default_delay
 
 

@@ -585,7 +585,7 @@ git commit -m "feat: report chunked analysis progress"
 
 ---
 
-### Task 7: Verificare, provare con payload equivalente e pubblicare
+### Task 7: Verificare e provare con payload equivalente prima della pubblicazione
 
 **Files:**
 
@@ -594,7 +594,7 @@ git commit -m "feat: report chunked analysis progress"
 
 **Interfaces:**
 
-- Produces: prova live esplicita, documentazione operativa e deployment Railway verificato.
+- Produces: prova live esplicita e documentazione operativa pronte per il deployment Railway.
 - Does not produce: un nuovo lavoro Bunny a pagamento senza conferma dell'utente.
 
 - [ ] **Step 1: Aggiungere una prova live equivalente ma sintetica**
@@ -632,23 +632,17 @@ Aggiornare `README.md` con analisi a blocchi, output minimo, assenza di storage,
 servizi già necessari e modalità di verifica. Dichiarare che credito e limite API
 sono distinti e che non serve un nuovo abbonamento per questa architettura.
 
-- [ ] **Step 6: Commit e push**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add README.md tests/test_live_diagnostics.py
 git commit -m "docs: verify chunked production analysis"
-git push origin HEAD
 ```
 
-- [ ] **Step 7: Pubblicare su Railway e verificare la salute**
+- [ ] **Step 7: Fermarsi prima del nuovo tentativo reale**
 
-Avviare un deployment dal commit appena pubblicato. Verificare stato `SUCCESS`,
-`GET /healthz == {"status":"ok"}` e accesso autenticato a catalogo e pagina
-lavoro.
-
-- [ ] **Step 8: Fermarsi prima del nuovo tentativo reale**
-
-Presentare all'utente commit, esito test, esito prova sintetica, URL di produzione
-e nuova stima. Chiedere conferma esplicita prima di rilanciare “Governance delle
-holding e conferimenti a realizzo controllato”, perché trascrizione e analisi
-comportano un nuovo costo API.
+Consegnare il commit al controllo finale di branch. Solo dopo quel controllo, il
+controller integra, pubblica su Railway e verifica stato `SUCCESS`,
+`GET /healthz == {"status":"ok"}` e accesso autenticato. Chiedere conferma
+esplicita prima di rilanciare “Governance delle holding e conferimenti a realizzo
+controllato”, perché trascrizione e analisi comportano un nuovo costo API.

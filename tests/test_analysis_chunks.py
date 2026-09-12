@@ -9,6 +9,14 @@ from app.models import SlideChange
 from app.transcription import TranscriptSegment
 
 
+def test_prompts_preserve_every_announced_presenter_moderator_and_speaker_without_voice_mapping():
+    from app.prompts import CONSOLIDATION_PROMPT, WINDOW_PROMPT
+
+    assert "ogni persona esplicitamente annunciata" in WINDOW_PROMPT
+    assert "diarization_labels=[]" in WINDOW_PROMPT
+    assert "Non eliminare persone esplicitamente annunciate" in CONSOLIDATION_PROMPT
+
+
 def test_four_hours_are_split_without_loss_or_oversized_payloads():
     from app.analysis_chunks import split_transcript_windows
 

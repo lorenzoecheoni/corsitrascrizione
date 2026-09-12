@@ -298,6 +298,69 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
             "Synthetic live analysis failed; inspect only safe provider status", pytrace=False,
         ) from None
 
+
+@pytest.mark.live
+def test_announced_presenter_and_speakers_survive_live_consolidation():
+    """Keep announced people even when their names cannot be mapped to voice labels."""
+    api_key = _synthetic_live_api_key()
+    expected_names = {
+        "Vincenzo Manfredi",
+        "Gaetano De Vito",
+        "Antonio Sibiglia",
+        "Furio D'Andrea",
+        "Luigi Morra",
+    }
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"),
+        title="Seminario sintetico con più relatori",
+        duration_seconds=120,
+    )
+    transcription = TranscriptionResult(
+        text="",
+        segments=[TranscriptSegment(
+            start_seconds=0,
+            end_seconds=60,
+            diarization_label="chunk-0:A",
+            text=(
+                "Buongiorno, sono Vincenzo Manfredi e presento questo seminario. "
+                "I nostri relatori sono il Presidente Gaetano De Vito, Antonio Sibiglia, "
+                "l'Avvocato Furio D'Andrea e Luigi Morra. Li introduco ora; dal solo "
+                "annuncio non sappiamo ancora quale voce appartenga a ciascuno di loro."
+            ),
+        )],
+        audio_seconds=60,
+    )
+
+    client = OpenAI(api_key=api_key, max_retries=0)
+    audited = _SafeRecordingOpenAI(client)
+    names: set[str] = set()
+    passed = False
+    try:
+        result = OpenAIAnalyzer(audited).analyze(metadata, transcription, frames=[])
+        names = {speaker.display_name for speaker in result.speakers}
+        assert expected_names <= names
+        assert sum(audited.status_counts.values()) == len(audited.requests)
+        assert all(status == 429 or 200 <= status < 300 for status in audited.status_counts)
+        assert sum(count for status, count in audited.status_counts.items() if 200 <= status < 300) >= 2
+        passed = True
+    except Exception:
+        pass
+    finally:
+        client.close()
+    print(
+        "announced_speaker_diagnostic "
+        f"status={'passed' if passed else 'failed'} requests={len(audited.requests)} "
+        f"status_2xx={sum(count for status, count in audited.status_counts.items() if 200 <= status < 300)} "
+        f"status_429={audited.status_counts[429]} returned={len(names)} "
+        f"missing={','.join(sorted(expected_names - names)) or 'none'}"
+    )
+    if not passed:
+        raise pytest.fail.Exception(
+            "Announced-speaker live analysis failed; inspect only safe provider status",
+            pytrace=False,
+        ) from None
+
+
 @pytest.mark.parametrize("phase,message", [
     ("configuration", "Invalid live configuration (details withheld)"),
     ("analysis", "Live analysis failed; inspect only sanitized application diagnostics"),

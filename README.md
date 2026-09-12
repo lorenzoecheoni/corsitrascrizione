@@ -102,6 +102,28 @@ PATH='/percorso/a/ffmpeg:'"$PATH" .venv/bin/python -m pytest -m 'not live' -q
 
 Lo smoke `tests/test_end_to_end.py` genera un video sintetico con FFmpeg, usa confini Bunny/OpenAI finti e attraversa form, worker, schema, download e pulizia temporanea entro 15 secondi. Verifica anche autenticazione, healthcheck e perdita del lavoro al riavvio. FFmpeg e FFprobe devono essere disponibili nel `PATH`.
 
+## Analisi a blocchi e verifica prima della pubblicazione
+
+La trascrizione resta in memoria e viene divisa in finestre cronologiche di al massimo 600 secondi e 12.000 caratteri serializzati. Ogni finestra produce soltanto evidenze compatte; un unico consolidamento, limitato a 30.000 caratteri, genera l'output minimo: titolo, lingua, sinossi, relatori con evidenze, slide e incertezze. Le immagini sono inviate solo nel percorso separato di classificazione slide; la prova qui sotto le esclude deliberatamente.
+
+Non viene introdotto database, bucket, storage video o storage del transcript: gli input remoti, i media temporanei e i payload di analisi non sono conservati dall'applicazione. Restano necessari soltanto i servizi già configurati: Bunny Stream read-only per i lavori reali, OpenAI API per trascrizione/analisi e Railway per eseguire il container. Credito API e limite API sono distinti: avere credito non aumenta i limiti di richieste o token. Questa architettura non richiede un nuovo abbonamento; richiede però crediti/fatturazione attivi per i servizi già scelti e rispetta i rispettivi limiti.
+
+Prima di pubblicare, eseguire la suite disponibile nell'ambiente locale privo di FFmpeg/FFprobe:
+
+```sh
+.venv/bin/pytest -q -m 'not live' --ignore=tests/test_media.py -k 'not test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup'
+.venv/bin/python -m compileall -q app tests
+git diff --check
+```
+
+I test esclusi che richiedono FFmpeg e FFprobe vanno eseguiti nell'immagine Docker/Railway, dove i due programmi sono installati. Con le variabili runtime Railway già configurate, la prova live esplicita usa 96 segmenti sintetici da un minuto (1 ora e 36 minuti), non chiama Bunny e non legge media reali:
+
+```sh
+railway run .venv/bin/pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report
+```
+
+La prova percorre finestre e consolidamento reali senza immagini, verifica tutti i limiti di payload e richiede sinossi e almeno un relatore. Stampa solo stato, richieste, token, durata, tempo trascorso e conteggi del risultato; non stampa chiavi, payload, trascrizione, testo del modello o corpi di risposta. Non rilanciare il video reale “Governance delle holding e conferimenti a realizzo controllato” senza conferma esplicita: trascrizione e analisi generano un nuovo costo API.
+
 Il test live è **opt-in e a pagamento**. Compilare in `.env` le variabili obbligatorie e `BUNNY_SAMPLE_VIDEO_URL` con un video autorizzato; fornire anche la chiave token se necessaria. Impostare `RUN_LIVE_BUNNY=1` nel file e caricarlo come dati, senza eseguirlo come script shell:
 
 ```sh

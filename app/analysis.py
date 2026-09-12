@@ -24,7 +24,7 @@ from app.transcription import TranscriptionResult
 from app.usage import record_usage
 
 
-_VISUAL_BATCH_SIZE = 100
+_VISUAL_BATCH_SIZE = 25
 
 
 class ClassifiedFrame(ReportModel):
@@ -171,6 +171,7 @@ class OpenAIAnalyzer:
         prepare: Callable[[dict], None], validate: Callable[[T], list[str]],
         cancellation_event: Event | None, usage: ProviderUsage,
         model: str = "gpt-5.6-luna",
+        max_output_tokens: int = 4000,
     ) -> T:
         attempts = 0
         for repair in range(2):
@@ -182,6 +183,7 @@ class OpenAIAnalyzer:
                     response = self._client.responses.parse(
                         model=model, store=False, text_format=text_format,
                         instructions=instructions, input=payload,
+                        max_output_tokens=max_output_tokens,
                     )
                 except CancelledError:
                     raise
@@ -253,6 +255,7 @@ class OpenAIAnalyzer:
                     text_format=SlideBatchResult, instructions=VISUAL_PROMPT,
                     payload=[{"role": "user", "content": parts}], prepare=lambda data: None,
                     validate=validate_batch, cancellation_event=cancellation_event, usage=usage,
+                    max_output_tokens=3000,
                 )
             except OSError:
                 raise AnalysisError("frames") from None

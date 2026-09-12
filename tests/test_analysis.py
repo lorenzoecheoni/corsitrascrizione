@@ -139,22 +139,27 @@ def test_metadata_description_and_existing_evidence_reach_analysis(inputs, conte
     assert metadata["chapters"][0]["title"] == "Apertura"
 
 
-def test_visual_batches_group_one_hundred_low_detail_images_without_losing_frames(inputs, content):
+def test_visual_batches_never_exceed_twenty_five_low_detail_images(inputs, content):
     path = inputs["frames"][0].path
     inputs["metadata"].duration_seconds = 400
     content["duration_seconds"] = 400
-    inputs["frames"] = [FrameCandidate(path, i * 2) for i in range(201)]
-    outcomes = [{"frames": [dict(timestamp_seconds=i * 2, kind="camera_change", confidence="alta")
-                             for i in range(start, min(start + 100, 201))]}
-                for start in (0, 100, 200)]
+    inputs["frames"] = [FrameCandidate(path, i * 2) for i in range(101)]
+    outcomes = [
+        {"frames": [
+            {"timestamp_seconds": i * 2, "kind": "camera_change", "confidence": "alta"}
+            for i in range(start, min(start + 25, 101))
+        ]}
+        for start in (0, 25, 50, 75, 100)
+    ]
     client = FakeClient(*outcomes, content)
     OpenAIAnalyzer(client).analyze(**inputs)
     visual_calls = client.calls[:-1]
     counts = [sum(part["type"] == "input_image" for part in call["input"][0]["content"])
               for call in visual_calls]
-    assert counts == [100, 100, 1]
+    assert counts == [25, 25, 25, 25, 1]
     assert all(part["detail"] == "low" for call in visual_calls
                for part in call["input"][0]["content"] if part["type"] == "input_image")
+    assert all(call["max_output_tokens"] == 3000 for call in visual_calls)
     assert "data:image" not in client.calls[-1]["input"]
 
 

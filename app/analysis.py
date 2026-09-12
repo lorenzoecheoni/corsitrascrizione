@@ -1,4 +1,4 @@
-"""Ephemeral two-pass analysis; remote content is never logged or persisted."""
+"""Ephemeral bounded analysis; remote content is never logged or persisted."""
 
 import base64
 from collections.abc import Callable, Sequence
@@ -13,12 +13,16 @@ from openai import APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 from app.bunny import BunnyVideoMetadata
+from app.analysis_chunks import (
+    ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
+    split_transcript_windows,
+)
 from app.media import FrameCandidate
 from app.models import (
-    AcademyContent, Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
+    Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
     ReportModel, SlideChange, AnalysisResult, ProviderUsage, Nonnegative,
 )
-from app.prompts import REPORT_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT
+from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT
 from app.retry import check_cancelled, retry_remote
 from app.transcription import TranscriptionResult
 from app.usage import record_usage
@@ -132,7 +136,7 @@ def _normalize_speakers(data: dict) -> None:
     data["uncertainties"] = list(dict.fromkeys(uncertainties))
 
 
-def _content_errors(content: AcademyContent, duration: float) -> list[str]:
+def _content_errors(content: ConsolidatedTextReport, duration: float) -> list[str]:
     errors = []
     if not math.isfinite(content.duration_seconds) or content.duration_seconds != duration:
         errors.append(f"duration_seconds deve essere {duration}.")
@@ -227,6 +231,7 @@ class OpenAIAnalyzer:
     def analyze(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
         frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> AnalysisResult:
         check_cancelled(cancellation_event)
         usage = ProviderUsage()
@@ -269,29 +274,37 @@ class OpenAIAnalyzer:
                     uncertain_count += 1
         check_cancelled(cancellation_event)
         slide_data = [slide.model_dump(mode="json") for slide in slides]
-        compact_transcription = {
-            "language": transcription.language,
-            "audio_seconds": transcription.audio_seconds,
-            "segments": [segment.model_dump(mode="json") for segment in transcription.segments],
-            "speaker_mapping": transcription.speaker_mapping,
-        }
-        payload = json.dumps({"metadata": metadata.model_dump(mode="json"),
-                              "transcription": compact_transcription,
-                              "slides": slide_data}, ensure_ascii=False)
-
-        def prepare_content(data: dict) -> None:
-            _normalize_speakers(data)
-            # The visual pass owns slide facts; generated additions are discarded.
-            data["slides"] = slide_data
-            if uncertain_count:
-                note = f"{uncertain_count} frame con classificazione incerta esclusi dalle slide."
-                if note not in data["uncertainties"]:
-                    data["uncertainties"].append(note)
+        try:
+            windows = split_transcript_windows(transcription.segments)
+        except ValueError:
+            raise AnalysisError("response") from None
+        analyses: list[WindowAnalysis] = []
+        for index, window in enumerate(windows, start=1):
+            check_cancelled(cancellation_event)
+            analyses.append(self._structured(
+                text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
+                payload=window.to_payload(), prepare=lambda data: None,
+                validate=lambda result: [], cancellation_event=cancellation_event,
+                usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
+            ))
+            if progress_callback is not None:
+                progress_callback("transcript", index, len(windows))
+        check_cancelled(cancellation_event)
+        try:
+            payload = build_consolidation_payload(metadata, analyses, slides)
+        except ValueError:
+            raise AnalysisError("response") from None
 
         result = self._structured(
-            text_format=AcademyContent, instructions=REPORT_PROMPT, payload=payload,
-            prepare=prepare_content, validate=lambda content: _content_errors(content, metadata.duration_seconds),
+            text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
+            prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
             cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
+            max_output_tokens=4000,
         )
         check_cancelled(cancellation_event)
-        return AnalysisResult(**result.model_dump(), usage=usage)
+        data = result.model_dump()
+        if uncertain_count:
+            note = f"{uncertain_count} frame con classificazione incerta esclusi dalle slide."
+            if note not in data["uncertainties"]:
+                data["uncertainties"].append(note)
+        return AnalysisResult(**data, slides=slide_data, usage=usage)

@@ -11,6 +11,7 @@ from PIL import Image
 import pytest
 
 from app.analysis import AnalysisError, OpenAIAnalyzer, SlideBatchResult
+from app.analysis_chunks import ConsolidatedTextReport, WindowAnalysis
 from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
 from app.models import AcademyContent
@@ -32,7 +33,7 @@ def content():
             {"id": "b", "display_name": "Relatore 2", "role": None,
              "confidence": "bassa", "evidence": []},
         ],
-        "slides": [], "uncertainties": [],
+        "uncertainties": [],
     }
 
 
@@ -81,19 +82,104 @@ class FakeClient:
         return SimpleNamespace(output_parsed=outcome)
 
 
+def window_result():
+    return {"detected_language": "it", "synopsis_notes": ["Pubblicazione Academy"],
+            "speakers": [], "uncertainties": []}
+
+
+def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):
+    inputs["metadata"].duration_seconds = 5760
+    inputs["transcription"] = TranscriptionResult(
+        text="private full transcript", audio_seconds=5760,
+        segments=[TranscriptSegment(start_seconds=i * 60, end_seconds=(i + 1) * 60,
+                                    diarization_label=f"chunk-{i // 10}:A",
+                                    text=f"Segmento distinto {i}: pubblicazione Academy.")
+                  for i in range(96)],
+    )
+    inputs["frames"] = []
+    content["duration_seconds"] = 5760
+    def respond(call):
+        data = window_result() if call["text_format"] is WindowAnalysis else content
+        if call["text_format"] is ConsolidatedTextReport:
+            data = {key: value for key, value in data.items() if key != "slides"}
+        return SimpleNamespace(output_parsed=data, usage=SimpleNamespace(input_tokens=10, output_tokens=2))
+    client = FakeClient(*([respond] * 20))
+    progress = []
+    result = OpenAIAnalyzer(client).analyze(**inputs, progress_callback=lambda *args: progress.append(args))
+    assert all("private full transcript" not in json.dumps(call["input"])
+               for call in client.calls)
+    window_calls = [call for call in client.calls if call["text_format"] is WindowAnalysis]
+    assert len(window_calls) >= 10
+    assert all(len(call["input"]) <= 12_000 for call in window_calls)
+    assert [segment["text"] for call in window_calls for segment in json.loads(call["input"])["segments"]] == [
+        segment.text for segment in inputs["transcription"].segments]
+    final_call = client.calls[-1]
+    assert final_call["text_format"] is ConsolidatedTextReport
+    assert len(final_call["input"]) <= 30_000
+    assert "segments" not in final_call["input"]
+    assert "data:image" not in final_call["input"]
+    assert [call["max_output_tokens"] for call in window_calls] == [2000] * len(window_calls)
+    assert final_call["max_output_tokens"] == 4000
+    assert all(call["model"] == "gpt-4o-mini" and call["store"] is False for call in client.calls)
+    assert progress == [("transcript", i, 10) for i in range(1, 11)]
+    assert result.usage.requests == 11
+    assert result.usage.input_tokens == 110
+    assert result.usage.output_tokens == 22
+    captured = caplog.text + capsys.readouterr().out
+    assert "private full transcript" not in captured
+    assert all(segment.text not in captured for segment in inputs["transcription"].segments)
+
+
+def test_window_progress_reports_completed_windows_and_can_cancel(inputs, content):
+    inputs["frames"] = []
+    event = Event()
+    progress = []
+    def completed(phase, done, total):
+        progress.append((phase, done, total))
+        event.set()
+    client = FakeClient(window_result(), content)
+    with pytest.raises(CancelledError):
+        OpenAIAnalyzer(client).analyze(**inputs, cancellation_event=event, progress_callback=completed)
+    assert progress == [("transcript", 1, 1)]
+    assert len(client.calls) == 1
+
+
+def test_all_visual_slides_survive_bounded_final_context(inputs, content):
+    path = inputs["frames"][0].path
+    inputs["frames"] = [FrameCandidate(path, i) for i in range(80)]
+    slides = [{"timestamp_seconds": i, "kind": "slide", "title": f"Slide {i}",
+               "visible_content": ["x" * 1000] * 5, "confidence": "alta"} for i in range(80)]
+    client = FakeClient(*[{"frames": slides[i:i + 25]} for i in range(0, 80, 25)],
+                        window_result(), content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert len(json.loads(client.calls[-1]["input"])["slides"]) < 80
+    assert [slide.timestamp_seconds for slide in result.slides] == list(range(80))
+    assert all(slide.visible_content == ["x" * 1000] * 5 for slide in result.slides)
+
+
+def test_unrepresentable_windows_have_safe_error(inputs, caplog, capsys):
+    inputs["frames"] = []
+    inputs["transcription"].segments = [TranscriptSegment(
+        start_seconds=0, end_seconds=601, text="PRIVATE SEGMENT", diarization_label="A")]
+    client = FakeClient()
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.code == "response"
+    assert "PRIVATE" not in str(caught.value) + caplog.text + capsys.readouterr().out
+    assert not client.calls
+
+
 def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, content):
-    client = FakeClient(visual("slide", "camera_change", "uncertain"), content)
+    client = FakeClient(visual("slide", "camera_change", "uncertain"), window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert isinstance(result, AcademyContent)
     assert client.max_retries == 0
-    assert [call["text_format"] for call in client.calls] == [SlideBatchResult, AcademyContent]
+    assert [call["text_format"] for call in client.calls] == [SlideBatchResult, WindowAnalysis, ConsolidatedTextReport]
     assert all(call["store"] is False for call in client.calls)
-    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini"]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini"]
     payload = json.loads(client.calls[-1]["input"])
-    assert set(payload["transcription"]) == {
-        "language", "audio_seconds", "segments", "speaker_mapping",
-    }
-    assert payload["transcription"]["segments"] == [{
+    assert "transcription" not in payload
+    assert json.loads(client.calls[1]["input"])["segments"] == [{
         "start_seconds": 0.0,
         "end_seconds": 10.0,
         "diarization_label": "chunk-0:A",
@@ -103,6 +189,7 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     assert "Visible 1" not in client.calls[-1]["input"]
     assert "Visible 2" not in client.calls[-1]["input"]
     assert [slide.timestamp_seconds for slide in result.slides] == [2]
+    assert "1 frame con classificazione incerta esclusi dalle slide." in result.uncertainties
     assert "cost" not in result.model_dump()
     images = [part for part in client.calls[0]["input"][0]["content"] if part["type"] == "input_image"]
     assert all(part["detail"] == "low" and part["image_url"].startswith("data:image/jpeg;base64,")
@@ -119,24 +206,22 @@ def test_usage_counts_batches_retry_error_and_semantic_repair(inputs, content, m
         return lambda _: SimpleNamespace(output_parsed=data, status="completed",
             usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens))
     client = FakeClient(failure, returned(visual("slide", "camera_change", "slide"), 100, 10),
-                        returned(bad, 200, 20), returned(content, 50, 5))
+                        returned(window_result(), 30, 3), returned(bad, 200, 20), returned(content, 50, 5))
     result = OpenAIAnalyzer(client).analyze(**inputs)
-    assert result.usage.requests == 4
-    assert result.usage.input_tokens == 355
-    assert result.usage.output_tokens == 36
+    assert result.usage.requests == 5
+    assert result.usage.input_tokens == 385
+    assert result.usage.output_tokens == 39
     assert result.usage.missing_input_requests == 0
 
 
-def test_metadata_description_and_existing_evidence_reach_analysis(inputs, content):
+def test_final_metadata_is_limited_to_consolidation_contract(inputs, content):
     inputs["metadata"].__dict__["description"] = "Descrizione originale"
     inputs["metadata"].captions = [{"srclang": "it", "label": "Italiano", "version": 1}]
     inputs["metadata"].chapters = [{"title": "Apertura", "start": 0, "end": 10}]
-    client = FakeClient(visual("slide", "camera_change", "slide"), content)
+    client = FakeClient(visual("slide", "camera_change", "slide"), window_result(), content)
     OpenAIAnalyzer(client).analyze(**inputs)
     metadata = json.loads(client.calls[-1]["input"])["metadata"]
-    assert metadata["description"] == "Descrizione originale"
-    assert metadata["captions"][0]["srclang"] == "it"
-    assert metadata["chapters"][0]["title"] == "Apertura"
+    assert metadata == {"title": "Academy", "duration_seconds": 90}
 
 
 def test_visual_batches_never_exceed_twenty_five_low_detail_images(inputs, content):
@@ -151,9 +236,9 @@ def test_visual_batches_never_exceed_twenty_five_low_detail_images(inputs, conte
         ]}
         for start in (0, 25, 50, 75, 100)
     ]
-    client = FakeClient(*outcomes, content)
+    client = FakeClient(*outcomes, window_result(), content)
     OpenAIAnalyzer(client).analyze(**inputs)
-    visual_calls = client.calls[:-1]
+    visual_calls = [call for call in client.calls if call["text_format"] is SlideBatchResult]
     counts = [sum(part["type"] == "input_image" for part in call["input"][0]["content"])
               for call in visual_calls]
     assert counts == [25, 25, 25, 25, 1]
@@ -171,7 +256,7 @@ def test_rate_limit_honors_retry_after_before_retrying(inputs, content, monkeypa
         429, headers={"Retry-After": "12.5"},
         request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
     )
-    client = FakeClient(APIStatusError("safe", response=response, body={}), content)
+    client = FakeClient(APIStatusError("safe", response=response, body={}), window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.title == "Pubblicazione Academy"
     assert sleeps == [12.5]
@@ -185,7 +270,7 @@ def test_rate_limit_without_retry_after_waits_for_the_token_window(inputs, conte
         429, request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
     )
     error = APIStatusError("safe", response=response, body={"error": {"code": "rate_limit_exceeded"}})
-    client = FakeClient(error, error, content)
+    client = FakeClient(error, error, window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.title == "Pubblicazione Academy"
     assert sleeps == [30.0, 60.0]
@@ -195,7 +280,7 @@ def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, c
     inputs["frames"] = []
     content["speakers"][1].update(display_name="Nome Inventato", role="CEO", confidence="bassa",
                                    evidence=[{"kind": "inferenza", "note": "Supposizione"}])
-    client = FakeClient(content)
+    client = FakeClient(window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.speakers[0].display_name == "Giulia Bianchi"
     assert result.speakers[1].display_name.startswith("Relatore ")
@@ -212,34 +297,35 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
     if fault == "duration": bad["duration_seconds"] = 91
     if fault == "language": bad["detected_language"] = "und"
     if fault == "evidence": bad["speakers"][0]["evidence"][0]["timestamp_seconds"] = 91
-    client = FakeClient(bad, content)
+    client = FakeClient(window_result(), bad, content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.detected_language == "it"
-    assert len(client.calls) == 2
-    repair = json.loads(client.calls[1]["input"])
+    assert len(client.calls) == 3
+    repair = json.loads(client.calls[2]["input"])
     assert set(repair) == {"errors", "previous_json"}
     assert repair["errors"]
     assert "transcription" not in repair
+    assert all(call["max_output_tokens"] == 4000 for call in client.calls[1:])
 
 
 def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, content):
     inputs["frames"] = []
     content["duration_seconds"] = float("nan")
-    client = FakeClient(content)
+    client = FakeClient(window_result(), content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
-    assert caught.value.code == "response" and len(client.calls) == 1
+    assert caught.value.code == "response" and len(client.calls) == 2
 
 
 def test_second_invalid_response_has_fixed_safe_error(inputs, content):
     inputs["frames"] = []
     content["speakers"][0]["evidence"][0]["timestamp_seconds"] = 1000
-    client = FakeClient(content, content, content)
+    client = FakeClient(window_result(), content, content, content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
     assert caught.value.code == "response"
     assert "Giulia" not in str(caught.value)
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
 
 @pytest.mark.parametrize("status,attempts", [(429, 3), (503, 3), (401, 1), (400, 1), (409, 1)])
@@ -261,33 +347,33 @@ def test_repair_and_transient_errors_share_three_remote_attempt_budget(inputs, c
     monkeypatch.setattr("app.retry.time.sleep", lambda seconds: None)
     bad = copy.deepcopy(content)
     bad["speakers"][1]["id"] = "host"
-    client = FakeClient(TimeoutError("SECRET"), bad, TimeoutError("SECRET"), content)
+    client = FakeClient(window_result(), TimeoutError("SECRET"), bad, TimeoutError("SECRET"), content)
     with pytest.raises(AnalysisError):
         OpenAIAnalyzer(client).analyze(**inputs)
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
 
 
-@pytest.mark.parametrize("phase", ["before", "visual", "final"])
+@pytest.mark.parametrize("phase", ["before", "visual", "window", "final"])
 def test_cancellation_stops_after_blocking_call(inputs, content, phase):
     event = Event()
     if phase == "before": event.set()
     def cancel(kwargs):
         event.set()
         return SimpleNamespace(output_parsed=content if phase == "final" else visual("slide", "slide", "slide"))
-    if phase == "final": inputs["frames"] = []
-    client = FakeClient(cancel, content)
+    if phase in {"window", "final"}: inputs["frames"] = []
+    client = FakeClient(*([window_result()] if phase == "final" else []), cancel, content)
     with pytest.raises(CancelledError):
         OpenAIAnalyzer(client).analyze(**inputs, cancellation_event=event)
-    assert len(client.calls) == (0 if phase == "before" else 1)
+    assert len(client.calls) == (0 if phase == "before" else 2 if phase == "final" else 1)
 
 
 def test_visual_timestamp_mismatch_is_repaired_before_final_pass(inputs, content):
     bad = visual("slide", "camera_change", "uncertain")
     bad["frames"][0]["timestamp_seconds"] = 89
-    client = FakeClient(bad, visual("slide", "camera_change", "uncertain"), content)
+    client = FakeClient(bad, visual("slide", "camera_change", "uncertain"), window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.slides[0].timestamp_seconds == 2
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
 
 
 @pytest.mark.parametrize("invalid_name", [False, True])
@@ -298,13 +384,14 @@ def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, c
     requests = []
     def respond(request):
         requests.append(json.loads(request.content))
+        data = window_result() if len(requests) == 1 else content
         return httpx.Response(200, json={
             "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
             "model": "gpt-5.6-luna", "error": None, "incomplete_details": None,
             "instructions": None, "metadata": {}, "parallel_tool_calls": True,
             "tools": [], "tool_choice": "auto", "temperature": 1, "top_p": 1,
             "output": [{"id": "msg_test", "type": "message", "role": "assistant", "status": "completed",
-                        "content": [{"type": "output_text", "text": json.dumps(content), "annotations": []}]}],
+                        "content": [{"type": "output_text", "text": json.dumps(data), "annotations": []}]}],
         })
     with OpenAI(api_key="test-only", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
         if invalid_name:
@@ -313,13 +400,14 @@ def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, c
             assert caught.value.code == "response"
             assert "SECRET" not in str(caught.value)
             assert caught.value.__suppress_context__
-            assert len(requests) == 1
+            assert len(requests) == 2
         else:
             result = OpenAIAnalyzer(client).analyze(**inputs)
             assert result.speakers[0].display_name == "Giulia Bianchi"
-    assert requests[0]["text"]["format"]["name"] == "AcademyContent"
-    assert requests[0]["text"]["format"]["strict"] is True
-    assert requests[0]["store"] is False
+    assert [request["text"]["format"]["name"] for request in requests] == ["WindowAnalysis", "ConsolidatedTextReport"]
+    assert all(request["text"]["format"]["strict"] is True for request in requests)
+    assert all(request["store"] is False for request in requests)
+    assert [request["max_output_tokens"] for request in requests] == [2000, 4000]
     assert "SECRET" not in caplog.text + capsys.readouterr().out
 
 
@@ -347,10 +435,10 @@ def test_duplicate_generic_speakers_must_be_repaired(inputs, content):
     inputs["frames"] = []
     bad = copy.deepcopy(content)
     bad["speakers"][0]["display_name"] = "Relatore 2"
-    client = FakeClient(bad, content)
+    client = FakeClient(window_result(), bad, content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert result.speakers[0].display_name == "Giulia Bianchi"
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
 
 def test_incomplete_response_is_never_returned_as_complete_report(inputs, content):

@@ -14,6 +14,7 @@ from openai.types.audio import TranscriptionDiarized
 
 import app.main as main
 from app.analysis import SlideBatchResult
+from app.analysis_chunks import WindowAnalysis
 from app.bunny import BunnyCatalog, BunnyVideoMetadata
 from app.config import Settings
 from app.models import AcademyReport
@@ -50,16 +51,25 @@ class OfflineOpenAI:
                  "title": "Introduzione", "visible_content": ["Corso"], "confidence": "alta"}
                 for p in parts if p["type"] == "input_text"
             ]}
+        elif text_format is WindowAnalysis:
+            payload = json.loads(input)
+            assert payload["segments"][0]["diarization_label"] == "chunk-0:A"
+            data = {
+                "detected_language": "it", "synopsis_notes": ["Introduzione al corso sintetico."],
+                "speakers": [{"diarization_labels": ["chunk-0:A"], "display_name": None,
+                              "role": None, "confidence": "bassa", "evidence": []}],
+                "uncertainties": [],
+            }
         else:
             payload = json.loads(input)
-            assert payload["transcription"]["audio_seconds"] > 0
-            assert payload["transcription"]["segments"][0]["diarization_label"] == "chunk-0:A"
+            assert "segments" not in payload and "transcription" not in payload
+            assert payload["synopsis_notes"] == ["Introduzione al corso sintetico."]
             data = {
                 "title": "Corso sintetico", "duration_seconds": 2, "detected_language": "it",
                 "synopsis": "Introduzione al corso sintetico.",
                 "speakers": [{"id": "a", "display_name": "Relatore 1", "role": None,
                               "confidence": "bassa", "evidence": []}],
-                "slides": [], "uncertainties": [],
+                "uncertainties": [],
             }
         return SimpleNamespace(status="completed", output_parsed=text_format.model_validate(data))
 

@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import CancelledError
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -98,6 +99,99 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert list(tmp_path.iterdir()) == []
     assert "private raw transcript" not in report.model_dump_json()
     assert "private raw transcript" not in " ".join(messages)
+
+
+def test_pipeline_uses_direct_global_transcription_and_single_fast_analysis_when_configured(components):
+    transcription_started = Event()
+
+    def mp4(metadata):
+        assert metadata is components.metadata
+        components.calls.append("mp4")
+        return "https://cdn.example.com/video/play_240p.mp4"
+
+    def extract_visual(url, workspace, progress, cancellation_event):
+        assert url == "https://cdn.example.com/video/play_240p.mp4"
+        assert not cancellation_event.is_set()
+        assert transcription_started.wait(1), "trascrizione e scansione slide devono partire in parallelo"
+        frame = workspace / "frame.jpg"
+        frame.write_bytes(b"private image")
+        components.calls.append("visual-media")
+        progress(3600)
+        return MediaArtifacts([], [FrameCandidate(frame, 0)], 1_000_000_000)
+
+    def transcribe_url(url, *, duration_seconds, cancellation_event):
+        assert url == "https://cdn.example.com/video/play_240p.mp4"
+        assert duration_seconds == 3600
+        assert not cancellation_event.is_set()
+        components.calls.append("assemblyai")
+        transcription_started.set()
+        return TranscriptionResult(
+            provider="assemblyai", language="it", text="testo globale",
+            segments=[], audio_seconds=3600,
+        )
+
+    def analyze_fast(meta, transcript, frames, *, cancellation_event, progress_callback):
+        assert transcript.provider == "assemblyai"
+        assert cancellation_event is components.event
+        components.calls.append("fast-analysis")
+        progress_callback("transcript", 1, 1)
+        progress_callback("consolidation", 0, 1)
+        return components.content
+
+    components.pipeline.bunny.build_mp4_url = mp4
+    components.pipeline.bunny.select_hls_url = lambda *_args, **_kwargs: pytest.fail("HLS non previsto")
+    components.pipeline.media.extract_visual = extract_visual
+    components.pipeline.media.extract = lambda *_args, **_kwargs: pytest.fail("estrazione audio non prevista")
+    components.pipeline.fast_transcriber = SimpleNamespace(transcribe_url=transcribe_url)
+    components.pipeline.analyzer.analyze_fast = analyze_fast
+    components.pipeline.transcriber.transcribe = lambda *_args, **_kwargs: pytest.fail("fallback OpenAI non previsto")
+    components.pipeline.analyzer.analyze = lambda *_args, **_kwargs: pytest.fail("analisi a finestre non prevista")
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert report.title == components.content.title
+    assert components.calls[0] == "metadata"
+    assert components.calls[-1] == "fast-analysis"
+    assert components.calls.count("mp4") == 2
+    assert components.calls.count("assemblyai") == 1
+    assert components.calls.count("visual-media") == 1
+    assert components.calls.index("assemblyai") < components.calls.index("visual-media")
+
+
+@pytest.mark.parametrize(
+    "failing_stage, expected_code",
+    [("media", "media_decode"), ("transcription", "transcription")],
+)
+def test_fast_parallel_failure_cancels_the_other_stage_and_preserves_root_error(
+    components, tmp_path, failing_stage, expected_code,
+):
+    counterpart_cancelled = Event()
+    components.pipeline.bunny.build_mp4_url = lambda _metadata: "https://cdn.example/video.mp4"
+
+    def extract_visual(_url, _workspace, _progress, cancellation_event):
+        if failing_stage == "media":
+            raise MediaError("private media failure")
+        assert cancellation_event.wait(1)
+        counterpart_cancelled.set()
+        raise CancelledError()
+
+    def transcribe_url(_url, *, duration_seconds, cancellation_event):
+        assert duration_seconds == 3600
+        if failing_stage == "transcription":
+            raise TranscriptionError("response")
+        assert cancellation_event.wait(1)
+        counterpart_cancelled.set()
+        raise CancelledError()
+
+    components.pipeline.media.extract_visual = extract_visual
+    components.pipeline.fast_transcriber = SimpleNamespace(transcribe_url=transcribe_url)
+
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert caught.value.code == expected_code
+    assert counterpart_cancelled.is_set()
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("stage,error,code", [

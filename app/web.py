@@ -34,6 +34,10 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 templates.env.globals["format_timestamp"] = format_timestamp
 
 
+def _transcription_provider(request: Request) -> str:
+    return "assemblyai" if request.app.state.assemblyai is not None else "openai"
+
+
 def secure_cookie(request: Request) -> bool:
     return request.url.scheme == "https" or request.headers.get("x-forwarded-proto", "").lower() == "https"
 
@@ -129,6 +133,7 @@ def home(request: Request) -> HTMLResponse:
         return templates.TemplateResponse(request, "home.html", {
             "catalog_error": _catalog_error_message(exc), "videos": [], "total_items": 0,
             "total_duration": 0, "recent_jobs": request.app.state.store.list_recent(),
+            "fast_mode": request.app.state.assemblyai is not None,
         })
     return templates.TemplateResponse(request, "home.html", {
         "videos": catalog.videos,
@@ -137,6 +142,7 @@ def home(request: Request) -> HTMLResponse:
         "total_items": catalog.total_items,
         "total_duration": sum(video.duration_seconds for video in catalog.videos),
         "recent_jobs": request.app.state.store.list_recent(),
+        "fast_mode": request.app.state.assemblyai is not None,
     })
 
 
@@ -148,7 +154,10 @@ def selection_preview(request: Request, video_ids: list[str] = Form(default=[]))
     return templates.TemplateResponse(request, "selection_preview.html", {
         "videos": metadata,
         "total_duration": total_duration,
-        "cost": estimate_cost(total_duration, 0),
+        "cost": estimate_cost(
+            total_duration, 0,
+            transcription_provider=_transcription_provider(request),
+        ),
         "confirmation": sign_selection(selected_ids, request.app.state.confirmation_key),
     })
 
@@ -207,7 +216,11 @@ def preview_job(request: Request, source_url: str = Form("")) -> HTMLResponse:
     signature = hmac.digest(request.app.state.confirmation_key, payload.encode(), "sha256").hex()
     return templates.TemplateResponse(request, "preview.html", {
         "metadata": metadata, "duration": format_timestamp(metadata.duration_seconds),
-        "cost": estimate_cost(metadata.duration_seconds, 0), "confirmation": f"{payload}:{signature}",
+        "cost": estimate_cost(
+            metadata.duration_seconds, 0,
+            transcription_provider=_transcription_provider(request),
+        ),
+        "confirmation": f"{payload}:{signature}",
     })
 
 

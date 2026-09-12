@@ -225,6 +225,19 @@ def test_selection_preview_accepts_between_one_and_fifty_unique_canonical_ids(cl
     assert extract_hidden(response.text, "confirmation")
 
 
+def test_dashboard_and_preview_show_fast_provider_when_assemblyai_is_active(client):
+    client.app.state.assemblyai = object()
+    client.app.state.bunny.list_videos = lambda: catalog(
+        catalog_video(VIDEO_ID, VIDEO_TITLE, 3600),
+    )
+
+    dashboard = client.get("/")
+    preview = selection_form(client, [VIDEO_ID])
+
+    assert "Modalità veloce AssemblyAI attiva" in dashboard.text
+    assert "0.2900–0.4300 USD" in preview.text
+
+
 def test_selection_preview_rejects_an_empty_selection(client):
     response = selection_form(client, [])
 

@@ -228,6 +228,35 @@ def test_invalid_source_error_does_not_expose_url_or_upstream_diagnostics(tmp_pa
     assert error.value.__cause__ is None
 
 
+def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path, monkeypatch) -> None:
+    commands = []
+
+    def fake_run(args, event, consume):
+        commands.append(args)
+        template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+        Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
+        consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stdout", "out_time_us=60000000")
+
+    monkeypatch.setattr(media, "_run_process", fake_run)
+    progress = []
+    with temporary_workspace(tmp_path) as workspace:
+        result = FFmpegProcessor().extract_visual(
+            "https://cdn.example/video/play_240p.mp4", workspace, progress.append, Event(),
+        )
+        assert result.audio_chunks == []
+        assert not list(workspace.rglob("*.m4a"))
+        assert not list(workspace.rglob("audio.csv"))
+        assert [frame.timestamp_seconds for frame in result.frame_candidates] == [0]
+        assert result.downloaded_bytes == 120
+        assert progress == [60]
+
+    assert len(commands) == 1
+    assert commands[0].count("https://cdn.example/video/play_240p.mp4") == 1
+    assert "copy" in commands[0]
+
+
 def test_cancelled_before_start_never_launches_ffmpeg(tmp_path) -> None:
     event = Event()
     event.set()

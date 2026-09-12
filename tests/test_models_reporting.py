@@ -123,3 +123,19 @@ def test_original_title_usage_and_refined_cost_are_rendered():
         assert "1000" in rendered and "2000" in rendered
         assert "stima applicativa" in rendered
         assert "non sostituisce la fattura" in rendered
+
+
+def test_assemblyai_cost_uses_one_global_job_with_diarization_and_speaker_identification():
+    from app.models import APIUsage, ProviderUsage, UsageEntry
+
+    usage = APIUsage(transcription=ProviderUsage(entries=[UsageEntry(
+        provider_audio_seconds=3600, request_audio_seconds=3600,
+    )]))
+
+    cost = estimate_cost(
+        3600, 0, usage=usage, transcription_provider="assemblyai",
+    )
+
+    assert cost.transcription_usd == .25
+    assert cost.estimated_low_usd == .29
+    assert cost.estimated_high_usd == .43

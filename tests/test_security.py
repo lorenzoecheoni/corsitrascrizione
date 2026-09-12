@@ -21,6 +21,7 @@ from app.transcription import TranscriptionError, TranscriptionResult
 def sentinels():
     values = SimpleNamespace(
         api_key="FAKE_ONLY_BUNNY_API_SENTINEL", openai="FAKE_ONLY_OPENAI_SENTINEL",
+        assemblyai="00000000-0000-0000-0000-000000000099",
         password="FAKE_ONLY_PASSWORD_SENTINEL", token_key="FAKE_ONLY_TOKEN_KEY_SENTINEL",
         token="FAKE_ONLY_QUERY_TOKEN_SENTINEL", transcript="FAKE_ONLY_TRANSCRIPT_SENTINEL",
         image="FAKE_ONLY_IMAGE_PAYLOAD_SENTINEL", body="FAKE_ONLY_PROVIDER_BODY_SENTINEL",
@@ -38,6 +39,7 @@ def sentinels():
 def settings(sentinels):
     return Settings(bunny_library_id=123, bunny_stream_api_key=sentinels.api_key,
                     bunny_cdn_hostname="cdn.example.test", openai_api_key=sentinels.openai,
+                    assemblyai_api_key=sentinels.assemblyai,
                     app_password=sentinels.password, bunny_token_auth_key=sentinels.token_key,
                     _env_file=None)
 
@@ -235,6 +237,17 @@ def test_configuration_protects_new_handlers_and_configured_values(caplog, setti
     assert "9999999999" not in stream.getvalue()
     assert "/fake/private/" not in stream.getvalue()
     assert "log_suppressed" in stream.getvalue()
+
+
+def test_assemblyai_key_is_redacted_even_when_it_looks_like_valid_event_metadata(caplog, settings, sentinels):
+    from app.logging_config import configure_logging, job_log_context, log_event
+
+    configure_logging(settings)
+    caplog.set_level(logging.INFO)
+    with job_log_context(UUID(sentinels.assemblyai)):
+        log_event("transcription", elapsed_seconds=1)
+
+    assert_private(caplog, sentinels)
 
 
 def test_invalid_source_has_safe_validation_error_in_pipeline_and_http(caplog, settings, sentinels, tmp_path):

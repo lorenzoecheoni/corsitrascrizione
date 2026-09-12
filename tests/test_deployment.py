@@ -11,7 +11,7 @@ from uvicorn.main import main as uvicorn_command
 
 from app.auth import SESSION_COOKIE
 from app.config import Settings
-from app.main import create_app
+from app.main import build_services, create_app
 
 
 @pytest.fixture
@@ -44,6 +44,36 @@ def test_container_explicitly_enables_proxy_headers_with_bounded_allowlist(conta
     assert proxy_source is ParameterSource.COMMANDLINE
     assert config.proxy_headers is True
     assert config.forwarded_allow_ips.split(",") == ["127.0.0.1", "100.0.0.0/8"]
+
+
+def test_assemblyai_is_optional_eu_fast_path_and_secret_is_not_represented():
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", assemblyai_api_key="assembly-secret", _env_file=None,
+    )
+    services = build_services(settings)
+    try:
+        assert services.assemblyai is not None
+        assert services.pipeline.fast_transcriber is services.assemblyai
+        assert "assembly-secret" not in repr(settings)
+    finally:
+        services.runner.shutdown(wait=True)
+        services.assemblyai.close()
+        services.openai.close()
+
+    fallback = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", _env_file=None,
+    )
+    fallback_services = build_services(fallback)
+    try:
+        assert fallback_services.assemblyai is None
+        assert fallback_services.pipeline.fast_transcriber is None
+    finally:
+        fallback_services.runner.shutdown(wait=True)
+        fallback_services.openai.close()
 
 
 @pytest.mark.parametrize("peer", ["127.0.0.1", "100.64.0.42", "100.255.0.1"])

@@ -18,6 +18,7 @@
     <a id="refresh-catalog" class="button secondary" href="/">Aggiorna catalogo</a>
     <p class="catalog-total">{{ total_items }} video <span aria-hidden="true">·</span> Durata complessiva: {{ format_timestamp(total_duration) }}</p>
   </section>
+  {% if fast_mode %}<p class="notice" role="status">Modalità veloce AssemblyAI attiva</p>{% endif %}
   {% if catalog_error %}
   <p class="notice form-error" role="alert">{{ catalog_error }}</p>
   {% elif not videos %}

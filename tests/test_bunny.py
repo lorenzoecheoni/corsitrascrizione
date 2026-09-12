@@ -365,6 +365,24 @@ def test_protected_playback_uses_configured_key_and_expiry(settings, monkeypatch
     assert "token-secret" not in url
 
 
+def test_mp4_url_uses_lowest_ready_resolution_and_same_signed_directory(settings, monkeypatch) -> None:
+    from app.bunny import BunnyVideoMetadata
+
+    metadata = BunnyVideoMetadata(
+        video_id=VIDEO_ID, title="Corso", duration_seconds=60,
+        status=4, available_resolutions=[720, 240, 480],
+    )
+    client = BunnyClient(settings)
+    assert client.build_mp4_url(metadata) == f"https://{CDN}/{VIDEO_ID}/play_240p.mp4"
+
+    settings.bunny_token_auth_key = "token-secret"
+    monkeypatch.setattr("app.bunny.time.time", lambda: 1_999_996_400)
+    protected = BunnyClient(settings).build_mp4_url(metadata)
+    assert "bcdn_token=HS256-" in protected
+    assert protected.endswith(f"/{VIDEO_ID}/play_240p.mp4")
+    assert "token-secret" not in protected
+
+
 @pytest.mark.parametrize("hostname", ["evil.example/path", "user@evil.example", "https://evil.example", "evil.example?token=x", "evil.example:8443", ""])
 def test_playback_rejects_malformed_configured_hostname(hostname, settings) -> None:
     settings.bunny_cdn_hostname = hostname

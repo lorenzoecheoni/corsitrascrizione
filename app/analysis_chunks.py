@@ -20,13 +20,16 @@ from app.models import (
     SlideChange,
     SpeakerProfile,
 )
-from app.transcription import TranscriptSegment
+from app.transcription import TranscriptionResult, TranscriptSegment
 
 
 MAX_WINDOW_SECONDS = 600
 MAX_WINDOW_CHARS = 12_000
 MAX_CONSOLIDATION_CHARS = 30_000
 MAX_VISUAL_CONTEXT_CHARS = 18_000
+MAX_FAST_REPORT_CHARS = 30_000
+MAX_FAST_TRANSCRIPT_CONTEXT_CHARS = 20_000
+MAX_FAST_VISUAL_CONTEXT_CHARS = 8_000
 
 BoundedText = Annotated[str, Field(max_length=300)]
 
@@ -273,4 +276,126 @@ def build_consolidation_payload(
     serialized = _serialized(payload)
     if len(serialized) > MAX_CONSOLIDATION_CHARS:
         raise AssertionError("Il payload di consolidamento supera il limite")
+    return serialized
+
+
+def _fast_segment_payload(segment: TranscriptSegment) -> dict:
+    return {
+        "start_seconds": segment.start_seconds,
+        "end_seconds": segment.end_seconds,
+        "diarization_label": segment.diarization_label,
+        "text": segment.text[:600],
+    }
+
+
+def build_fast_report_payload(
+    metadata: BunnyVideoMetadata,
+    transcription: TranscriptionResult,
+    slides: Sequence[SlideChange],
+) -> str:
+    """Build one bounded report request with identity and whole-video coverage.
+
+    The full transcript is deliberately excluded. Priority is given to the
+    opening, the first turn of every detected voice, regular timeline samples,
+    and the ending. All detected slide changes remain in the local report; this
+    payload includes only enough visual context for naming and synopsis.
+    """
+    provider_segments = sorted(
+        transcription.segments,
+        key=lambda segment: (segment.start_seconds, segment.end_seconds),
+    )
+    if not provider_segments or any(
+        segment.start_seconds > metadata.duration_seconds
+        or segment.end_seconds > metadata.duration_seconds + 60
+        or segment.start_seconds > segment.end_seconds
+        or not segment.text.strip()
+        for segment in provider_segments
+    ):
+        raise ConsolidationPayloadError("trascrizione non valida per il report rapido")
+    ordered = [
+        segment.model_copy(update={"end_seconds": min(segment.end_seconds, metadata.duration_seconds)})
+        for segment in provider_segments
+    ]
+
+    first_by_label: dict[str, int] = {}
+    for index, segment in enumerate(ordered):
+        first_by_label.setdefault(segment.diarization_label, index)
+    if len(first_by_label) > 64:
+        raise ConsolidationPayloadError("numero di voci non rappresentabile nel report rapido")
+
+    payload = {
+        "metadata": {
+            "title": metadata.title,
+            "duration_seconds": metadata.duration_seconds,
+        },
+        "detected_language": transcription.language,
+        "speaker_mapping": {
+            label: _bounded_text(transcription.speaker_mapping.get(label, label))
+            for label in first_by_label
+        },
+        "segments": [],
+        "slides": [],
+    }
+    if len(_serialized(payload)) > MAX_FAST_REPORT_CHARS:
+        raise ConsolidationPayloadError("dati obbligatori superano il limite del report rapido")
+
+    selected: set[int] = set()
+
+    def append_segment(index: int, *, required: bool = False) -> bool:
+        if index in selected:
+            return True
+        item = _fast_segment_payload(ordered[index])
+        payload["segments"].append(item)
+        size = len(_serialized({"segments": payload["segments"]}))
+        fits = size <= MAX_FAST_TRANSCRIPT_CONTEXT_CHARS and len(_serialized(payload)) <= MAX_FAST_REPORT_CHARS
+        if not fits:
+            payload["segments"].pop()
+            if required:
+                raise ConsolidationPayloadError("voci obbligatorie superano il limite del report rapido")
+            return False
+        selected.add(index)
+        return True
+
+    # Every detected voice and the final turn are mandatory; a report must not
+    # silently omit a presenter or co-speaker merely to fit the request.
+    for index in first_by_label.values():
+        append_segment(index, required=True)
+    append_segment(len(ordered) - 1, required=True)
+
+    # Preserve the introductions first, then regular coverage across up to four
+    # hours. Optional additions stop cleanly once the bounded context is full.
+    for index, segment in enumerate(ordered):
+        if segment.start_seconds > min(600, metadata.duration_seconds):
+            break
+        if not append_segment(index):
+            break
+
+    sample_count = min(48, len(ordered))
+    for sample in range(sample_count):
+        target = metadata.duration_seconds * sample / max(1, sample_count - 1)
+        index = min(
+            range(len(ordered)),
+            key=lambda candidate: abs(ordered[candidate].start_seconds - target),
+        )
+        append_segment(index)
+
+    # Include representative slide text for synthesis and name evidence. The
+    # complete chronological slide list is returned locally by the analyzer.
+    ordered_slides = sorted(slides, key=lambda slide: slide.timestamp_seconds)
+    if ordered_slides:
+        slide_indexes = {
+            round(sample * (len(ordered_slides) - 1) / max(1, min(47, len(ordered_slides) - 1)))
+            for sample in range(min(48, len(ordered_slides)))
+        }
+        for index in sorted(slide_indexes):
+            payload["slides"].append(_slide_payload(ordered_slides[index]))
+            visual_size = len(_serialized({"slides": payload["slides"]}))
+            if visual_size > MAX_FAST_VISUAL_CONTEXT_CHARS or len(_serialized(payload)) > MAX_FAST_REPORT_CHARS:
+                payload["slides"].pop()
+                break
+
+    payload["segments"].sort(key=lambda item: (item["start_seconds"], item["end_seconds"]))
+    serialized = _serialized(payload)
+    if len(serialized) > MAX_FAST_REPORT_CHARS:
+        raise AssertionError("Il payload rapido supera il limite")
     return serialized

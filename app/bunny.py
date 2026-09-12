@@ -462,6 +462,27 @@ class BunnyClient:
             )
         return f"https://{hostname}/{validated_id}/playlist.m3u8"
 
+    def build_mp4_url(self, metadata: BunnyVideoMetadata) -> str:
+        """Build the lowest-resolution ready MP4 from validated Bunny metadata."""
+        metadata.require_ready()
+        validated_id = _video_uuid(metadata.video_id)
+        hostname = _cdn_hostname(self._settings.bunny_cdn_hostname)
+        resolution = min(value for value in metadata.available_resolutions if 0 < value <= 720)
+        filename = f"play_{resolution}p.mp4"
+        key = self._settings.bunny_token_auth_key
+        if key:
+            with self._token_lock:
+                expires = max(int(time.time()) + 3600, self._last_token_expiry + 1)
+                self._last_token_expiry = expires
+            playlist = build_cdn_token_url(
+                hostname=hostname,
+                video_id=validated_id,
+                key=key,
+                expires=expires,
+            )
+            return playlist.removesuffix("playlist.m3u8") + filename
+        return f"https://{hostname}/{validated_id}/{filename}"
+
     def build_thumbnail_url(self, video_id: str | UUID, filename: str) -> str:
         """Create a safe thumbnail URL from configured CDN data only."""
         validated_id = _video_uuid(video_id)

@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 from app.analysis import OpenAIAnalyzer
+from app.assemblyai import AssemblyAITranscriber
 from app.auth import SESSION_COOKIE, session_is_valid
 from app.bunny import BunnyClient
 from app.config import Settings
@@ -33,6 +34,7 @@ class Services:
     openai: OpenAI
     transcriber: OpenAITranscriber
     analyzer: OpenAIAnalyzer
+    assemblyai: AssemblyAITranscriber | None
     pipeline: AnalysisPipeline
     store: JobStore
     runner: SingleWorkerRunner
@@ -47,10 +49,21 @@ def build_services(settings: Settings) -> Services:
     openai = OpenAI(api_key=settings.openai_api_key, max_retries=0)
     transcriber = OpenAITranscriber(openai)
     analyzer = OpenAIAnalyzer(openai)
-    pipeline = AnalysisPipeline(settings, bunny, media, transcriber, analyzer)
+    assemblyai = None
+    if settings.assemblyai_api_key:
+        base_url = (
+            "https://api.eu.assemblyai.com"
+            if settings.assemblyai_region == "eu"
+            else "https://api.assemblyai.com"
+        )
+        assemblyai = AssemblyAITranscriber(settings.assemblyai_api_key, base_url=base_url)
+    pipeline = AnalysisPipeline(
+        settings, bunny, media, transcriber, analyzer,
+        fast_transcriber=assemblyai,
+    )
     store = JobStore()
     runner = SingleWorkerRunner(store, pipeline.run)
-    return Services(bunny, media, openai, transcriber, analyzer, pipeline, store, runner)
+    return Services(bunny, media, openai, transcriber, analyzer, assemblyai, pipeline, store, runner)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -78,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.openai = services.openai
     app.state.transcriber = services.transcriber
     app.state.analyzer = services.analyzer
+    app.state.assemblyai = services.assemblyai
     app.state.pipeline = services.pipeline
     app.state.store = services.store
     app.state.runner = services.runner

@@ -107,7 +107,8 @@ def configure_logging(settings: Settings) -> None:
     with _lock:
         _filter.secrets |= frozenset(value for value in (
             settings.app_password, settings.bunny_stream_api_key,
-            settings.openai_api_key, settings.bunny_token_auth_key,
+            settings.openai_api_key, settings.assemblyai_api_key,
+            settings.bunny_token_auth_key,
         ) if value)
         previous = logging.Handler.filter
         if not getattr(previous, "_safe_event_filter", False):

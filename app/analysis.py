@@ -14,16 +14,18 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
-    MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS,
+    MAX_CONSOLIDATION_CHARS, MAX_FAST_REPORT_CHARS, MAX_WINDOW_CHARS,
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
-    split_transcript_windows,
+    build_fast_report_payload, split_transcript_windows,
 )
 from app.media import FrameCandidate
 from app.models import (
     Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
     ReportModel, SlideChange, AnalysisResult, ProviderUsage, Nonnegative,
 )
-from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT
+from app.prompts import (
+    CONSOLIDATION_PROMPT, FAST_REPORT_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT,
+)
 from app.openai_limits import ProviderRateGate, parse_reset_seconds
 from app.retry import check_cancelled, retry_remote
 from app.transcription import TranscriptionResult
@@ -270,6 +272,53 @@ class OpenAIAnalyzer:
     ) -> AnalysisResult:
         check_cancelled(cancellation_event)
         usage = ProviderUsage()
+        slides, uncertain_count = self._classify_slides(
+            metadata, frames, cancellation_event=cancellation_event,
+            progress_callback=progress_callback, usage=usage,
+        )
+        check_cancelled(cancellation_event)
+        slide_data = [slide.model_dump(mode="json") for slide in slides]
+        try:
+            windows = split_transcript_windows(transcription.segments)
+        except ValueError:
+            raise AnalysisError("response", stage="window") from None
+        analyses: list[WindowAnalysis] = []
+        for index, window in enumerate(windows, start=1):
+            check_cancelled(cancellation_event)
+            analyses.append(self._structured(
+                text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
+                payload=window.to_payload(), prepare=lambda data: None,
+                validate=lambda result: [], cancellation_event=cancellation_event,
+                usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
+                max_repair_chars=MAX_WINDOW_CHARS,
+                stage="window",
+            ))
+            if progress_callback is not None:
+                progress_callback("transcript", index, len(windows))
+        check_cancelled(cancellation_event)
+        try:
+            payload = build_consolidation_payload(metadata, analyses, slides)
+        except ValueError:
+            raise AnalysisError("response", stage="consolidation") from None
+        if progress_callback is not None:
+            progress_callback("consolidation", 0, 1)
+
+        result = self._structured(
+            text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
+            prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
+            cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
+            max_output_tokens=4000,
+            max_repair_chars=MAX_CONSOLIDATION_CHARS,
+            stage="consolidation",
+        )
+        return self._result_with_slides(result, slide_data, uncertain_count, usage, cancellation_event)
+
+    def _classify_slides(
+        self, metadata: BunnyVideoMetadata, frames: Sequence[FrameCandidate], *,
+        cancellation_event: Event | None,
+        progress_callback: Callable[[str, int, int], None] | None,
+        usage: ProviderUsage,
+    ) -> tuple[list[SlideChange], int]:
         timestamps = [frame.timestamp_seconds for frame in frames]
         if (any(not _valid_time(value, metadata.duration_seconds) for value in timestamps)
                 or timestamps != sorted(set(timestamps))):
@@ -311,41 +360,46 @@ class OpenAIAnalyzer:
                     uncertain_count += 1
             if progress_callback is not None:
                 progress_callback("slides", batch_number, total_batches)
+        return slides, uncertain_count
+
+    def analyze_fast(
+        self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
+        frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
+    ) -> AnalysisResult:
+        """Analyze a globally diarized transcript with one final text request."""
         check_cancelled(cancellation_event)
-        slide_data = [slide.model_dump(mode="json") for slide in slides]
+        usage = ProviderUsage()
+        slides, uncertain_count = self._classify_slides(
+            metadata, frames, cancellation_event=cancellation_event,
+            progress_callback=progress_callback, usage=usage,
+        )
         try:
-            windows = split_transcript_windows(transcription.segments)
-        except ValueError:
-            raise AnalysisError("response", stage="window") from None
-        analyses: list[WindowAnalysis] = []
-        for index, window in enumerate(windows, start=1):
-            check_cancelled(cancellation_event)
-            analyses.append(self._structured(
-                text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
-                payload=window.to_payload(), prepare=lambda data: None,
-                validate=lambda result: [], cancellation_event=cancellation_event,
-                usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
-                max_repair_chars=MAX_WINDOW_CHARS,
-                stage="window",
-            ))
-            if progress_callback is not None:
-                progress_callback("transcript", index, len(windows))
-        check_cancelled(cancellation_event)
-        try:
-            payload = build_consolidation_payload(metadata, analyses, slides)
+            payload = build_fast_report_payload(metadata, transcription, slides)
         except ValueError:
             raise AnalysisError("response", stage="consolidation") from None
+        if progress_callback is not None:
+            progress_callback("transcript", 1, 1)
+        check_cancelled(cancellation_event)
         if progress_callback is not None:
             progress_callback("consolidation", 0, 1)
 
         result = self._structured(
-            text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
+            text_format=ConsolidatedTextReport, instructions=FAST_REPORT_PROMPT, payload=payload,
             prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
             cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
             max_output_tokens=4000,
-            max_repair_chars=MAX_CONSOLIDATION_CHARS,
+            max_repair_chars=MAX_FAST_REPORT_CHARS,
             stage="consolidation",
         )
+        slide_data = [slide.model_dump(mode="json") for slide in slides]
+        return self._result_with_slides(result, slide_data, uncertain_count, usage, cancellation_event)
+
+    @staticmethod
+    def _result_with_slides(
+        result: ConsolidatedTextReport, slide_data: list[dict], uncertain_count: int,
+        usage: ProviderUsage, cancellation_event: Event | None,
+    ) -> AnalysisResult:
         check_cancelled(cancellation_event)
         data = result.model_dump()
         if uncertain_count:

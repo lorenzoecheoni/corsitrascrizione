@@ -40,4 +40,6 @@ def test_real_bunny_video_produces_valid_report(live_settings):
     finally:
         if services is not None:
             services.runner.shutdown(wait=True)
+            if services.assemblyai is not None:
+                services.assemblyai.close()
             services.openai.close()

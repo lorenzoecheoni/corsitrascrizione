@@ -249,6 +249,27 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
                for part in images)
 
 
+def test_fast_analysis_uses_one_visual_batch_and_one_final_text_request(inputs, content):
+    client = FakeClient(visual("slide", "camera_change", "uncertain"), content)
+    progress = []
+
+    result = OpenAIAnalyzer(client).analyze_fast(
+        **inputs, progress_callback=lambda *event: progress.append(event),
+    )
+
+    assert [call["text_format"] for call in client.calls] == [SlideBatchResult, ConsolidatedTextReport]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini"]
+    assert all(call["store"] is False for call in client.calls)
+    payload = json.loads(client.calls[-1]["input"])
+    assert payload["detected_language"] == "und"
+    assert payload["segments"][0]["diarization_label"] == "chunk-0:A"
+    assert "transcription" not in payload
+    assert "data:image" not in client.calls[-1]["input"]
+    assert [slide.timestamp_seconds for slide in result.slides] == [2]
+    assert result.usage.requests == 2
+    assert progress == [("slides", 1, 1), ("transcript", 1, 1), ("consolidation", 0, 1)]
+
+
 def test_usage_counts_batches_retry_error_and_semantic_repair(inputs, content, monkeypatch):
     monkeypatch.setattr("app.retry.time.sleep", lambda _: None)
     failure = APIStatusError("safe", response=httpx.Response(503, request=httpx.Request("POST", "https://api.openai.com")),

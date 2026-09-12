@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 from pathlib import Path
 from threading import Event
+from typing import Literal
 
 import httpx
 from openai import APIStatusError, APITimeoutError, OpenAI
@@ -39,6 +40,7 @@ class TranscriptSegment(BaseModel):
 
 
 class TranscriptionResult(BaseModel):
+    provider: Literal["openai", "assemblyai"] = "openai"
     # Diarized JSON has no language field; downstream analysis infers language.
     language: str = "und"
     text: str = Field(repr=False)

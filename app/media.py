@@ -254,11 +254,25 @@ class FFmpegProcessor:
         token = _active_limits.set(MediaLimits(workspace, monotonic() + self.runtime_seconds,
                                               self.inactivity_seconds, self.max_workspace_bytes))
         try:
-            return self._extract(source_url, workspace, progress_callback, cancellation_event)
+            return self._extract(source_url, workspace, progress_callback, cancellation_event, include_audio=True)
         finally:
             _active_limits.reset(token)
 
-    def _extract(self, source_url, workspace, progress_callback, cancellation_event) -> MediaArtifacts:
+    def extract_visual(
+        self, source_url: str, workspace: Path,
+        progress_callback: Callable[[float], None], cancellation_event: Event,
+    ) -> MediaArtifacts:
+        """Extract slide candidates without writing temporary audio files."""
+        token = _active_limits.set(MediaLimits(workspace, monotonic() + self.runtime_seconds,
+                                              self.inactivity_seconds, self.max_workspace_bytes))
+        try:
+            return self._extract(source_url, workspace, progress_callback, cancellation_event, include_audio=False)
+        finally:
+            _active_limits.reset(token)
+
+    def _extract(
+        self, source_url, workspace, progress_callback, cancellation_event, *, include_audio: bool,
+    ) -> MediaArtifacts:
         _check_cancelled(cancellation_event)
         output = Path(tempfile.mkdtemp(prefix="media-", dir=workspace))
         timestamps: dict[int, float] = {}
@@ -285,20 +299,30 @@ class FFmpegProcessor:
                     processed_seconds = seconds
                     progress_callback(seconds)
 
-        _run_process([
+        command = [
             self.ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose",
             "-nostats", "-progress", "pipe:1", "-i", source_url,
-            "-map", "0:a:0", "-vn", "-c:a", "aac", "-ac", "1", "-ar", "16000",
-            "-b:a", "24k", "-f", "segment",
-            "-segment_time", str(_TRANSCRIPTION_SEGMENT_SECONDS),
-            "-reset_timestamps", "1", "-segment_format", "mp4",
-            "-segment_list", str(output / "audio.csv"), "-segment_list_type", "csv",
-            str(output / "audio-%05d.m4a"),
+        ]
+        if include_audio:
+            command.extend([
+                "-map", "0:a:0", "-vn", "-c:a", "aac", "-ac", "1", "-ar", "16000",
+                "-b:a", "24k", "-f", "segment",
+                "-segment_time", str(_TRANSCRIPTION_SEGMENT_SECONDS),
+                "-reset_timestamps", "1", "-segment_format", "mp4",
+                "-segment_list", str(output / "audio.csv"), "-segment_list_type", "csv",
+                str(output / "audio-%05d.m4a"),
+            ])
+        command.extend([
             "-map", "0:v:0", "-an", "-vf",
             "select='eq(n,0)+gt(scene,0.18)',scale=w='min(960,iw)':h=-2,showinfo",
             "-fps_mode", "vfr", "-c:v", "mjpeg", "-q:v", "3",
             str(output / "frame-%06d.jpg"),
-        ], cancellation_event, consume)
+        ])
+        if not include_audio:
+            # Copy audio packets to the null muxer so FFmpeg progress advances
+            # through long static slides without encoding or persisting audio.
+            command.extend(["-map", "0:a:0", "-vn", "-c:a", "copy", "-f", "null", os.devnull])
+        _run_process(command, cancellation_event, consume)
         _check_cancelled(cancellation_event)
         frames = sorted(output.glob("frame-*.jpg"))
         if (
@@ -308,7 +332,7 @@ class FFmpegProcessor:
             or any(timestamps[i] <= timestamps[i - 1] for i in range(1, len(frames)))
         ):
             raise MediaError("Impossibile verificare i fotogrammi o la lettura del video")
-        audio_chunks = self._read_chunks(output, cancellation_event)
+        audio_chunks = self._read_chunks(output, cancellation_event) if include_audio else []
         frame_candidates = deduplicate_frames([
             FrameCandidate(path, timestamps[i]) for i, path in enumerate(frames)
         ], cancellation_event)

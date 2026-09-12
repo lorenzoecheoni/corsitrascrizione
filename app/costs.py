@@ -1,5 +1,7 @@
 """Deterministic initial cost estimates for a processed video."""
 
+from typing import Literal
+
 from app.models import APIUsage, CostEstimate, ProviderUsage
 
 
@@ -7,16 +9,25 @@ from app.models import APIUsage, CostEstimate, ProviderUsage
 BUNNY_USD_PER_GB = 0.01
 TRANSCRIPTION_LOW_USD_PER_HOUR = 0.36
 TRANSCRIPTION_HIGH_USD_PER_HOUR = 0.50
+ASSEMBLYAI_USD_PER_HOUR = 0.25
 ANALYSIS_LOW_USD_PER_HOUR = 0.04
 ANALYSIS_HIGH_USD_PER_HOUR = 0.18
 
 
-def estimate_cost(duration_seconds: float, downloaded_bytes: int, *, usage: APIUsage | None = None) -> CostEstimate:
+def estimate_cost(
+    duration_seconds: float, downloaded_bytes: int, *, usage: APIUsage | None = None,
+    transcription_provider: Literal["openai", "assemblyai"] = "openai",
+) -> CostEstimate:
     """Estimate USD costs from deterministic media usage measurements."""
     hours = duration_seconds / 3600
     bunny = downloaded_bytes / 1_000_000_000 * BUNNY_USD_PER_GB
-    transcription_low = hours * TRANSCRIPTION_LOW_USD_PER_HOUR
-    transcription_high = hours * TRANSCRIPTION_HIGH_USD_PER_HOUR
+    transcription_rate_low, transcription_rate_high = (
+        (ASSEMBLYAI_USD_PER_HOUR, ASSEMBLYAI_USD_PER_HOUR)
+        if transcription_provider == "assemblyai"
+        else (TRANSCRIPTION_LOW_USD_PER_HOUR, TRANSCRIPTION_HIGH_USD_PER_HOUR)
+    )
+    transcription_low = hours * transcription_rate_low
+    transcription_high = hours * transcription_rate_high
     analysis_low = hours * ANALYSIS_LOW_USD_PER_HOUR
     analysis_high = hours * ANALYSIS_HIGH_USD_PER_HOUR
     if usage is not None:
@@ -27,12 +38,13 @@ def estimate_cost(duration_seconds: float, downloaded_bytes: int, *, usage: APIU
                 low += known
                 high += known
                 if entry.input_tokens is None or entry.output_tokens is None:
-                    fallback_hours = entry.request_audio_seconds / 3600 if audio else hours / provider.requests
+                    fallback_seconds = entry.provider_audio_seconds or entry.request_audio_seconds
+                    fallback_hours = fallback_seconds / 3600 if audio else hours / provider.requests
                     low += fallback_hours * low_rate
                     high += fallback_hours * high_rate
             return (low, high) if provider.entries else (hours * low_rate, hours * high_rate)
         transcription_low, transcription_high = refine(usage.transcription, 2.5, 10,
-            TRANSCRIPTION_LOW_USD_PER_HOUR, TRANSCRIPTION_HIGH_USD_PER_HOUR, audio=True)
+            transcription_rate_low, transcription_rate_high, audio=True)
         analysis_low, analysis_high = refine(usage.responses, .2, 1.2,
             ANALYSIS_LOW_USD_PER_HOUR, ANALYSIS_HIGH_USD_PER_HOUR)
     return CostEstimate(

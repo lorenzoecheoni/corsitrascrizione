@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.models import SlideChange
-from app.transcription import TranscriptSegment
+from app.transcription import TranscriptionResult, TranscriptSegment
 
 
 def test_prompts_preserve_every_announced_presenter_moderator_and_speaker_without_voice_mapping():
@@ -300,3 +300,70 @@ def test_window_speaker_rejects_evidence_notes_over_300_characters():
             diarization_labels=["chunk-0:A"], confidence="alta",
             evidence=[Evidence(kind="introduzione", timestamp_seconds=0, note="x" * 301)],
         )
+
+
+def test_fast_report_payload_covers_every_voice_opening_timeline_and_ending_within_one_request():
+    from app.analysis_chunks import MAX_FAST_REPORT_CHARS, build_fast_report_payload
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"),
+        title="Sessione lunga", duration_seconds=14_400,
+    )
+    labels = [f"assembly:{letter}" for letter in "ABCDEF"]
+    segments = [
+        TranscriptSegment(
+            start_seconds=float(index * 60), end_seconds=float(index * 60 + 50),
+            diarization_label=(labels[index % 5] if index != 120 else labels[5]),
+            text=("Apertura e presentazione dei relatori." if index == 0 else
+                  "Conclusione definitiva della sessione." if index == 239 else
+                  f"Intervento numero {index}. " + "x" * 500),
+        )
+        for index in range(240)
+    ]
+    transcription = TranscriptionResult(
+        provider="assemblyai", language="it", text="TRASCRIZIONE_COMPLETA_DA_NON_INVIARE",
+        segments=segments, audio_seconds=14_400,
+        speaker_mapping={label: f"Relatore {index + 1}" for index, label in enumerate(labels)},
+    )
+    slides = [
+        SlideChange(timestamp_seconds=index * 60, title=f"Slide {index}",
+                    visible_content=["y" * 300] * 4, confidence="alta")
+        for index in range(240)
+    ]
+
+    payload = build_fast_report_payload(metadata, transcription, slides)
+    parsed = json.loads(payload)
+
+    assert len(payload) <= MAX_FAST_REPORT_CHARS
+    assert "TRASCRIZIONE_COMPLETA_DA_NON_INVIARE" not in payload
+    assert parsed["metadata"] == {"title": "Sessione lunga", "duration_seconds": 14_400}
+    assert parsed["detected_language"] == "it"
+    assert set(parsed["speaker_mapping"]) == set(labels)
+    assert set(item["diarization_label"] for item in parsed["segments"]) == set(labels)
+    assert parsed["segments"][0]["text"] == "Apertura e presentazione dei relatori."
+    assert any(item["start_seconds"] == 7200 for item in parsed["segments"])
+    assert parsed["segments"][-1]["text"] == "Conclusione definitiva della sessione."
+    assert parsed["slides"]
+
+
+def test_fast_report_payload_clamps_small_provider_duration_rounding():
+    from app.analysis_chunks import build_fast_report_payload
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"),
+        title="Sessione", duration_seconds=60,
+    )
+    transcription = TranscriptionResult(
+        provider="assemblyai", text="Conclusione.", audio_seconds=60.4,
+        segments=[TranscriptSegment(
+            start_seconds=59.5, end_seconds=60.4,
+            diarization_label="assembly:A", text="Conclusione.",
+        )],
+    )
+
+    payload = json.loads(build_fast_report_payload(metadata, transcription, []))
+
+    assert payload["segments"] == [{
+        "start_seconds": 59.5, "end_seconds": 60,
+        "diarization_label": "assembly:A", "text": "Conclusione.",
+    }]

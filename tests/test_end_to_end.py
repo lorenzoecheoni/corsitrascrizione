@@ -27,7 +27,11 @@ SOURCE = f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}"
 class OfflineOpenAI:
     def __init__(self, **kwargs):
         self.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=self.transcribe))
-        self.responses = SimpleNamespace(parse=self.parse)
+        self.responses = SimpleNamespace(with_raw_response=SimpleNamespace(parse=self.raw_parse))
+
+    def raw_parse(self, **kwargs):
+        response = self.parse(**kwargs)
+        return SimpleNamespace(headers={}, parse=lambda: response)
 
     def with_options(self, **kwargs):
         return self

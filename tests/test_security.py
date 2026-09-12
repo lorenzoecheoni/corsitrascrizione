@@ -86,7 +86,7 @@ def failing_pipeline(settings, sentinels, tmp_path, phase):
 
 
 @pytest.mark.parametrize("phase,code", [("metadata", "bunny_auth"), ("media", "media_decode"),
-    ("transcription", "transcription"), ("analysis", "analysis"), ("report", "temporary_failure")])
+    ("transcription", "transcription"), ("analysis", "analysis_consolidation"), ("report", "temporary_failure")])
 def test_stage_errors_never_disclose_secrets(caplog, settings, sentinels, tmp_path, phase, code):
     caplog.set_level(logging.DEBUG)
     pipeline = failing_pipeline(settings, sentinels, tmp_path, phase)
@@ -98,7 +98,7 @@ def test_stage_errors_never_disclose_secrets(caplog, settings, sentinels, tmp_pa
 
 
 @pytest.mark.parametrize("phase,code", [("metadata", "bunny_auth"), ("media", "media_decode"),
-    ("transcription", "transcription"), ("analysis", "analysis"), ("report", "temporary_failure")])
+    ("transcription", "transcription"), ("analysis", "analysis_consolidation"), ("report", "temporary_failure")])
 def test_http_failed_job_has_safe_correlated_event(caplog, settings, sentinels, tmp_path, phase, code):
     caplog.set_level(logging.DEBUG)
     app = create_app(settings)

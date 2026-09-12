@@ -29,6 +29,12 @@ _MESSAGES = {
     "transcription": "Trascrizione non riuscita; verifica la configurazione OpenAI e riprova",
     "analysis": "Analisi non riuscita; verifica la configurazione OpenAI e riprova",
     "analysis_rate_limit": "Limite OpenAI temporaneamente raggiunto; riprova più tardi",
+    "analysis_visual": "Analisi delle slide non riuscita; verifica la configurazione OpenAI e riprova",
+    "analysis_window": "Analisi della finestra testuale non riuscita; verifica la configurazione OpenAI e riprova",
+    "analysis_consolidation": "Consolidamento del report non riuscito; verifica la configurazione OpenAI e riprova",
+    "analysis_visual_rate_limit": "Limite OpenAI raggiunto durante l'analisi delle slide; riprova più tardi",
+    "analysis_window_rate_limit": "Limite OpenAI raggiunto durante l'analisi della finestra testuale; riprova più tardi",
+    "analysis_consolidation_rate_limit": "Limite OpenAI raggiunto durante il consolidamento del report; riprova più tardi",
     "temporary_failure": "Servizio temporaneamente non disponibile; riprova più tardi",
     "not_ready": "Video ancora in elaborazione su Bunny; attendere la fine della codifica",
     "encoding_failed": "Codifica o caricamento Bunny fallito; verificare il video nella libreria",
@@ -161,7 +167,9 @@ class AnalysisPipeline:
             elif isinstance(exc, TranscriptionError):
                 code = "transcription"
             elif isinstance(exc, AnalysisError):
-                code = "analysis_rate_limit" if exc.code == "rate_limit" else "analysis"
+                code = f"analysis_{exc.stage}"
+                if exc.code == "rate_limit":
+                    code += "_rate_limit"
             else:
                 code = "temporary_failure"
             log_event(phase, elapsed_seconds=monotonic() - started, error_code=code,

@@ -24,6 +24,7 @@ from app.models import (
     ReportModel, SlideChange, AnalysisResult, ProviderUsage, Nonnegative,
 )
 from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT
+from app.openai_limits import ProviderRateGate, parse_reset_seconds
 from app.retry import check_cancelled, retry_remote
 from app.transcription import TranscriptionResult
 from app.usage import record_usage
@@ -31,6 +32,7 @@ from app.usage import record_usage
 
 _VISUAL_BATCH_SIZE = 25
 _MAX_VISUAL_REPAIR_CHARS = 30_000
+AnalysisStage = Literal["visual", "window", "consolidation"]
 
 
 class ClassifiedFrame(ReportModel):
@@ -63,19 +65,23 @@ class AnalysisError(Exception):
     def __init__(
         self, code: str, *, status_code: int | None = None,
         retry_after_seconds: float | None = None,
+        stage: AnalysisStage = "consolidation",
     ) -> None:
+        if stage not in {"visual", "window", "consolidation"}:
+            raise ValueError("Fase di analisi non valida")
         super().__init__(_MESSAGES[code])
+        self.stage = stage
         self.code = code
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
         self.retryable = code in {"timeout", "rate_limit", "server"}
 
 
-def _remote_error(exc: Exception) -> AnalysisError:
+def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
     if isinstance(exc, (APITimeoutError, TimeoutError, httpx.TimeoutException)):
-        return AnalysisError("timeout")
+        return AnalysisError("timeout", stage=stage)
     if isinstance(exc, ValidationError):
-        return AnalysisError("response")
+        return AnalysisError("response", stage=stage)
     if isinstance(exc, APIStatusError):
         status = exc.status_code
         code = ("rate_limit" if status == 429 else "server" if 500 <= status <= 599
@@ -88,8 +94,10 @@ def _remote_error(exc: Exception) -> AnalysisError:
                     retry_after = candidate
             except (TypeError, ValueError):
                 pass
-        return AnalysisError(code, status_code=status, retry_after_seconds=retry_after)
-    return AnalysisError("transport")
+            if retry_after is None:
+                retry_after = parse_reset_seconds(exc.response.headers.get("x-ratelimit-reset-project-tokens", ""))
+        return AnalysisError(code, stage=stage, status_code=status, retry_after_seconds=retry_after)
+    return AnalysisError("transport", stage=stage)
 
 
 def _analysis_retry_delay(exc: Exception, default_delay: float) -> float:
@@ -169,14 +177,16 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class OpenAIAnalyzer:
-    def __init__(self, client: OpenAI) -> None:
+    def __init__(self, client: OpenAI, *, rate_gate: ProviderRateGate | None = None) -> None:
         self._client = client.with_options(max_retries=0)
+        self._rate_gate = rate_gate if rate_gate is not None else ProviderRateGate()
 
     def _structured(
         self, *, text_format: type[T], instructions: str, payload: str | list,
         prepare: Callable[[dict], None], validate: Callable[[T], list[str]],
         cancellation_event: Event | None, usage: ProviderUsage,
         max_repair_chars: int,
+        stage: AnalysisStage,
         model: str = "gpt-5.6-luna",
         max_output_tokens: int = 4000,
     ) -> T:
@@ -185,19 +195,31 @@ class OpenAIAnalyzer:
             def request():
                 nonlocal attempts
                 check_cancelled(cancellation_event)
+                serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+                images = (sum(part.get("type") == "input_image" and part.get("detail") == "low"
+                              for message in payload for part in message.get("content", []))
+                          if isinstance(payload, list) else 0)
+                required_tokens = max(max_output_tokens, math.ceil(len(serialized) / 3)) + 300 * images
+                self._rate_gate.wait(model, required_tokens, cancellation_event)
+                check_cancelled(cancellation_event)
                 attempts += 1
                 try:
-                    response = self._client.responses.parse(
+                    raw = self._client.responses.with_raw_response.parse(
                         model=model, store=False, text_format=text_format,
                         instructions=instructions, input=payload,
                         max_output_tokens=max_output_tokens,
                     )
+                    try:
+                        self._rate_gate.observe(model, raw.headers)
+                        response = raw.parse()
+                    finally:
+                        del raw
                 except CancelledError:
                     raise
                 except Exception as exc:
                     record_usage(usage, exc)
                     check_cancelled(cancellation_event)
-                    raise _remote_error(exc) from None
+                    raise _remote_error(exc, stage) from None
                 record_usage(usage, response)
                 check_cancelled(cancellation_event)
                 return response
@@ -220,18 +242,18 @@ class OpenAIAnalyzer:
                 result = text_format.model_validate(data)
                 errors = validate(result)
             except (ValueError, TypeError, AttributeError, KeyError):
-                raise AnalysisError("response") from None
+                raise AnalysisError("response", stage=stage) from None
             if not errors:
                 check_cancelled(cancellation_event)
                 return result
             if repair or attempts >= 3:
-                raise AnalysisError("response")
+                raise AnalysisError("response", stage=stage)
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)
             if len(payload) > max_repair_chars:
-                raise AnalysisError("response") from None
+                raise AnalysisError("response", stage=stage) from None
             instructions = REPAIR_PROMPT
-        raise AnalysisError("response")  # Defensive; both iterations return or raise.
+        raise AnalysisError("response", stage=stage)  # Defensive; both iterations return or raise.
 
     def analyze(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
@@ -243,7 +265,7 @@ class OpenAIAnalyzer:
         timestamps = [frame.timestamp_seconds for frame in frames]
         if (any(not _valid_time(value, metadata.duration_seconds) for value in timestamps)
                 or timestamps != sorted(set(timestamps))):
-            raise AnalysisError("frames")
+            raise AnalysisError("frames", stage="visual")
         slides: list[SlideChange] = []
         uncertain_count = 0
         for offset in range(0, len(frames), _VISUAL_BATCH_SIZE):
@@ -266,9 +288,10 @@ class OpenAIAnalyzer:
                     payload=[{"role": "user", "content": parts}], prepare=lambda data: None,
                     validate=validate_batch, cancellation_event=cancellation_event, usage=usage,
                     max_output_tokens=3000, max_repair_chars=_MAX_VISUAL_REPAIR_CHARS,
+                    stage="visual",
                 )
             except OSError:
-                raise AnalysisError("frames") from None
+                raise AnalysisError("frames", stage="visual") from None
             finally:
                 # Drop data URLs immediately, including error/cancellation paths.
                 parts.clear()
@@ -282,7 +305,7 @@ class OpenAIAnalyzer:
         try:
             windows = split_transcript_windows(transcription.segments)
         except ValueError:
-            raise AnalysisError("response") from None
+            raise AnalysisError("response", stage="window") from None
         analyses: list[WindowAnalysis] = []
         for index, window in enumerate(windows, start=1):
             check_cancelled(cancellation_event)
@@ -292,6 +315,7 @@ class OpenAIAnalyzer:
                 validate=lambda result: [], cancellation_event=cancellation_event,
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
+                stage="window",
             ))
             if progress_callback is not None:
                 progress_callback("transcript", index, len(windows))
@@ -299,7 +323,7 @@ class OpenAIAnalyzer:
         try:
             payload = build_consolidation_payload(metadata, analyses, slides)
         except ValueError:
-            raise AnalysisError("response") from None
+            raise AnalysisError("response", stage="consolidation") from None
 
         result = self._structured(
             text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
@@ -307,6 +331,7 @@ class OpenAIAnalyzer:
             cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
             max_output_tokens=4000,
             max_repair_chars=MAX_CONSOLIDATION_CHARS,
+            stage="consolidation",
         )
         check_cancelled(cancellation_event)
         data = result.model_dump()

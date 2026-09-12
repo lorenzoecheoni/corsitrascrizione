@@ -100,7 +100,7 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     ("media", MediaError("secret upstream"), "media_decode"),
     ("media", MediaProtectedError("secret upstream"), "protected_video"),
     ("transcription", TranscriptionError("response"), "transcription"),
-    ("analysis", AnalysisError("response"), "analysis"),
+    ("analysis", AnalysisError("response"), "analysis_consolidation"),
 ])
 def test_pipeline_sanitizes_failures_and_cleans_files(components, tmp_path, stage, error, code):
     components.error = stage, error
@@ -115,9 +115,25 @@ def test_analysis_rate_limit_has_specific_actionable_message(components, tmp_pat
     components.error = "analysis", AnalysisError("rate_limit", status_code=429)
     with pytest.raises(PipelineError) as caught:
         components.pipeline.run(SOURCE, lambda p, m: None, components.event)
-    assert caught.value.code == "analysis_rate_limit"
-    assert caught.value.user_message == "Limite OpenAI temporaneamente raggiunto; riprova più tardi"
+    assert caught.value.code == "analysis_consolidation_rate_limit"
+    assert "consolidamento" in caught.value.user_message.lower()
+    assert "riprova" in caught.value.user_message
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("stage,word", [("visual", "slide"), ("window", "testuale"),
+                                       ("consolidation", "consolidamento")])
+@pytest.mark.parametrize("reason,status", [("response", None), ("rate_limit", 429)])
+def test_analysis_failure_exposes_safe_stage_in_message_and_logs(components, stage, word, reason, status, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="app.events")
+    components.error = "analysis", AnalysisError(reason, stage=stage, status_code=status)
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert word in caught.value.user_message.lower()
+    assert f"analysis_{stage}" in caught.value.code
+    assert caught.value.code in caplog.text
+    assert "private raw transcript" not in caplog.text
 
 
 @pytest.mark.parametrize("stage", ["metadata", "media", "transcription", "analysis"])

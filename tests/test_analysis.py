@@ -65,7 +65,12 @@ class FakeClient:
         self.outcomes = list(outcomes)
         self.calls = []
         self.responses = self
+        self.with_raw_response = SimpleNamespace(parse=self.raw_parse)
         self.max_retries = None
+
+    def raw_parse(self, **kwargs):
+        response = self.parse(**kwargs)
+        return SimpleNamespace(headers=getattr(response, "headers", {}), parse=lambda: response)
 
     def with_options(self, *, max_retries):
         self.max_retries = max_retries
@@ -276,6 +281,92 @@ def test_rate_limit_without_retry_after_waits_for_the_token_window(inputs, conte
     assert sleeps == [30.0, 60.0]
 
 
+@pytest.mark.parametrize("headers,delay", [
+    ({"x-ratelimit-reset-project-tokens": "1m2s"}, 62),
+    ({"retry-after": "bad", "x-ratelimit-reset-project-tokens": "250ms"}, 1),
+    ({"retry-after": "12.5", "x-ratelimit-reset-project-tokens": "1m2s"}, 12.5),
+])
+def test_rate_limit_reset_fallback_and_retry_after_precedence(inputs, content, monkeypatch, headers, delay):
+    inputs["frames"] = []
+    sleeps = []
+    monkeypatch.setattr("app.retry.time.sleep", sleeps.append)
+    error = APIStatusError("PRIVATE", response=httpx.Response(
+        429, headers=headers, request=httpx.Request("POST", "https://api.openai.com")), body={})
+    client = FakeClient(error, window_result(), content)
+    OpenAIAnalyzer(client).analyze(**inputs)
+    assert sleeps == [delay]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_raw_headers_pace_next_call_and_cancel_before_sending(inputs, content, cancel):
+    from app.openai_limits import ProviderRateGate
+    inputs["frames"] = []
+    event = Event()
+    now, waits = [100], []
+    def wait(seconds, ev):
+        waits.append(seconds)
+        now[0] += seconds
+        if cancel:
+            ev.set()
+    gate = ProviderRateGate(clock=lambda: now[0], wait=wait)
+    response = lambda _: SimpleNamespace(output_parsed=window_result(),
+        headers={"x-ratelimit-remaining-project-tokens": "3999",
+                 "x-ratelimit-reset-project-tokens": "3s", "private": "SECRET"},
+        usage=SimpleNamespace(input_tokens=10, output_tokens=2))
+    client = FakeClient(response, content)
+    analyzer = OpenAIAnalyzer(client, rate_gate=gate)
+    if cancel:
+        with pytest.raises(CancelledError):
+            analyzer.analyze(**inputs, cancellation_event=event)
+        assert len(client.calls) == 1
+    else:
+        result = analyzer.analyze(**inputs, cancellation_event=event)
+        assert result.usage.requests == 2
+        assert result.usage.input_tokens == 10
+    assert waits == [3]
+
+
+@pytest.mark.parametrize("stage", ["visual", "window", "consolidation"])
+def test_failure_preserves_static_analysis_stage(inputs, stage):
+    error = APIStatusError("SECRET", response=httpx.Response(
+        400, request=httpx.Request("POST", "https://api.openai.com")), body={})
+    if stage != "visual":
+        inputs["frames"] = []
+    client = FakeClient(*([window_result()] if stage == "consolidation" else []), error)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.stage == stage
+    assert caught.value.status_code == 400
+    assert "SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("payload,remaining,waits", [
+    ("{}", 1999, [3]), ("{}", 2000, []),
+    ("x" * 9001, 3000, [3]), ("x" * 9001, 3001, []),
+    ([{"role": "user", "content": [{"type": "input_image", "detail": "low",
+       "image_url": "data:image/jpeg;base64,a"}]}], 2299, [3]),
+    ([{"role": "user", "content": [{"type": "input_image", "detail": "low",
+       "image_url": "data:image/jpeg;base64,a"}]}], 2300, []),
+])
+def test_gate_request_estimate_includes_output_json_and_low_detail_images(payload, remaining, waits):
+    from app.openai_limits import ProviderRateGate
+    now, observed = [100], []
+    def wait(seconds, event):
+        observed.append(seconds)
+        now[0] += seconds
+    gate = ProviderRateGate(clock=lambda: now[0], wait=wait)
+    gate.observe("gpt-4o-mini", {"x-ratelimit-remaining-project-tokens": str(remaining),
+                               "x-ratelimit-reset-project-tokens": "3s"})
+    analyzer = OpenAIAnalyzer(FakeClient(window_result()), rate_gate=gate)
+    result = analyzer._structured(
+        text_format=WindowAnalysis, instructions="test", payload=payload,
+        prepare=lambda data: None, validate=lambda result: [],
+        cancellation_event=None, usage=ProviderUsage(), model="gpt-4o-mini",
+        max_output_tokens=2000, max_repair_chars=12_000, stage="window")
+    assert result.detected_language == "it"
+    assert observed == waits
+
+
 def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, content):
     inputs["frames"] = []
     content["speakers"][1].update(display_name="Nome Inventato", role="CEO", confidence="bassa",
@@ -342,6 +433,7 @@ def test_window_repairs_count_serialized_envelope_against_cap(size, should_repai
             validate=lambda result: ["invalid language"] if result.detected_language != "it" else [],
             cancellation_event=None, usage=usage, model="gpt-4o-mini",
             max_output_tokens=2000, max_repair_chars=12_000,
+            stage="window",
         )
     if should_repair:
         assert request().detected_language == "it"
@@ -427,14 +519,21 @@ def test_visual_timestamp_mismatch_is_repaired_before_final_pass(inputs, content
 
 @pytest.mark.parametrize("invalid_name", [False, True])
 def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, caplog, capsys):
+    from app.openai_limits import ProviderRateGate
     inputs["frames"] = []
     if invalid_name:
         content["speakers"][1].update(display_name="SECRET INVENTED NAME", evidence=[])
     requests = []
+    now, waits = [100], []
+    def wait(seconds, event):
+        waits.append(seconds)
+        now[0] += seconds
+    gate = ProviderRateGate(clock=lambda: now[0], wait=wait)
     def respond(request):
         requests.append(json.loads(request.content))
         data = window_result() if len(requests) == 1 else content
-        return httpx.Response(200, json={
+        return httpx.Response(200, headers={"x-ratelimit-remaining-project-tokens": "0",
+            "x-ratelimit-reset-project-tokens": "250ms", "private": "SECRET HEADER"}, json={
             "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
             "model": "gpt-5.6-luna", "error": None, "incomplete_details": None,
             "instructions": None, "metadata": {}, "parallel_tool_calls": True,
@@ -445,18 +544,19 @@ def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, c
     with OpenAI(api_key="test-only", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
         if invalid_name:
             with pytest.raises(AnalysisError) as caught:
-                OpenAIAnalyzer(client).analyze(**inputs)
+                OpenAIAnalyzer(client, rate_gate=gate).analyze(**inputs)
             assert caught.value.code == "response"
             assert "SECRET" not in str(caught.value)
             assert caught.value.__suppress_context__
             assert len(requests) == 2
         else:
-            result = OpenAIAnalyzer(client).analyze(**inputs)
+            result = OpenAIAnalyzer(client, rate_gate=gate).analyze(**inputs)
             assert result.speakers[0].display_name == "Giulia Bianchi"
     assert [request["text"]["format"]["name"] for request in requests] == ["WindowAnalysis", "ConsolidatedTextReport"]
     assert all(request["text"]["format"]["strict"] is True for request in requests)
     assert all(request["store"] is False for request in requests)
     assert [request["max_output_tokens"] for request in requests] == [2000, 4000]
+    assert waits == [.25]
     assert "SECRET" not in caplog.text + capsys.readouterr().out
 
 

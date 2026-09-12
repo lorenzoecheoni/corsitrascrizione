@@ -25,6 +25,8 @@ _PHASES = {"validation", "metadata", "media", "transcription", "analysis", "repo
 _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protected_video",
           "unsupported_duration", "media_decode", "transcription", "analysis", "temporary_failure",
           "analysis_rate_limit",
+          "analysis_visual", "analysis_window", "analysis_consolidation",
+          "analysis_visual_rate_limit", "analysis_window_rate_limit", "analysis_consolidation_rate_limit",
           "timeout", "transport", "remote_response", "invalid_request", "unauthorized",
           "log_suppressed"}
 _ROUTES = {"/", "/jobs", "/jobs/{job_id}", "/api/jobs/{job_id}", "/jobs/{job_id}/cancel",

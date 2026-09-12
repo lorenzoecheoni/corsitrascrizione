@@ -14,11 +14,15 @@ def load_report() -> AcademyReport:
     return AcademyReport.model_validate(data)
 
 
-def test_report_fixture_covers_multi_speaker_session() -> None:
+def test_report_fixture_covers_requested_text_report() -> None:
     report = load_report()
     assert len(report.speakers) == 3
-    assert len(report.interventions[1].speaker_ids) == 2
+    assert report.synopsis
     assert report.slides[0].timestamp_seconds == 95
+    assert set(report.model_dump()) == {
+        "title", "duration_seconds", "detected_language", "synopsis",
+        "speakers", "slides", "uncertainties", "cost", "bunny_title", "usage",
+    }
 
 
 def test_one_hour_cost_is_in_approved_range() -> None:
@@ -32,6 +36,11 @@ def test_markdown_and_text_are_exportable() -> None:
     plain = render_text(report)
     assert "## Relatori" in markdown
     assert "01:35" in markdown
+    assert "## Descrizione estesa" not in markdown
+    assert "## Capitoli" not in markdown
+    assert "## Interventi" not in markdown
+    assert "## Argomenti e parole chiave" not in markdown
+    assert "## Punti chiave" not in markdown
     assert "Relatori" in plain
     assert format_timestamp(3661) == "1:01:01"
 
@@ -79,24 +88,12 @@ def test_report_rejects_nonfinite_negative_duration(field, value):
         AcademyReport.model_validate(data)
 
 
-@pytest.mark.parametrize("section,field,value", [
-    ("chapters", "end_seconds", -1), ("interventions", "end_seconds", -1),
-    ("slides", "timestamp_seconds", float("inf")),
-])
+@pytest.mark.parametrize("section,field,value", [("slides", "timestamp_seconds", float("inf"))])
 def test_report_rejects_invalid_timestamps(section, field, value):
     data = load_report().model_dump()
     data[section][0][field] = value
     with pytest.raises(ValueError):
         AcademyReport.model_validate(data)
-
-
-@pytest.mark.parametrize("section", ["chapters", "interventions"])
-def test_report_rejects_reversed_positive_intervals(section):
-    data = load_report().model_dump()
-    data[section][0].update(start_seconds=5, end_seconds=4)
-    with pytest.raises(ValueError):
-        AcademyReport.model_validate(data)
-
 
 def test_cost_rejects_negative_nan_and_reversed_bounds():
     for changes in ({"estimated_low_usd": -1}, {"analysis_usd": float("nan")},

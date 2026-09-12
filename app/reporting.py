@@ -19,13 +19,6 @@ def _csv(items: list[str]) -> str:
     return ", ".join(items) if items else "Nessuno"
 
 
-def _speaker_name(report: AcademyReport, speaker_id: str) -> str:
-    return next(
-        (speaker.display_name for speaker in report.speakers if speaker.id == speaker_id),
-        speaker_id,
-    )
-
-
 def render_markdown(report: AcademyReport) -> str:
     """Render a stable, human-readable Markdown representation of a report."""
     lines = [
@@ -37,14 +30,6 @@ def render_markdown(report: AcademyReport) -> str:
         "",
         "## Sintesi",
         report.synopsis,
-        "",
-        "## Descrizione estesa",
-        report.extended_description,
-        "",
-        "## Pubblico e obiettivi",
-        f"- Destinatari: {_csv(report.target_audience)}",
-        f"- Prerequisiti: {_csv(report.prerequisites)}",
-        f"- Obiettivi: {_csv(report.learning_objectives)}",
         "",
         "## Relatori",
     ]
@@ -59,23 +44,6 @@ def render_markdown(report: AcademyReport) -> str:
             )
             lines.append(f"  - Evidenza{timestamp}: {evidence.note}")
 
-    lines.extend(["", "## Capitoli"])
-    for chapter in report.chapters:
-        lines.append(
-            f"- {format_timestamp(chapter.start_seconds)}–{format_timestamp(chapter.end_seconds)}: "
-            f"{chapter.title} — {chapter.summary}"
-        )
-
-    lines.extend(["", "## Interventi"])
-    for intervention in report.interventions:
-        speakers = ", ".join(
-            _speaker_name(report, speaker_id) for speaker_id in intervention.speaker_ids
-        )
-        lines.append(
-            f"- {format_timestamp(intervention.start_seconds)}–{format_timestamp(intervention.end_seconds)}: "
-            f"{speakers} — {intervention.summary}"
-        )
-
     lines.extend(["", "## Slide"])
     for slide in report.slides:
         title = slide.title or "Senza titolo"
@@ -85,17 +53,6 @@ def render_markdown(report: AcademyReport) -> str:
             f"(confidenza: {slide.confidence})"
         )
 
-    lines.extend(
-        [
-            "",
-            "## Argomenti e parole chiave",
-            f"- Argomenti: {_csv(report.topics)}",
-            f"- Parole chiave: {_csv(report.keywords)}",
-            "",
-            "## Punti chiave",
-        ]
-    )
-    lines.extend(f"- {takeaway}" for takeaway in report.key_takeaways)
     lines.extend(["", "## Incertezze"])
     lines.extend(f"- {uncertainty}" for uncertainty in report.uncertainties)
     lines.extend(

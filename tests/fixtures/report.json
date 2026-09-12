@@ -3,10 +3,6 @@
   "duration_seconds": 3720,
   "detected_language": "it",
   "synopsis": "Sessione introduttiva sulle funzionalità della piattaforma Academy.",
-  "extended_description": "Il presentatore introduce due relatori, che illustrano il flusso di pubblicazione e rispondono insieme alle domande finali.",
-  "target_audience": ["team academy", "content manager"],
-  "prerequisites": ["Conoscenza base della piattaforma"],
-  "learning_objectives": ["Pubblicare un corso", "Comprendere il flusso di revisione"],
   "speakers": [
     {
       "id": "presentatore",
@@ -36,21 +32,10 @@
       ]
     }
   ],
-  "interventions": [
-    {"start_seconds": 0, "end_seconds": 44, "speaker_ids": ["presentatore"], "summary": "Apertura e presentazione della sessione."},
-    {"start_seconds": 2100, "end_seconds": 2280, "speaker_ids": ["relatore-1", "relatore-2"], "summary": "Risposta congiunta alle domande sulla revisione."}
-  ],
-  "chapters": [
-    {"start_seconds": 0, "end_seconds": 600, "title": "Introduzione", "summary": "Obiettivi e relatori."},
-    {"start_seconds": 600, "end_seconds": 3720, "title": "Pubblicazione", "summary": "Procedura e domande finali."}
-  ],
   "slides": [
     {"timestamp_seconds": 95, "title": "Agenda", "visible_content": ["Obiettivi", "Flusso di pubblicazione"], "confidence": "alta"},
     {"timestamp_seconds": 720, "title": "Revisione dei contenuti", "visible_content": ["Bozza", "Approvazione"], "confidence": "media"}
   ],
-  "topics": ["academy", "pubblicazione", "revisione"],
-  "keywords": ["corso", "contenuti", "approvazione"],
-  "key_takeaways": ["La revisione precede la pubblicazione.", "La responsabilità è condivisa dal team."],
   "uncertainties": ["Il nome del Relatore 2 non è supportato da evidenze non biometriche."],
   "cost": {
     "estimated_low_usd": 0.42,

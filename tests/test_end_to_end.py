@@ -57,17 +57,9 @@ class OfflineOpenAI:
             data = {
                 "title": "Corso sintetico", "duration_seconds": 2, "detected_language": "it",
                 "synopsis": "Introduzione al corso sintetico.",
-                "extended_description": "Una breve introduzione per il collaudo operativo.",
-                "target_audience": ["Redattori"], "prerequisites": ["Nessuno dichiarato"],
-                "learning_objectives": ["Comprendere il corso"],
                 "speakers": [{"id": "a", "display_name": "Relatore 1", "role": None,
                               "confidence": "bassa", "evidence": []}],
-                "interventions": [{"start_seconds": 0, "end_seconds": 2,
-                                   "speaker_ids": ["a"], "summary": "Introduzione"}],
-                "chapters": [{"start_seconds": 0, "end_seconds": 2,
-                              "title": "Introduzione", "summary": "Presentazione del corso"}],
-                "slides": [], "topics": ["Corso"], "keywords": ["Introduzione"],
-                "key_takeaways": ["Seguire il corso"], "uncertainties": [],
+                "slides": [], "uncertainties": [],
             }
         return SimpleNamespace(status="completed", output_parsed=text_format.model_validate(data))
 

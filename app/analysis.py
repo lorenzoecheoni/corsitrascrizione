@@ -136,16 +136,13 @@ def _content_errors(content: AcademyContent, duration: float) -> list[str]:
     errors = []
     if not math.isfinite(content.duration_seconds) or content.duration_seconds != duration:
         errors.append(f"duration_seconds deve essere {duration}.")
-    for field in ("title", "synopsis", "extended_description", "detected_language"):
+    for field in ("title", "synopsis", "detected_language"):
         if not getattr(content, field).strip():
             errors.append(f"{field} deve essere compilato.")
     if content.detected_language.strip().lower() == "und":
         errors.append("Inferire detected_language dal testo; se impossibile dichiarare non determinabile.")
-    for field in ("target_audience", "prerequisites", "learning_objectives", "topics", "keywords", "key_takeaways"):
-        if not getattr(content, field) or any(not value.strip() for value in getattr(content, field)):
-            errors.append(f"{field} deve contenere informazioni o un'assenza esplicita.")
-    if not content.speakers or not content.interventions or not content.chapters:
-        errors.append("speakers, interventions e chapters devono essere compilati.")
+    if not content.speakers:
+        errors.append("speakers devono essere compilati.")
     ids = [speaker.id for speaker in content.speakers]
     if len(set(ids)) != len(ids) or any(not value.strip() for value in ids):
         errors.append("speakers.id devono essere unici e non vuoti.")
@@ -159,23 +156,6 @@ def _content_errors(content: AcademyContent, duration: float) -> list[str]:
                 errors.append(f"speakers[{index}].evidence: timestamp fuori durata.")
             if not evidence.note.strip():
                 errors.append(f"speakers[{index}].evidence: nota vuota.")
-    for field in ("interventions", "chapters"):
-        previous_start = previous_end = -1.0
-        for index, item in enumerate(getattr(content, field)):
-            if (not _valid_time(item.start_seconds, duration) or not _valid_time(item.end_seconds, duration)
-                    or item.start_seconds >= item.end_seconds):
-                errors.append(f"{field}[{index}]: intervallo non valido entro durata {duration}.")
-            if item.start_seconds < previous_start:
-                errors.append(f"{field}[{index}]: timestamp non ordinati.")
-            if field == "chapters" and item.start_seconds < previous_end:
-                errors.append(f"chapters[{index}]: capitoli sovrapposti.")
-            if not item.summary.strip() or (field == "chapters" and not item.title.strip()):
-                errors.append(f"{field}[{index}]: titolo o descrizione vuoti.")
-            if field == "interventions" and (not item.speaker_ids or
-                    len(set(item.speaker_ids)) != len(item.speaker_ids) or
-                    any(speaker_id not in ids for speaker_id in item.speaker_ids)):
-                errors.append(f"interventions[{index}]: speaker_ids mancanti, duplicati o sconosciuti.")
-            previous_start, previous_end = item.start_seconds, item.end_seconds
     return errors
 
 

@@ -43,27 +43,6 @@ class SpeakerProfile(ReportModel):
         )
 
 
-class TimeInterval(ReportModel):
-    start_seconds: Nonnegative
-    end_seconds: Nonnegative
-
-    @model_validator(mode="after")
-    def ordered_interval(self):
-        if self.end_seconds < self.start_seconds:
-            raise ValueError("La fine precede l'inizio")
-        return self
-
-
-class Intervention(TimeInterval):
-    speaker_ids: list[str]
-    summary: str
-
-
-class Chapter(TimeInterval):
-    title: str
-    summary: str
-
-
 class SlideChange(ReportModel):
     timestamp_seconds: Nonnegative
     title: str | None = None
@@ -137,17 +116,8 @@ class AcademyContent(ReportModel):
     duration_seconds: Nonnegative
     detected_language: str
     synopsis: str
-    extended_description: str
-    target_audience: list[str]
-    prerequisites: list[str]
-    learning_objectives: list[str]
     speakers: list[SpeakerProfile]
-    interventions: list[Intervention]
-    chapters: list[Chapter]
     slides: list[SlideChange]
-    topics: list[str]
-    keywords: list[str]
-    key_takeaways: list[str]
     uncertainties: list[str]
 
 

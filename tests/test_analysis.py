@@ -22,9 +22,6 @@ def content():
     return {
         "title": "Pubblicazione Academy", "duration_seconds": 90,
         "detected_language": "it", "synopsis": "Come pubblicare contenuti.",
-        "extended_description": "Introduzione, dimostrazione e confronto fra due relatori.",
-        "target_audience": ["Redattori"], "prerequisites": ["Nessuno dichiarato"],
-        "learning_objectives": ["Pubblicare un corso"],
         "speakers": [
             {"id": "host", "display_name": "Giulia Bianchi", "role": "Presentatrice",
              "confidence": "alta", "evidence": [{"kind": "introduzione", "timestamp_seconds": 0,
@@ -35,16 +32,7 @@ def content():
             {"id": "b", "display_name": "Relatore 2", "role": None,
              "confidence": "bassa", "evidence": []},
         ],
-        "interventions": [
-            {"start_seconds": 0, "end_seconds": 10, "speaker_ids": ["host"], "summary": "Introduzione"},
-            {"start_seconds": 10, "end_seconds": 90, "speaker_ids": ["a", "b"], "summary": "Confronto"},
-        ],
-        "chapters": [
-            {"start_seconds": 0, "end_seconds": 10, "title": "Apertura", "summary": "Presentazioni"},
-            {"start_seconds": 10, "end_seconds": 90, "title": "Corso", "summary": "Pubblicazione"},
-        ],
-        "slides": [], "topics": ["Pubblicazione"], "keywords": ["Academy"],
-        "key_takeaways": ["Revisionare prima di pubblicare"], "uncertainties": [],
+        "slides": [], "uncertainties": [],
     }
 
 
@@ -209,21 +197,13 @@ def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, c
     assert result.speakers[1].display_name != result.speakers[2].display_name
     assert result.speakers[1].role is None
     assert result.uncertainties
-    assert result.interventions[1].speaker_ids == ["a", "b"]
 
 
-@pytest.mark.parametrize("fault", ["overlap", "range", "order", "speaker", "duplicate",
-                                  "empty_speakers", "empty_section", "duration", "language", "evidence"])
+@pytest.mark.parametrize("fault", ["duplicate", "duration", "language", "evidence"])
 def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors(inputs, content, fault):
     inputs["frames"] = []
     bad = copy.deepcopy(content)
-    if fault == "overlap": bad["chapters"][1]["start_seconds"] = 9
-    if fault == "range": bad["interventions"][1]["end_seconds"] = 91
-    if fault == "order": bad["interventions"].reverse()
-    if fault == "speaker": bad["interventions"][0]["speaker_ids"] = ["missing"]
     if fault == "duplicate": bad["speakers"][1]["id"] = "host"
-    if fault == "empty_speakers": bad["interventions"][0]["speaker_ids"] = []
-    if fault == "empty_section": bad["learning_objectives"] = []
     if fault == "duration": bad["duration_seconds"] = 91
     if fault == "language": bad["detected_language"] = "und"
     if fault == "evidence": bad["speakers"][0]["evidence"][0]["timestamp_seconds"] = 91
@@ -239,7 +219,7 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
 
 def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, content):
     inputs["frames"] = []
-    content["interventions"][0]["start_seconds"] = float("nan")
+    content["duration_seconds"] = float("nan")
     client = FakeClient(content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
@@ -248,7 +228,7 @@ def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, 
 
 def test_second_invalid_response_has_fixed_safe_error(inputs, content):
     inputs["frames"] = []
-    content["chapters"][0]["end_seconds"] = 1000
+    content["speakers"][0]["evidence"][0]["timestamp_seconds"] = 1000
     client = FakeClient(content, content, content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
@@ -275,7 +255,7 @@ def test_repair_and_transient_errors_share_three_remote_attempt_budget(inputs, c
     inputs["frames"] = []
     monkeypatch.setattr("app.retry.time.sleep", lambda seconds: None)
     bad = copy.deepcopy(content)
-    bad["chapters"][0]["end_seconds"] = 100
+    bad["speakers"][1]["id"] = "host"
     client = FakeClient(TimeoutError("SECRET"), bad, TimeoutError("SECRET"), content)
     with pytest.raises(AnalysisError):
         OpenAIAnalyzer(client).analyze(**inputs)

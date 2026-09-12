@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
+    MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS,
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
     split_transcript_windows,
 )
@@ -29,6 +30,7 @@ from app.usage import record_usage
 
 
 _VISUAL_BATCH_SIZE = 25
+_MAX_VISUAL_REPAIR_CHARS = 30_000
 
 
 class ClassifiedFrame(ReportModel):
@@ -174,6 +176,7 @@ class OpenAIAnalyzer:
         self, *, text_format: type[T], instructions: str, payload: str | list,
         prepare: Callable[[dict], None], validate: Callable[[T], list[str]],
         cancellation_event: Event | None, usage: ProviderUsage,
+        max_repair_chars: int,
         model: str = "gpt-5.6-luna",
         max_output_tokens: int = 4000,
     ) -> T:
@@ -225,6 +228,8 @@ class OpenAIAnalyzer:
                 raise AnalysisError("response")
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)
+            if len(payload) > max_repair_chars:
+                raise AnalysisError("response") from None
             instructions = REPAIR_PROMPT
         raise AnalysisError("response")  # Defensive; both iterations return or raise.
 
@@ -260,7 +265,7 @@ class OpenAIAnalyzer:
                     text_format=SlideBatchResult, instructions=VISUAL_PROMPT,
                     payload=[{"role": "user", "content": parts}], prepare=lambda data: None,
                     validate=validate_batch, cancellation_event=cancellation_event, usage=usage,
-                    max_output_tokens=3000,
+                    max_output_tokens=3000, max_repair_chars=_MAX_VISUAL_REPAIR_CHARS,
                 )
             except OSError:
                 raise AnalysisError("frames") from None
@@ -286,6 +291,7 @@ class OpenAIAnalyzer:
                 payload=window.to_payload(), prepare=lambda data: None,
                 validate=lambda result: [], cancellation_event=cancellation_event,
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
+                max_repair_chars=MAX_WINDOW_CHARS,
             ))
             if progress_callback is not None:
                 progress_callback("transcript", index, len(windows))
@@ -300,6 +306,7 @@ class OpenAIAnalyzer:
             prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
             cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
             max_output_tokens=4000,
+            max_repair_chars=MAX_CONSOLIDATION_CHARS,
         )
         check_cancelled(cancellation_event)
         data = result.model_dump()

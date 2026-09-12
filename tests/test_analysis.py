@@ -14,7 +14,7 @@ from app.analysis import AnalysisError, OpenAIAnalyzer, SlideBatchResult
 from app.analysis_chunks import ConsolidatedTextReport, WindowAnalysis
 from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
-from app.models import AcademyContent
+from app.models import AcademyContent, ProviderUsage
 from app.transcription import TranscriptionResult, TranscriptSegment
 
 
@@ -305,7 +305,56 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
     assert set(repair) == {"errors", "previous_json"}
     assert repair["errors"]
     assert "transcription" not in repair
+    assert len(client.calls[2]["input"]) <= 30_000
     assert all(call["max_output_tokens"] == 4000 for call in client.calls[1:])
+
+
+def test_oversized_final_repair_is_rejected_before_second_remote_call(inputs, content, caplog, capsys):
+    inputs["frames"] = []
+    inputs["transcription"].segments = []
+    bad = copy.deepcopy(content)
+    private_text = "PRIVATE_REPAIR_CONTENT " * 1500
+    bad.update(synopsis=private_text, duration_seconds=91)
+    parsed = ConsolidatedTextReport.model_validate(bad)
+    client = FakeClient(parsed, content)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.code == "response"
+    assert caught.value.__suppress_context__
+    assert len(client.calls) == 1
+    assert client.calls[0]["text_format"] is ConsolidatedTextReport
+    assert len(client.calls[0]["input"]) <= 30_000
+    captured = capsys.readouterr()
+    assert "PRIVATE_REPAIR_CONTENT" not in str(caught.value) + caplog.text + captured.out + captured.err
+
+
+@pytest.mark.parametrize("size, should_repair", [(11_800, True), (12_000, False)])
+def test_window_repairs_count_serialized_envelope_against_cap(size, should_repair):
+    bad = window_result()
+    # WindowAnalysis leaves language unbounded; token limits cannot bound its JSON.
+    bad["detected_language"] = "x" * size
+    client = FakeClient(WindowAnalysis.model_validate(bad), window_result())
+    usage = ProviderUsage()
+    def request():
+        return OpenAIAnalyzer(client)._structured(
+            text_format=WindowAnalysis, instructions="Window instructions", payload="{}",
+            prepare=lambda data: None,
+            validate=lambda result: ["invalid language"] if result.detected_language != "it" else [],
+            cancellation_event=None, usage=usage, model="gpt-4o-mini",
+            max_output_tokens=2000, max_repair_chars=12_000,
+        )
+    if should_repair:
+        assert request().detected_language == "it"
+        assert len(client.calls) == 2
+        assert len(client.calls[-1]["input"]) <= 12_000
+    else:
+        with pytest.raises(AnalysisError) as caught:
+            request()
+        assert caught.value.code == "response"
+        assert caught.value.__suppress_context__
+        assert len(client.calls) == 1
+    assert all(call["max_output_tokens"] == 2000 for call in client.calls)
+    assert usage.requests == len(client.calls)
 
 
 def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, content):

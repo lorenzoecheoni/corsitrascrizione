@@ -26,6 +26,8 @@ fra zero e la durata. Assegna id unici ed etichette Relatore N distinte.
 Le etichette vocali identificano voci locali, non provano identità fra chunk.
 Un nome personale richiede introduzione, sottopancia, slide o metadata espliciti;
 inferenze e somiglianze non bastano. Usa role=null se il ruolo è incerto.
+Conserva un ruolo esplicito e le sue evidenze anche quando il nome personale
+non è noto: in quel caso mantieni un nome generico Relatore N.
 Se la lingua non è determinabile dichiaralo, senza usare 'und'.
 """
 

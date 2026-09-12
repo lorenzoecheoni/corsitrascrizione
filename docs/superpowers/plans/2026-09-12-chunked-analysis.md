@@ -214,14 +214,19 @@ stessi limiti temporali. Nessun segmento normale può apparire due volte.
 `build_consolidation_payload(metadata, analyses, slides)` deve:
 
 1. serializzare metadati essenziali;
-2. aggiungere prima candidati con nome e prove ammesse;
-3. aggiungere un contesto visivo limitato con timestamp, titolo e testo leggibile;
-4. aggiungere candidati generici e incertezze;
-5. aggiungere appunti di sinossi in ordine temporale finché resta budget;
+2. riservare tutti i candidati con prove ammesse, con note complete, incluse le
+   evidenze di ruolo per voci senza nome personale;
+3. riservare almeno un appunto completo da ogni finestra con note di sinossi;
+4. verificare che questi dati obbligatori entrino nel budget, altrimenti sollevare
+   un errore locale sicuro senza inviare un consolidamento incompleto;
+5. aggiungere gli ulteriori appunti a turno fra finestre mantenendone l'ordine
+   temporale, poi contesto visivo limitato, candidati generici senza evidenze e incertezze;
 6. verificare `len(payload) <= MAX_CONSOLIDATION_CHARS` prima del ritorno.
 
-Se i dati obbligatori da soli superano il budget, troncare soltanto note testuali
-ai limiti documentati, mai timestamp, tipo di evidenza o nome supportato.
+Non troncare note di evidenza: prefissi non vuoti possono comunque perdere il
+fatto indispensabile. I test verificano il contenuto completo delle evidenze e la
+copertura di ogni finestra, oltre a nomi, timestamp e lunghezza. Anche un ruolo
+esplicito senza nome conserva evidenza e budget obbligatori; il nome resta generico.
 
 - [ ] **Step 6: Verificare il GREEN**
 
@@ -469,8 +474,9 @@ Expected: FAIL con `ModuleNotFoundError: app.openai_limits`.
 
 `ProviderRateGate` conserva soltanto contatori numerici e scadenze monotone per
 modello. Non registra header arbitrari. `required_tokens` viene stimato
-conservativamente come massimo fra `max_output_tokens` e caratteri JSON divisi
-per tre, aggiungendo 300 token per ogni immagine a dettaglio basso.
+conservativamente come massimo fra `max_output_tokens` e caratteri del solo JSON
+testuale divisi per tre, aggiungendo una sola volta 300 token per ogni immagine a
+dettaglio basso. I data URL delle immagini non sono testo ai fini della stima.
 
 Se gli header non sono disponibili il gate non introduce attese preventive; i
 payload limitati restano la protezione primaria. Un 429 continua a usare
@@ -599,10 +605,15 @@ git commit -m "feat: report chunked analysis progress"
 
 - [ ] **Step 1: Aggiungere una prova live equivalente ma sintetica**
 
-La prova marcata `live` deve costruire segmenti sintetici per 1 ora e 36 minuti,
-eseguire il percorso finestre + consolidamento senza immagini e stampare soltanto:
-stato, richieste, token, durata e conteggi del risultato. Non deve stampare chiavi,
-payload o output testuale.
+La prova marcata `live` deve costruire segmenti sintetici variati per 1 ora e
+36 minuti, con almeno 100.000 caratteri sorgente e almeno 10.800 caratteri per
+finestra piena (l'ultima può essere parziale). Deve eseguire il percorso finestre
+e consolidamento senza immagini, verificando almeno 10.000 caratteri nel payload
+effettivo di consolidamento. Registra ogni status HTTP con contatori numerici e
+asserisce zero 429, anche se un retry successivo riesce. Stampa soltanto stato,
+richieste, contatori HTTP inclusi 429, token, durata, volumi dei payload e conteggi
+del risultato. Non deve stampare chiavi, payload o output testuale. Un test locale
+verifica che una risposta 429 recuperata faccia comunque fallire l'accettazione.
 
 - [ ] **Step 2: Eseguire la suite disponibile**
 
@@ -621,10 +632,11 @@ Expected: entrambi exit 0.
 
 - [ ] **Step 4: Eseguire la prova live sintetica con le variabili Railway**
 
-Run: `railway run .venv/bin/pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report`
+Run: `RUN_LIVE_SYNTHETIC_ANALYSIS=1 railway run .venv/bin/python -m pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report`
 
-Expected: PASS senza 429; ogni payload rispetta i limiti e il report contiene
-sinossi e almeno un relatore.
+Expected: PASS con contatore 429 uguale a zero; ogni payload rispetta i limiti
+minimi rappresentativi e massimi previsti, il report contiene sinossi e almeno
+un relatore. Il consenso specifico è richiesto anche con credenziali già presenti.
 
 - [ ] **Step 5: Documentare architettura, tempi e servizi**
 

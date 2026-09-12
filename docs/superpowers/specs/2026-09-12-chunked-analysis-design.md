@@ -78,8 +78,15 @@ Non produce capitoli, trascrizione riformattata o testo editoriale esteso.
 La richiesta finale riceve esclusivamente metadati essenziali, risultati intermedi
 e slide già classificate; non riceve la trascrizione originale né immagini. La
 dimensione dell'input viene verificata localmente prima dell'invio e non può
-superare 30.000 caratteri. Se gli appunti eccedono il limite, il backend conserva
-prima evidenze di identità e ruolo, poi comprime gli appunti della sinossi.
+superare 30.000 caratteri. Il budget obbligatorio conserva integralmente le note
+di evidenza di ogni candidato ammesso e almeno un appunto completo da ogni
+finestra con appunti di sinossi. Un ruolo esplicito con evidenza resta obbligatorio
+anche per una voce senza nome personale, che mantiene un'etichetta generica.
+Le note non vengono troncate: anche la parte finale può contenere il fatto
+indispensabile. Se questi dati non entrano, il consolidamento fallisce localmente
+con un errore sicuro. Gli altri appunti ricevono spazio a turno fra finestre,
+prima del contesto visivo e degli altri dati facoltativi; l'ordine temporale degli
+appunti conservati resta invariato.
 
 Il modello consolida nomi e ruoli soltanto quando le evidenze lo consentono.
 Persone omonime con evidenze incompatibili non vengono unite. Voci non identificate
@@ -175,6 +182,13 @@ OpenAI API, Railway e FFmpeg già configurati.
 - l'intera suite non espone segreti o contenuti nei log.
 
 ### Prova reale
+
+La prova API sintetica preliminare copre 96 minuti con almeno 100.000 caratteri
+di contenuto variato. Ogni finestra piena usa almeno 10.800 dei 12.000 caratteri
+disponibili e il consolidamento effettivo contiene almeno 10.000 caratteri.
+La prova richiede `RUN_LIVE_SYNTHETIC_ANALYSIS=1`, conta gli status HTTP anche dei
+tentativi recuperati e passa soltanto con zero risposte 429. Emette esclusivamente
+stati e contatori sicuri; non accede a Bunny e non conserva payload o risposte.
 
 Il video “Governance delle holding e conferimenti a realizzo controllato” deve:
 

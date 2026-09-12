@@ -195,7 +195,15 @@ class OpenAIAnalyzer:
             def request():
                 nonlocal attempts
                 check_cancelled(cancellation_event)
-                serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+                # Image data URLs are transport bytes, not text tokens. Keep
+                # the textual envelope and account for low-detail images once.
+                text_payload = payload if isinstance(payload, str) else [
+                    {**message, "content": [part for part in message.get("content", [])
+                                            if part.get("type") != "input_image"]}
+                    for message in payload
+                ]
+                serialized = (text_payload if isinstance(text_payload, str)
+                              else json.dumps(text_payload, ensure_ascii=False))
                 images = (sum(part.get("type") == "input_image" and part.get("detail") == "low"
                               for message in payload for part in message.get("content", []))
                           if isinstance(payload, list) else 0)

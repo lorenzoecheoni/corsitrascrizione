@@ -171,17 +171,17 @@ class ConsolidationPayloadError(ValueError):
     """Safe local error when mandatory consolidation facts cannot fit."""
 
 
-def _evidence_payload(evidence: WindowEvidence, *, note: str | None = None) -> dict:
+def _evidence_payload(evidence: WindowEvidence) -> dict:
     return {
         "kind": evidence.kind,
         "timestamp_seconds": evidence.timestamp_seconds,
-        "note": evidence.note if note is None else note,
+        "note": evidence.note,
     }
 
 
-def _supported_candidate(speaker: WindowSpeaker, *, include_notes: bool = True) -> dict | None:
+def _supported_candidate(speaker: WindowSpeaker) -> dict | None:
     evidence = [
-        _evidence_payload(item, note=item.note if include_notes else "")
+        _evidence_payload(item)
         for item in speaker.evidence
         if item.kind in IDENTITY_EVIDENCE_KINDS and item.note.strip()
     ]
@@ -197,10 +197,15 @@ def _supported_candidate(speaker: WindowSpeaker, *, include_notes: bool = True) 
 
 
 def _generic_candidate(speaker: WindowSpeaker) -> dict:
-    return {
+    candidate = {
         "diarization_labels": speaker.diarization_labels,
         "confidence": speaker.confidence,
     }
+    evidence = [_evidence_payload(item) for item in speaker.evidence
+                if item.kind in IDENTITY_EVIDENCE_KINDS and item.note.strip()]
+    if speaker.role and evidence:
+        candidate.update(role=speaker.role, evidence=evidence)
+    return candidate
 
 
 def _slide_payload(slide: SlideChange) -> dict:
@@ -212,26 +217,6 @@ def _slide_payload(slide: SlideChange) -> dict:
     }
 
 
-def _fill_note_within_budget(payload: dict, target: dict, source: str) -> None:
-    """Restore the longest leading note prefix that keeps the complete JSON valid.
-
-    Required facts are installed before this runs.  Evidence notes are therefore
-    the only supported-candidate data that can be compressed for the 30,000
-    character limit, in deterministic analysis/speaker/evidence order.
-    """
-    low, high = 0, len(source)
-    best = 0
-    while low <= high:
-        length = (low + high) // 2
-        target["note"] = source[:length]
-        if len(_serialized(payload)) <= MAX_CONSOLIDATION_CHARS:
-            best = length
-            low = length + 1
-        else:
-            high = length - 1
-    target["note"] = source[:best]
-
-
 def build_consolidation_payload(
     metadata: BunnyVideoMetadata,
     analyses: Sequence[WindowAnalysis],
@@ -239,7 +224,6 @@ def build_consolidation_payload(
 ) -> str:
     """Build a deterministic, JSON-only consolidation request within its budget."""
     supported: list[dict] = []
-    mandatory_supported: list[dict] = []
     generic: list[dict] = []
     for analysis in analyses:
         for speaker in analysis.speakers:
@@ -248,10 +232,10 @@ def build_consolidation_payload(
                 generic.append(_generic_candidate(speaker))
             else:
                 supported.append(candidate)
-                mandatory = _supported_candidate(speaker, include_notes=False)
-                if mandatory is None:  # Defensive: the admission check is identical above.
-                    raise AssertionError("Candidato supportato non valido")
-                mandatory_supported.append(mandatory)
+
+    notes_by_window = [[note for note in analysis.synopsis_notes if note.strip()]
+                       for analysis in analyses]
+    selected_notes = [notes[:1] for notes in notes_by_window]
 
     payload = {
         "metadata": {
@@ -259,31 +243,33 @@ def build_consolidation_payload(
             "duration_seconds": metadata.duration_seconds,
         },
         "detected_languages": list(dict.fromkeys(analysis.detected_language for analysis in analyses)),
-        "supported_candidates": mandatory_supported,
+        "supported_candidates": supported,
         "slides": [],
-        "generic_candidates": [],
+        "generic_candidates": [candidate for candidate in generic if candidate.get("evidence")],
         "uncertainties": [],
-        "synopsis_notes": [],
+        "synopsis_notes": [note for notes in selected_notes for note in notes],
     }
 
     if len(_serialized(payload)) > MAX_CONSOLIDATION_CHARS:
         raise ConsolidationPayloadError("dati obbligatori superano il limite di consolidamento")
 
-    for target, candidate in zip(mandatory_supported, supported, strict=True):
-        for target_evidence, evidence in zip(target["evidence"], candidate["evidence"], strict=True):
-            _fill_note_within_budget(payload, target_evidence, evidence["note"])
+    # Complete evidence and one complete note from every nonempty window are
+    # indispensable: a prefix can drop the very fact that supports a name/role.
+    # Give additional synopsis notes room across windows before visual extras.
+    for note_index in range(1, 4):
+        for window_index, notes in enumerate(notes_by_window):
+            if note_index < len(notes) and _append_if_fits(payload, "synopsis_notes", notes[note_index]):
+                selected_notes[window_index].append(notes[note_index])
+    payload["synopsis_notes"] = [note for notes in selected_notes for note in notes]
 
     for slide in sorted(slides, key=lambda item: item.timestamp_seconds):
         _append_slide_if_fits(payload, _slide_payload(slide))
     for candidate in generic:
-        _append_if_fits(payload, "generic_candidates", candidate)
+        if not candidate.get("evidence"):
+            _append_if_fits(payload, "generic_candidates", candidate)
     for analysis in analyses:
         for uncertainty in analysis.uncertainties:
             _append_if_fits(payload, "uncertainties", uncertainty)
-    for analysis in analyses:
-        for note in analysis.synopsis_notes:
-            _append_if_fits(payload, "synopsis_notes", note)
-
     serialized = _serialized(payload)
     if len(serialized) > MAX_CONSOLIDATION_CHARS:
         raise AssertionError("Il payload di consolidamento supera il limite")

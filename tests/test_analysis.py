@@ -1,6 +1,8 @@
+import base64
 import copy
 import json
 from concurrent.futures import CancelledError
+from io import BytesIO
 from threading import Event
 from types import SimpleNamespace
 from uuid import UUID
@@ -90,6 +92,26 @@ class FakeClient:
 def window_result():
     return {"detected_language": "it", "synopsis_notes": ["Pubblicazione Academy"],
             "speakers": [], "uncertainties": []}
+
+
+def test_unnamed_moderator_role_reaches_consolidation_and_generic_report(inputs, content):
+    inputs["frames"] = []
+    evidence = [{"kind": "introduzione", "timestamp_seconds": 0,
+                 "note": "Sono la moderatrice della sessione."}]
+    mapped = window_result()
+    mapped["speakers"] = [{"diarization_labels": ["chunk-0:A"], "display_name": None,
+                           "role": "Moderatrice", "confidence": "alta", "evidence": evidence}]
+    content["speakers"] = [{"id": "host", "display_name": "Relatore 1", "role": "Moderatrice",
+                            "confidence": "alta", "evidence": evidence}]
+    client = FakeClient(mapped, content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    candidate = json.loads(client.calls[-1]["input"])["generic_candidates"][0]
+    assert candidate["role"] == "Moderatrice"
+    assert candidate["evidence"] == evidence
+    assert result.speakers[0].display_name == "Relatore 1"
+    assert result.speakers[0].role == "Moderatrice"
 
 
 def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):
@@ -391,6 +413,37 @@ def test_gate_request_estimate_includes_output_json_and_low_detail_images(payloa
         max_output_tokens=2000, max_repair_chars=12_000, stage="window")
     assert result.detected_language == "it"
     assert observed == waits
+
+
+@pytest.mark.parametrize("remaining,expected_waits", [(10_500, []), (10_499, [3])])
+def test_visual_pacing_counts_realistic_jpegs_once(remaining, expected_waits):
+    from app.openai_limits import ProviderRateGate
+
+    jpeg = BytesIO()
+    Image.effect_noise((1280, 720), 100).convert("RGB").save(jpeg, format="JPEG", quality=85)
+    assert len(jpeg.getvalue()) > 100_000
+    image_url = "data:image/jpeg;base64," + base64.b64encode(jpeg.getvalue()).decode("ascii")
+    parts = []
+    for index in range(25):
+        parts.extend([{"type": "input_text", "text": f"timestamp_seconds={index}"},
+                      {"type": "input_image", "detail": "low", "image_url": image_url}])
+    observed, now = [], [100]
+    def wait(seconds, event):
+        observed.append(seconds)
+        now[0] += seconds
+    gate = ProviderRateGate(clock=lambda: now[0], wait=wait)
+    gate.observe("gpt-5.6-luna", {"x-ratelimit-remaining-project-tokens": str(remaining),
+                               "x-ratelimit-reset-project-tokens": "3s"})
+    client = FakeClient({"frames": []})
+
+    result = OpenAIAnalyzer(client, rate_gate=gate)._structured(
+        text_format=SlideBatchResult, instructions="Visual test", payload=[{"role": "user", "content": parts}],
+        prepare=lambda _: None, validate=lambda _: [], cancellation_event=None,
+        usage=ProviderUsage(), max_output_tokens=3000, max_repair_chars=30_000, stage="visual")
+
+    assert result.frames == []
+    assert observed == expected_waits
+    assert client.calls[0]["input"][0]["content"][1]["image_url"] == image_url
 
 
 def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, content):

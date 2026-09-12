@@ -1,5 +1,6 @@
 """Exercise safe diagnostics and the opt-in synthetic provider proof."""
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,8 @@ import sys
 import time
 from uuid import UUID
 
-from openai import OpenAI
+import httpx
+from openai import APIStatusError, OpenAI
 import pytest
 
 from app.analysis import OpenAIAnalyzer
@@ -20,12 +22,54 @@ from app.analysis_chunks import (
     split_transcript_windows,
 )
 from app.bunny import BunnyVideoMetadata
+from app.models import ProviderUsage
 from app.transcription import TranscriptSegment, TranscriptionResult
 
 
 _SYNTHETIC_DURATION_SECONDS = 96 * 60
-_SYNTHETIC_SEGMENT_TEXT = (
-    "Sessione sintetica di formazione: il relatore presenta principi, esempi e conclusioni."
+_SYNTHETIC_INTRODUCTIONS = (
+    "Sono Elena Verdi, responsabile del progetto didattico.",
+    "Sono Paolo Neri, relatore sui processi organizzativi.",
+    "Sono Marta Blu, relatrice sulla valutazione dei risultati.",
+    "Sono la moderatrice della sessione; il mio nome non viene comunicato.",
+)
+_SYNTHETIC_TOPICS = (
+    "La pianificazione parte dagli obiettivi: una biblioteca vuole aumentare i prestiti digitali. "
+    "Definisce destinatari, scadenze, risorse e criteri di successo. Il gruppo distingue desideri "
+    "generici da risultati verificabili e assegna un referente a ciascuna attività.",
+    "La ricerca ascolta gli utenti con interviste, questionari e osservazione. Si raccolgono "
+    "esigenze diverse di studenti, insegnanti e pensionati. Un campione piccolo può suggerire "
+    "ipotesi, ma richiede prudenza prima di estendere le conclusioni alla popolazione.",
+    "Il catalogo descrive libri, riviste, audiolibri e materiali accessibili. Titoli, autori, "
+    "lingue, argomenti e formati devono essere coerenti. La revisione dei duplicati migliora "
+    "la ricerca; una scheda incompleta può rendere invisibile una risorsa disponibile.",
+    "L'accessibilità comprende tastiera, contrasto, ingrandimento, sottotitoli e descrizioni. "
+    "Una pagina leggibile riduce ostacoli per molti visitatori. Le verifiche coinvolgono persone "
+    "con esigenze differenti, evitando di assumere che uno strumento automatico trovi tutto.",
+    "La formazione dei volontari usa esercitazioni guidate, dimostrazioni e simulazioni. "
+    "Chi partecipa prova prenotazione, rinnovo e restituzione. Le domande ricorrenti diventano "
+    "materiale didattico; il tutor osserva gli errori e modifica le spiegazioni troppo astratte.",
+    "La comunicazione presenta benefici concreti attraverso newsletter, manifesti e incontri. "
+    "Il messaggio cambia secondo il destinatario e mantiene un linguaggio comprensibile. "
+    "La squadra confronta canali, frequenza, adesioni e richieste di assistenza ricevute.",
+    "Il servizio di assistenza raccoglie problemi tecnici, dubbi e suggerimenti. Ogni richiesta "
+    "riceve una categoria e una priorità. Una procedura indica quando coinvolgere uno specialista; "
+    "i tempi di risposta vengono confrontati con la complessità e con la disponibilità del personale.",
+    "La qualità dei dati richiede controlli su valori mancanti, date incoerenti e registrazioni "
+    "duplicate. Il gruppo documenta le correzioni senza cancellare il significato originario. "
+    "Indicatori comparabili dipendono da definizioni stabili e da fonti chiaramente descritte.",
+    "La valutazione considera iscrizioni, prestiti, soddisfazione e capacità di usare il servizio. "
+    "Un aumento degli accessi può accompagnarsi a molte difficoltà. Per questo il rapporto combina "
+    "conteggi, testimonianze e confronti con il periodo iniziale, spiegando le possibili distorsioni.",
+    "La gestione degli imprevisti prevede assenze, ritardi nelle consegne e interruzioni tecniche. "
+    "Una simulazione chiarisce responsabilità e alternative. Il coordinatore aggiorna il calendario "
+    "e comunica le modifiche a chi ne è coinvolto, mantenendo traccia delle decisioni adottate.",
+    "La collaborazione con scuole e associazioni distribuisce spazi, materiali e competenze. "
+    "Gli accordi chiariscono contributi e aspettative. Riunioni brevi controllano gli avanzamenti, "
+    "mentre un referente raccoglie proposte contrastanti e prepara una decisione motivata.",
+    "La chiusura restituisce risultati, limiti e attività ancora aperte. La biblioteca confronta "
+    "quanto previsto con quanto osservato e conserva le lezioni utili per il ciclo successivo. "
+    "Il seminario termina con una revisione delle priorità e con l'indicazione dei prossimi passi.",
 )
 
 
@@ -48,6 +92,52 @@ def test_captured_live_output_raises_static_failure():
     assert caught.value.pytrace is False
 
 
+def test_synthetic_workload_has_representative_varied_text_volume():
+    metadata, transcription = _synthetic_long_inputs()
+    windows = split_transcript_windows(transcription.segments)
+    sizes = [len(window.to_payload()) for window in windows]
+
+    assert metadata.duration_seconds == 5760
+    assert sum(len(segment.text) for segment in transcription.segments) >= 100_000
+    assert len({segment.text for segment in transcription.segments}) == 96
+    assert len(set(" ".join(segment.text for segment in transcription.segments).split())) >= 250
+    assert len(windows) >= 10
+    assert all(10_800 <= size <= 12_000 for size in sizes[:-1])
+    assert max(sizes) >= 11_000
+    assert all(window.end_seconds - window.start_seconds <= 600 for window in windows)
+
+
+def test_live_acceptance_rejects_recovered_429_and_counts_only_safe_statuses(monkeypatch):
+    monkeypatch.setattr("app.retry.time.sleep", lambda _: None)
+    attempts = 0
+
+    def respond(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "0"},
+                                  json={"error": {"message": "PRIVATE_PROVIDER_BODY"}})
+        return httpx.Response(200, json={
+            "id": "resp_test", "object": "response", "created_at": 1, "status": "completed",
+            "model": "gpt-4o-mini", "output": [{"id": "msg_test", "type": "message",
+                "role": "assistant", "status": "completed", "content": [{"type": "output_text",
+                "annotations": [], "text": json.dumps({"detected_language": "it",
+                    "synopsis_notes": ["Sintesi."], "speakers": [], "uncertainties": []})}]}],
+        })
+
+    with OpenAI(api_key="test-only", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+        audited = _SafeRecordingOpenAI(client)
+        result = OpenAIAnalyzer(audited)._structured(
+            text_format=WindowAnalysis, instructions="Synthetic test", payload="{}",
+            prepare=lambda _: None, validate=lambda _: [], cancellation_event=None,
+            usage=ProviderUsage(), max_repair_chars=12_000, stage="window", model="gpt-4o-mini")
+
+    assert result.detected_language == "it"
+    assert getattr(audited, "status_counts", {}) == {429: 1, 200: 1}
+    with pytest.raises(AssertionError):
+        _assert_live_statuses(audited)
+
+
 def _synthetic_live_api_key() -> str:
     if os.environ.get("RUN_LIVE_SYNTHETIC_ANALYSIS") != "1":
         pytest.skip(
@@ -68,11 +158,12 @@ def _fail_if_captured_live_output(stdout: str, stderr: str) -> None:
 
 
 class _SafeRecordingOpenAI:
-    """Keep only payload lengths at the live-provider boundary."""
+    """Keep only lengths, schema types and numeric HTTP counts in memory."""
 
     def __init__(self, client: OpenAI) -> None:
         self._client = client.with_options(max_retries=0)
         self.requests: list[tuple[type, int]] = []
+        self.status_counts: Counter[int] = Counter()
         self.responses = self
         self.with_raw_response = self
 
@@ -83,7 +174,38 @@ class _SafeRecordingOpenAI:
         payload = kwargs["input"]
         serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
         self.requests.append((kwargs["text_format"], len(serialized)))
-        return self._client.responses.with_raw_response.parse(**kwargs)
+        try:
+            raw = self._client.responses.with_raw_response.parse(**kwargs)
+        except APIStatusError as exc:
+            self.status_counts[exc.status_code] += 1
+            raise
+        self.status_counts[raw.status_code] += 1
+        return raw
+
+
+def _assert_live_statuses(audited: _SafeRecordingOpenAI) -> None:
+    assert audited.status_counts[429] == 0
+    assert sum(audited.status_counts.values()) == len(audited.requests)
+    assert all(200 <= status < 300 for status in audited.status_counts)
+
+
+def _synthetic_segment_text(index: int) -> str:
+    # Roughly 170 spoken Italian words/minute; topics and numeric cases vary.
+    text = (
+        f"{_SYNTHETIC_INTRODUCTIONS[index % 4]} Intervento {index + 1} del seminario sintetico. "
+        f"{_SYNTHETIC_TOPICS[index // 8]} "
+        f"Nel caso numero {index + 1}, il laboratorio dispone di {12 + index} partecipanti "
+        f"e di {3 + index % 7} postazioni. La prima settimana comprende {2 + index % 5} incontri. "
+        "Si confrontano due proposte: organizzare attività individuali oppure lavorare in piccoli gruppi. "
+        "La scelta dipende dall'esperienza iniziale, dagli strumenti disponibili e dal tempo necessario "
+        "per accompagnare ciascuno. Durante la discussione emergono dubbi sui passaggi più complessi. "
+        "Un partecipante chiede un esempio concreto e un altro segnala una difficoltà pratica. "
+        "La risposta propone una prova limitata, una raccolta di osservazioni e una successiva revisione. "
+        "Il verbale descrive decisioni, responsabilità e scadenze senza attribuire certezze ai dati incompleti. "
+        "Alla fine dell'esercizio il gruppo verifica il risultato, confronta le alternative e formula "
+        "una raccomandazione motivata per il prossimo incontro."
+    )
+    return text[:1100]
 
 
 def _synthetic_long_inputs():
@@ -91,8 +213,8 @@ def _synthetic_long_inputs():
         TranscriptSegment(
             start_seconds=index * 60,
             end_seconds=(index + 1) * 60,
-            diarization_label="synthetic-speaker",
-            text=_SYNTHETIC_SEGMENT_TEXT,
+            diarization_label=f"chunk-{index // 10}:{'ABCD'[index % 4]}",
+            text=_synthetic_segment_text(index),
         )
         for index in range(96)
     ]
@@ -118,16 +240,21 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     metadata, transcription = _synthetic_long_inputs()
     windows = split_transcript_windows(transcription.segments)
     assert metadata.duration_seconds == 5760
-    assert len(windows) == 10
+    assert sum(len(segment.text) for segment in transcription.segments) >= 100_000
+    assert len(windows) >= 10
+    assert all(len(window.to_payload()) >= 10_800 for window in windows[:-1])
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
     client = OpenAI(api_key=api_key, max_retries=0)
     audited = _SafeRecordingOpenAI(client)
     started = time.monotonic()
+    result = None
+    passed = False
     try:
         result = OpenAIAnalyzer(audited).analyze(metadata, transcription, frames=[])
         assert result.synopsis.strip()
         assert result.speakers
+        _assert_live_statuses(audited)
         window_payloads = [size for schema, size in audited.requests if schema is WindowAnalysis]
         consolidation_payloads = [
             size for schema, size in audited.requests if schema is ConsolidatedTextReport
@@ -136,10 +263,11 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
         assert consolidation_payloads
         assert all(size <= MAX_WINDOW_CHARS for size in window_payloads)
         assert all(size <= MAX_CONSOLIDATION_CHARS for size in consolidation_payloads)
+        # The real map output must exercise a substantial consolidation too.
+        assert max(consolidation_payloads) >= 10_000
+        passed = True
     except Exception:
-        raise pytest.fail.Exception(
-            "Synthetic live analysis failed; inspect only safe provider status", pytrace=False,
-        ) from None
+        pass  # Emit numeric diagnostics below, then fail with static text only.
     finally:
         client.close()
 
@@ -149,14 +277,26 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     with capsys.disabled():
         print(
             "live_diagnostic "
-            f"status=passed requests={result.usage.requests} "
-            f"input_tokens={result.usage.input_tokens if result.usage.input_tokens is not None else 'unknown'} "
-            f"output_tokens={result.usage.output_tokens if result.usage.output_tokens is not None else 'unknown'} "
+            f"status={'passed' if passed else 'failed'} requests={len(audited.requests)} "
+            f"status_2xx={sum(count for status, count in audited.status_counts.items() if 200 <= status < 300)} "
+            f"status_429={audited.status_counts[429]} "
+            f"status_other={sum(count for status, count in audited.status_counts.items() if not 200 <= status < 300 and status != 429)} "
+            f"input_tokens={result.usage.input_tokens if result is not None else 'unknown'} "
+            f"output_tokens={result.usage.output_tokens if result is not None else 'unknown'} "
             f"duration_seconds={int(metadata.duration_seconds)} "
             f"elapsed_seconds={elapsed_seconds:.2f} windows={len(windows)} "
-            f"speakers={len(result.speakers)} slides={len(result.slides)} "
-            f"uncertainties={len(result.uncertainties)}"
+            f"source_chars={sum(len(segment.text) for segment in transcription.segments)} "
+            f"window_min_chars={min(len(window.to_payload()) for window in windows)} "
+            f"window_max_chars={max(len(window.to_payload()) for window in windows)} "
+            f"consolidation_max_chars={max((size for schema, size in audited.requests if schema is ConsolidatedTextReport), default=0)} "
+            f"speakers={len(result.speakers) if result is not None else 0} "
+            f"slides={len(result.slides) if result is not None else 0} "
+            f"uncertainties={len(result.uncertainties) if result is not None else 0}"
         )
+    if not passed:
+        raise pytest.fail.Exception(
+            "Synthetic live analysis failed; inspect only safe provider status", pytrace=False,
+        ) from None
 
 @pytest.mark.parametrize("phase,message", [
     ("configuration", "Invalid live configuration (details withheld)"),

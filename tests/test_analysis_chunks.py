@@ -131,7 +131,56 @@ def test_empty_identity_evidence_does_not_support_a_personal_name():
     assert payload["generic_candidates"] == [{"diarization_labels": ["chunk-0:A"], "confidence": "bassa"}]
 
 
-def test_supported_candidates_keep_required_facts_when_evidence_notes_are_compressed():
+@pytest.mark.parametrize("kind,note,supported", [
+    ("introduzione", "Sono la moderatrice della sessione.", True),
+    ("inferenza", "Sembra coordinare gli interventi.", False),
+    ("introduzione", " ", False),
+])
+def test_unnamed_speaker_keeps_only_explicit_role_and_evidence(kind, note, supported):
+    from app.analysis_chunks import WindowAnalysis, WindowSpeaker, build_consolidation_payload
+    from app.models import Evidence
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=600,
+    )
+    analysis = WindowAnalysis(detected_language="it", synopsis_notes=["Il seminario si apre."],
+        speakers=[WindowSpeaker(diarization_labels=["chunk-0:A"], display_name=None,
+            role="Moderatrice", confidence="alta",
+            evidence=[Evidence(kind=kind, timestamp_seconds=5, note=note)])])
+    slides = [SlideChange(timestamp_seconds=index, title="x" * 300,
+                          visible_content=["x" * 300] * 4, confidence="alta") for index in range(100)]
+
+    payload = json.loads(build_consolidation_payload(metadata, [analysis], slides))
+
+    assert payload["supported_candidates"] == []
+    candidate = payload["generic_candidates"][0]
+    assert candidate["diarization_labels"] == ["chunk-0:A"]
+    assert candidate.get("display_name") is None
+    if supported:
+        assert candidate["role"] == "Moderatrice"
+        assert candidate["evidence"] == [{"kind": kind, "timestamp_seconds": 5, "note": note}]
+    else:
+        assert not candidate.get("role")
+        assert not candidate.get("evidence")
+
+
+def test_unnamed_role_evidence_is_mandatory_under_budget_pressure():
+    from app.analysis_chunks import ConsolidationPayloadError, WindowAnalysis, WindowSpeaker, build_consolidation_payload
+    from app.models import Evidence
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=600,
+    )
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=["Seminario."],
+        speakers=[WindowSpeaker(diarization_labels=[f"chunk-{index}:A"], role="Moderatrice",
+            confidence="alta", evidence=[Evidence(kind="introduzione", timestamp_seconds=index,
+                note="Contesto. " * 25 + "Sono la moderatrice.")])]) for index in range(100)]
+
+    with pytest.raises(ConsolidationPayloadError, match="dati obbligatori"):
+        build_consolidation_payload(metadata, analyses, [])
+
+
+def test_supported_candidates_keep_complete_evidence_and_summary_from_every_window():
     from app.analysis_chunks import WindowAnalysis, WindowSpeaker, build_consolidation_payload
     from app.models import Evidence
 
@@ -142,17 +191,23 @@ def test_supported_candidates_keep_required_facts_when_evidence_notes_are_compre
         WindowSpeaker(
             diarization_labels=[f"chunk-{index}:A"], display_name=f"Nome supportato {index}",
             confidence="alta", evidence=[Evidence(
-                kind="introduzione", timestamp_seconds=float(index), note="n" * 300,
+                kind="introduzione", timestamp_seconds=float(index),
+                note=f"Mi chiamo Nome supportato {index} e presento il caso {index}.",
             )],
         )
         for index in range(100)
     ]
     analyses = [
-        WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=speakers[index:index + 8])
+        WindowAnalysis(detected_language="it", synopsis_notes=[
+            f"Finestra {index}: conclusione specifica del caso discusso.",
+            "Approfondimento: " + "x" * 280,
+        ], speakers=speakers[index:index + 8])
         for index in range(0, len(speakers), 8)
     ]
 
-    payload = json.loads(build_consolidation_payload(metadata, analyses, []))
+    slides = [SlideChange(timestamp_seconds=index, title="x" * 300,
+                          visible_content=["x" * 300] * 4, confidence="alta") for index in range(100)]
+    payload = json.loads(build_consolidation_payload(metadata, analyses, slides))
 
     assert len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) <= 30_000
     assert len(payload["supported_candidates"]) == 100
@@ -163,7 +218,44 @@ def test_supported_candidates_keep_required_facts_when_evidence_notes_are_compre
         float(index) for index in range(100)
     ]
     assert {candidate["evidence"][0]["kind"] for candidate in payload["supported_candidates"]} == {"introduzione"}
-    assert all(len(candidate["evidence"][0]["note"]) <= 300 for candidate in payload["supported_candidates"])
+    assert [candidate["evidence"][0]["note"] for candidate in payload["supported_candidates"]] == [
+        f"Mi chiamo Nome supportato {index} e presento il caso {index}." for index in range(100)
+    ]
+    assert all(analysis.synopsis_notes[0] in payload["synopsis_notes"] for analysis in analyses)
+
+
+def test_indispensable_evidence_is_never_truncated_to_fit():
+    from app.analysis_chunks import (
+        ConsolidationPayloadError, WindowAnalysis, WindowSpeaker, build_consolidation_payload,
+    )
+    from app.models import Evidence
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=600,
+    )
+    speakers = [WindowSpeaker(
+        diarization_labels=[f"chunk-{index}:A"], display_name=f"Nome supportato {index}",
+        confidence="alta", evidence=[Evidence(kind="introduzione", timestamp_seconds=index,
+            note="Contesto. " * 25 + f"Mi chiamo Nome supportato {index}.")],
+    ) for index in range(100)]
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=[f"Conclusione {index}."],
+                speakers=speakers[index:index + 8]) for index in range(0, 100, 8)]
+
+    with pytest.raises(ConsolidationPayloadError, match="dati obbligatori"):
+        build_consolidation_payload(metadata, analyses, [])
+
+
+def test_summary_coverage_cannot_be_silently_dropped_when_budget_is_full():
+    from app.analysis_chunks import ConsolidationPayloadError, WindowAnalysis, build_consolidation_payload
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=14_400,
+    )
+    analyses = [WindowAnalysis(detected_language="it", speakers=[],
+                 synopsis_notes=[f"Finestra {index}: " + "x" * 280]) for index in range(110)]
+
+    with pytest.raises(ConsolidationPayloadError, match="dati obbligatori"):
+        build_consolidation_payload(metadata, analyses, [])
 
 
 def test_incompressible_supported_facts_raise_a_safe_budget_error():

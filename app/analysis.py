@@ -190,6 +190,7 @@ class OpenAIAnalyzer:
         self, *, text_format: type[T], instructions: str, payload: str | list,
         prepare: Callable[[dict], None], validate: Callable[[T], list[str]],
         cancellation_event: Event | None, usage: ProviderUsage,
+        model: str = "gpt-5.6-luna",
     ) -> T:
         attempts = 0
         for repair in range(2):
@@ -199,7 +200,7 @@ class OpenAIAnalyzer:
                 attempts += 1
                 try:
                     response = self._client.responses.parse(
-                        model="gpt-5.6-luna", store=False, text_format=text_format,
+                        model=model, store=False, text_format=text_format,
                         instructions=instructions, input=payload,
                     )
                 except CancelledError:
@@ -285,8 +286,14 @@ class OpenAIAnalyzer:
                     uncertain_count += 1
         check_cancelled(cancellation_event)
         slide_data = [slide.model_dump(mode="json") for slide in slides]
+        compact_transcription = {
+            "language": transcription.language,
+            "audio_seconds": transcription.audio_seconds,
+            "segments": [segment.model_dump(mode="json") for segment in transcription.segments],
+            "speaker_mapping": transcription.speaker_mapping,
+        }
         payload = json.dumps({"metadata": metadata.model_dump(mode="json"),
-                              "transcription": transcription.model_dump(mode="json"),
+                              "transcription": compact_transcription,
                               "slides": slide_data}, ensure_ascii=False)
 
         def prepare_content(data: dict) -> None:
@@ -301,7 +308,7 @@ class OpenAIAnalyzer:
         result = self._structured(
             text_format=AcademyContent, instructions=REPORT_PROMPT, payload=payload,
             prepare=prepare_content, validate=lambda content: _content_errors(content, metadata.duration_seconds),
-            cancellation_event=cancellation_event, usage=usage,
+            cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
         )
         check_cancelled(cancellation_event)
         return AnalysisResult(**result.model_dump(), usage=usage)

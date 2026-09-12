@@ -99,8 +99,18 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     assert isinstance(result, AcademyContent)
     assert client.max_retries == 0
     assert [call["text_format"] for call in client.calls] == [SlideBatchResult, AcademyContent]
-    assert all(call["store"] is False and call["model"] == "gpt-5.6-luna" for call in client.calls)
+    assert all(call["store"] is False for call in client.calls)
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini"]
     payload = json.loads(client.calls[-1]["input"])
+    assert set(payload["transcription"]) == {
+        "language", "audio_seconds", "segments", "speaker_mapping",
+    }
+    assert payload["transcription"]["segments"] == [{
+        "start_seconds": 0.0,
+        "end_seconds": 10.0,
+        "diarization_label": "chunk-0:A",
+        "text": "Sono Giulia Bianchi.",
+    }]
     assert [item["timestamp_seconds"] for item in payload["slides"]] == [2]
     assert "Visible 1" not in client.calls[-1]["input"]
     assert "Visible 2" not in client.calls[-1]["input"]

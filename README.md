@@ -116,10 +116,20 @@ Prima di pubblicare, eseguire la suite disponibile nell'ambiente locale privo di
 git diff --check
 ```
 
-I test esclusi che richiedono FFmpeg e FFprobe vanno eseguiti nell'immagine Docker/Railway, dove i due programmi sono installati. Con le variabili runtime Railway già configurate, la prova live esplicita usa 96 segmenti sintetici da un minuto (1 ora e 36 minuti), non chiama Bunny e non legge media reali:
+I test esclusi che richiedono FFmpeg e FFprobe vanno eseguiti nell'immagine Docker/Railway, dove i due programmi sono installati. L'immagine di runtime non include test o `pytest`; senza modificarla, costruirla e montare il checkout in sola lettura, creando le dipendenze di test soltanto nel venv effimero del container:
 
 ```sh
-railway run .venv/bin/pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report
+docker build -t bunny-video-report:local .
+docker run --rm -v "$(pwd)":/src:ro -w /src bunny-video-report:local sh -c \
+  'python -m venv --system-site-packages /tmp/test-venv && \
+   /tmp/test-venv/bin/pip install --no-cache-dir ".[test]" && \
+   PYTHONDONTWRITEBYTECODE=1 /tmp/test-venv/bin/python -m pytest -q -m "not live" -p no:cacheprovider'
+```
+
+Con le variabili runtime Railway già configurate, la prova live esplicita usa 96 segmenti sintetici da un minuto (1 ora e 36 minuti), non chiama Bunny e non legge media reali. Richiede **entrambi** `RUN_LIVE_SYNTHETIC_ANALYSIS=1` e `OPENAI_API_KEY`; la sola chiave non la abilita:
+
+```sh
+RUN_LIVE_SYNTHETIC_ANALYSIS=1 railway run .venv/bin/pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report
 ```
 
 La prova percorre finestre e consolidamento reali senza immagini, verifica tutti i limiti di payload e richiede sinossi e almeno un relatore. Stampa solo stato, richieste, token, durata, tempo trascorso e conteggi del risultato; non stampa chiavi, payload, trascrizione, testo del modello o corpi di risposta. Non rilanciare il video reale “Governance delle holding e conferimenti a realizzo controllato” senza conferma esplicita: trascrizione e analisi generano un nuovo costo API.

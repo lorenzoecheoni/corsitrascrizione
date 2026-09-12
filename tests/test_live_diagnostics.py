@@ -29,6 +29,44 @@ _SYNTHETIC_SEGMENT_TEXT = (
 )
 
 
+def test_synthetic_live_proof_requires_dedicated_opt_in(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-only")
+    monkeypatch.delenv("RUN_LIVE_SYNTHETIC_ANALYSIS", raising=False)
+
+    with pytest.raises(pytest.skip.Exception, match="dedicated opt-in"):
+        _synthetic_live_api_key()
+
+
+def test_captured_live_output_raises_static_failure():
+    sentinel = "SYNTHETIC_PRIVATE_DIAGNOSTIC_72fada"
+
+    with pytest.raises(pytest.fail.Exception) as caught:
+        _fail_if_captured_live_output(sentinel, "")
+
+    assert str(caught.value) == "Synthetic live analysis emitted unexpected output"
+    assert sentinel not in str(caught.value)
+    assert caught.value.pytrace is False
+
+
+def _synthetic_live_api_key() -> str:
+    if os.environ.get("RUN_LIVE_SYNTHETIC_ANALYSIS") != "1":
+        pytest.skip(
+            "Synthetic live proof requires dedicated opt-in "
+            "RUN_LIVE_SYNTHETIC_ANALYSIS=1"
+        )
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        pytest.skip("Synthetic live proof requires OPENAI_API_KEY")
+    return api_key
+
+
+def _fail_if_captured_live_output(stdout: str, stderr: str) -> None:
+    if stdout or stderr:
+        raise pytest.fail.Exception(
+            "Synthetic live analysis emitted unexpected output", pytrace=False
+        )
+
+
 class _SafeRecordingOpenAI:
     """Keep only payload lengths at the live-provider boundary."""
 
@@ -75,9 +113,7 @@ def _synthetic_long_inputs():
 @pytest.mark.live
 def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     """Prove the production map/reduce path without Bunny, media, or images."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        pytest.skip("Synthetic live proof requires OPENAI_API_KEY")
+    api_key = _synthetic_live_api_key()
 
     metadata, transcription = _synthetic_long_inputs()
     windows = split_transcript_windows(transcription.segments)
@@ -109,7 +145,7 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
 
     elapsed_seconds = time.monotonic() - started
     captured = capsys.readouterr()
-    assert not captured.out and not captured.err
+    _fail_if_captured_live_output(captured.out, captured.err)
     with capsys.disabled():
         print(
             "live_diagnostic "

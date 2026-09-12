@@ -290,8 +290,10 @@ Expected: FAIL sul numero di immagini per batch.
 - [ ] **Step 3: Applicare il limite minimo**
 
 In `app/analysis.py` impostare `_VISUAL_BATCH_SIZE = 25`, aggiungere
-`max_output_tokens` alla firma di `_structured` e passare 3000 per
-`SlideBatchResult`. Tutte le chiamate devono continuare a usare `store=False`.
+`max_output_tokens=4000` alla firma di `_structured` e passare 3000 per
+`SlideBatchResult`. Il valore predefinito mantiene funzionante la chiamata finale
+esistente fino alla sua sostituzione nel Task 4. Tutte le chiamate devono
+continuare a usare `store=False`.
 
 - [ ] **Step 4: Verificare il GREEN e la validazione dei timestamp**
 
@@ -522,12 +524,9 @@ git commit -m "fix: pace OpenAI analysis by provider limits"
 **Files:**
 
 - Modify: `app/pipeline.py`
-- Modify: `app/costs.py`
-- Modify: `app/templates/job.html`
 - Modify: `tests/test_pipeline.py`
 - Modify: `tests/test_models_reporting.py`
 - Modify: `tests/test_web.py`
-- Modify: `tests/job_ui.cjs`
 
 **Interfaces:**
 
@@ -557,12 +556,13 @@ Passare un callback ad `analyzer.analyze`. Calcolare una frazione monotona dal
 numero completato/totale senza includere titoli o contenuti nel messaggio.
 Riservare 75–82% alle slide, 82–89% alle finestre e 90% al consolidamento.
 
-- [ ] **Step 4: Aggiornare la stima del costo**
+- [ ] **Step 4: Verificare la stima del costo esistente**
 
-Mantenere il calcolo da token effettivi quando disponibili. Aggiornare soltanto
-le costanti preventive se la prova equivalente mostra un intervallo diverso; il
-test deve verificare che `estimated_low_usd <= estimated_high_usd` e che la UI lo
-definisca sempre una stima, mai una fattura.
+Mantenere senza variazioni il calcolo da token effettivi quando disponibili e le
+costanti preventive correnti. Il test deve verificare che
+`estimated_low_usd <= estimated_high_usd` e che la UI lo definisca sempre una
+stima, mai una fattura. Un'eventuale calibrazione successiva richiede dati reali
+e non appartiene a questo task.
 
 - [ ] **Step 5: Verificare il GREEN web e pipeline**
 
@@ -573,7 +573,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add app/pipeline.py app/costs.py app/templates/job.html tests/test_pipeline.py tests/test_models_reporting.py tests/test_web.py tests/job_ui.cjs
+git add app/pipeline.py tests/test_pipeline.py tests/test_models_reporting.py tests/test_web.py
 git commit -m "feat: report chunked analysis progress"
 ```
 

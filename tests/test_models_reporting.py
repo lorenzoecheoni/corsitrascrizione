@@ -139,3 +139,13 @@ def test_assemblyai_cost_uses_one_global_job_with_diarization_and_speaker_identi
     assert cost.transcription_usd == .25
     assert cost.estimated_low_usd == .29
     assert cost.estimated_high_usd == .43
+
+
+def test_assemblyai_cost_counts_both_remote_and_local_bunny_media_reads():
+    cost = estimate_cost(
+        3600, 1_000_000_000, transcription_provider="assemblyai",
+    )
+
+    assert cost.bunny_bandwidth_usd == .02
+    assert cost.estimated_low_usd == .31
+    assert cost.estimated_high_usd == .45

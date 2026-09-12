@@ -20,7 +20,10 @@ def estimate_cost(
 ) -> CostEstimate:
     """Estimate USD costs from deterministic media usage measurements."""
     hours = duration_seconds / 3600
-    bunny = downloaded_bytes / 1_000_000_000 * BUNNY_USD_PER_GB
+    # The fast path has two CDN consumers in parallel: local FFmpeg for slide
+    # detection and AssemblyAI for audio transcription.
+    bunny_reads = 2 if transcription_provider == "assemblyai" else 1
+    bunny = downloaded_bytes / 1_000_000_000 * BUNNY_USD_PER_GB * bunny_reads
     transcription_rate_low, transcription_rate_high = (
         (ASSEMBLYAI_USD_PER_HOUR, ASSEMBLYAI_USD_PER_HOUR)
         if transcription_provider == "assemblyai"

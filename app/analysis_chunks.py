@@ -8,7 +8,7 @@ from collections.abc import Sequence
 import json
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from app.bunny import BunnyVideoMetadata
 from app.models import (
@@ -40,12 +40,26 @@ class TranscriptWindow(ReportModel):
         return json.dumps(self.model_dump(mode="json"), ensure_ascii=False)
 
 
+class WindowEvidence(Evidence):
+    """Evidence returned by a text window, bounded before consolidation."""
+
+    note: BoundedText
+
+
 class WindowSpeaker(ReportModel):
     diarization_labels: list[str]
     display_name: str | None = None
     role: str | None = None
     confidence: Confidence
-    evidence: list[Evidence] = Field(default_factory=list, max_length=4)
+    evidence: list[WindowEvidence] = Field(default_factory=list, max_length=4)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def validate_base_evidence_as_window_evidence(cls, value: object) -> object:
+        """Re-validate callers' base Evidence models against the bounded subtype."""
+        if not isinstance(value, list):
+            return value
+        return [item.model_dump() if isinstance(item, Evidence) else item for item in value]
 
 
 class WindowAnalysis(ReportModel):
@@ -153,17 +167,21 @@ def _append_slide_if_fits(payload: dict, item: dict) -> bool:
     return False
 
 
-def _evidence_payload(evidence: Evidence) -> dict:
+class ConsolidationPayloadError(ValueError):
+    """Safe local error when mandatory consolidation facts cannot fit."""
+
+
+def _evidence_payload(evidence: WindowEvidence, *, note: str | None = None) -> dict:
     return {
         "kind": evidence.kind,
         "timestamp_seconds": evidence.timestamp_seconds,
-        "note": _bounded_text(evidence.note),
+        "note": evidence.note if note is None else note,
     }
 
 
-def _supported_candidate(speaker: WindowSpeaker) -> dict | None:
+def _supported_candidate(speaker: WindowSpeaker, *, include_notes: bool = True) -> dict | None:
     evidence = [
-        _evidence_payload(item)
+        _evidence_payload(item, note=item.note if include_notes else "")
         for item in speaker.evidence
         if item.kind in IDENTITY_EVIDENCE_KINDS and item.note.strip()
     ]
@@ -172,7 +190,7 @@ def _supported_candidate(speaker: WindowSpeaker) -> dict | None:
     return {
         "diarization_labels": speaker.diarization_labels,
         "display_name": speaker.display_name,
-        "role": _bounded_text(speaker.role),
+        "role": speaker.role,
         "confidence": speaker.confidence,
         "evidence": evidence,
     }
@@ -194,36 +212,34 @@ def _slide_payload(slide: SlideChange) -> dict:
     }
 
 
+def _fill_note_within_budget(payload: dict, target: dict, source: str) -> None:
+    """Restore the longest leading note prefix that keeps the complete JSON valid.
+
+    Required facts are installed before this runs.  Evidence notes are therefore
+    the only supported-candidate data that can be compressed for the 30,000
+    character limit, in deterministic analysis/speaker/evidence order.
+    """
+    low, high = 0, len(source)
+    best = 0
+    while low <= high:
+        length = (low + high) // 2
+        target["note"] = source[:length]
+        if len(_serialized(payload)) <= MAX_CONSOLIDATION_CHARS:
+            best = length
+            low = length + 1
+        else:
+            high = length - 1
+    target["note"] = source[:best]
+
+
 def build_consolidation_payload(
     metadata: BunnyVideoMetadata,
     analyses: Sequence[WindowAnalysis],
     slides: Sequence[SlideChange],
 ) -> str:
     """Build a deterministic, JSON-only consolidation request within its budget."""
-    payload = {
-        "metadata": {
-            "title": _bounded_text(metadata.title),
-            "duration_seconds": metadata.duration_seconds,
-        },
-        "detected_languages": [],
-        "supported_candidates": [],
-        "slides": [],
-        "generic_candidates": [],
-        "uncertainties": [],
-        "synopsis_notes": [],
-    }
-
-    if len(_serialized(payload)) > MAX_CONSOLIDATION_CHARS:
-        raise ValueError("I metadati essenziali superano il limite di consolidamento")
-
-    seen_languages: set[str] = set()
-    for analysis in analyses:
-        language = _bounded_text(analysis.detected_language)
-        if language not in seen_languages:
-            seen_languages.add(language)
-            _append_if_fits(payload, "detected_languages", language)
-
     supported: list[dict] = []
+    mandatory_supported: list[dict] = []
     generic: list[dict] = []
     for analysis in analyses:
         for speaker in analysis.speakers:
@@ -232,9 +248,31 @@ def build_consolidation_payload(
                 generic.append(_generic_candidate(speaker))
             else:
                 supported.append(candidate)
+                mandatory = _supported_candidate(speaker, include_notes=False)
+                if mandatory is None:  # Defensive: the admission check is identical above.
+                    raise AssertionError("Candidato supportato non valido")
+                mandatory_supported.append(mandatory)
 
-    for candidate in supported:
-        _append_if_fits(payload, "supported_candidates", candidate)
+    payload = {
+        "metadata": {
+            "title": metadata.title,
+            "duration_seconds": metadata.duration_seconds,
+        },
+        "detected_languages": list(dict.fromkeys(analysis.detected_language for analysis in analyses)),
+        "supported_candidates": mandatory_supported,
+        "slides": [],
+        "generic_candidates": [],
+        "uncertainties": [],
+        "synopsis_notes": [],
+    }
+
+    if len(_serialized(payload)) > MAX_CONSOLIDATION_CHARS:
+        raise ConsolidationPayloadError("dati obbligatori superano il limite di consolidamento")
+
+    for target, candidate in zip(mandatory_supported, supported, strict=True):
+        for target_evidence, evidence in zip(target["evidence"], candidate["evidence"], strict=True):
+            _fill_note_within_budget(payload, target_evidence, evidence["note"])
+
     for slide in sorted(slides, key=lambda item: item.timestamp_seconds):
         _append_slide_if_fits(payload, _slide_payload(slide))
     for candidate in generic:

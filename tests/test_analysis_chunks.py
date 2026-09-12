@@ -1,6 +1,9 @@
 import json
 from uuid import UUID
 
+import pytest
+from pydantic import ValidationError
+
 from app.bunny import BunnyVideoMetadata
 from app.models import SlideChange
 from app.transcription import TranscriptSegment
@@ -126,3 +129,74 @@ def test_empty_identity_evidence_does_not_support_a_personal_name():
 
     assert payload["supported_candidates"] == []
     assert payload["generic_candidates"] == [{"diarization_labels": ["chunk-0:A"], "confidence": "bassa"}]
+
+
+def test_supported_candidates_keep_required_facts_when_evidence_notes_are_compressed():
+    from app.analysis_chunks import WindowAnalysis, WindowSpeaker, build_consolidation_payload
+    from app.models import Evidence
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=60,
+    )
+    speakers = [
+        WindowSpeaker(
+            diarization_labels=[f"chunk-{index}:A"], display_name=f"Nome supportato {index}",
+            confidence="alta", evidence=[Evidence(
+                kind="introduzione", timestamp_seconds=float(index), note="n" * 300,
+            )],
+        )
+        for index in range(100)
+    ]
+    analyses = [
+        WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=speakers[index:index + 8])
+        for index in range(0, len(speakers), 8)
+    ]
+
+    payload = json.loads(build_consolidation_payload(metadata, analyses, []))
+
+    assert len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))) <= 30_000
+    assert len(payload["supported_candidates"]) == 100
+    assert [candidate["display_name"] for candidate in payload["supported_candidates"]] == [
+        f"Nome supportato {index}" for index in range(100)
+    ]
+    assert [candidate["evidence"][0]["timestamp_seconds"] for candidate in payload["supported_candidates"]] == [
+        float(index) for index in range(100)
+    ]
+    assert {candidate["evidence"][0]["kind"] for candidate in payload["supported_candidates"]} == {"introduzione"}
+    assert all(len(candidate["evidence"][0]["note"]) <= 300 for candidate in payload["supported_candidates"])
+
+
+def test_incompressible_supported_facts_raise_a_safe_budget_error():
+    from app.analysis_chunks import WindowAnalysis, WindowSpeaker, build_consolidation_payload
+    from app.models import Evidence
+
+    metadata = BunnyVideoMetadata(
+        video_id=UUID("12345678-1234-1234-1234-123456789abc"), title="Sessione", duration_seconds=60,
+    )
+    speakers = [
+        WindowSpeaker(
+            diarization_labels=[f"chunk-{index}:A"], display_name="N" * 400,
+            confidence="alta", evidence=[Evidence(
+                kind="introduzione", timestamp_seconds=float(index), note="nota",
+            )],
+        )
+        for index in range(100)
+    ]
+    analyses = [
+        WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=speakers[index:index + 8])
+        for index in range(0, len(speakers), 8)
+    ]
+
+    with pytest.raises(ValueError, match="dati obbligatori"):
+        build_consolidation_payload(metadata, analyses, [])
+
+
+def test_window_speaker_rejects_evidence_notes_over_300_characters():
+    from app.analysis_chunks import WindowSpeaker
+    from app.models import Evidence
+
+    with pytest.raises(ValidationError):
+        WindowSpeaker(
+            diarization_labels=["chunk-0:A"], confidence="alta",
+            evidence=[Evidence(kind="introduzione", timestamp_seconds=0, note="x" * 301)],
+        )

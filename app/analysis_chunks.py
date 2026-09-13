@@ -18,7 +18,6 @@ from app.models import (
     Nonnegative,
     ReportModel,
     SlideChange,
-    SpeakerProfile,
 )
 from app.transcription import TranscriptionResult, TranscriptSegment
 
@@ -72,12 +71,22 @@ class WindowAnalysis(ReportModel):
     uncertainties: list[BoundedText] = Field(default_factory=list, max_length=6)
 
 
+class ConsolidatedSpeaker(ReportModel):
+    """Wire shape validated semantically only after local normalization."""
+
+    id: str
+    display_name: str
+    role: str | None = None
+    confidence: Confidence
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
 class ConsolidatedTextReport(ReportModel):
     title: str
     duration_seconds: Nonnegative
     detected_language: str
     synopsis: str
-    speakers: list[SpeakerProfile]
+    speakers: list[ConsolidatedSpeaker]
     uncertainties: list[str]
 
 

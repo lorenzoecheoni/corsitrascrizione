@@ -270,6 +270,26 @@ def test_fast_analysis_uses_one_visual_batch_and_one_final_text_request(inputs, 
     assert progress == [("slides", 1, 1), ("transcript", 1, 1), ("consolidation", 0, 1)]
 
 
+def test_fast_analysis_normalizes_unsupported_name_after_sdk_wire_validation(inputs, content):
+    inputs["frames"] = []
+    content["speakers"] = [{
+        "id": "provider-name",
+        "display_name": "Nome suggerito dal fornitore",
+        "role": "Relatore",
+        "confidence": "alta",
+        "evidence": [],
+    }]
+
+    def sdk_validates_before_returning(call):
+        return SimpleNamespace(output_parsed=call["text_format"].model_validate(content))
+
+    result = OpenAIAnalyzer(FakeClient(sdk_validates_before_returning)).analyze_fast(**inputs)
+
+    assert result.speakers[0].display_name == "Relatore 1"
+    assert result.speakers[0].role is None
+    assert any("non supportata" in note for note in result.uncertainties)
+
+
 def test_usage_counts_batches_retry_error_and_semantic_repair(inputs, content, monkeypatch):
     monkeypatch.setattr("app.retry.time.sleep", lambda _: None)
     failure = APIStatusError("safe", response=httpx.Response(503, request=httpx.Request("POST", "https://api.openai.com")),
@@ -642,15 +662,12 @@ def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, c
                         "content": [{"type": "output_text", "text": json.dumps(data), "annotations": []}]}],
         })
     with OpenAI(api_key="test-only", http_client=httpx.Client(transport=httpx.MockTransport(respond))) as client:
+        result = OpenAIAnalyzer(client, rate_gate=gate).analyze(**inputs)
         if invalid_name:
-            with pytest.raises(AnalysisError) as caught:
-                OpenAIAnalyzer(client, rate_gate=gate).analyze(**inputs)
-            assert caught.value.code == "response"
-            assert "SECRET" not in str(caught.value)
-            assert caught.value.__suppress_context__
-            assert len(requests) == 2
+            assert result.speakers[1].display_name == "Relatore 1"
+            assert result.speakers[1].role is None
+            assert "SECRET INVENTED NAME" not in result.model_dump_json()
         else:
-            result = OpenAIAnalyzer(client, rate_gate=gate).analyze(**inputs)
             assert result.speakers[0].display_name == "Giulia Bianchi"
     assert [request["text"]["format"]["name"] for request in requests] == ["WindowAnalysis", "ConsolidatedTextReport"]
     assert all(request["text"]["format"]["strict"] is True for request in requests)

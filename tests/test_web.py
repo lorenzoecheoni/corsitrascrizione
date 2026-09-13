@@ -19,6 +19,7 @@ from app.bunny import (
     BunnyVideoMetadata,
 )
 from app.config import Settings
+from app.course_models import IntermediateCourseReport
 from app.jobs import JobState
 from app.inventory import InventoryCourse
 from app.main import create_app
@@ -659,3 +660,160 @@ def test_course_status_assembles_one_intermediate_report_and_hides_report_bodies
     assert "report" not in response.text
     assert "source_url" not in response.text
     assert "iframe.mediadelivery.net" not in response.text
+
+
+def intermediate_report(*, critical=False):
+    speakers = [] if critical else [{
+        "nome": "Marco Rossi", "ruolo": "Relatore", "confidenza": .95,
+        "origine_nome": ["audio"],
+    }]
+    verifications = [{
+        "livello": "critico", "codice": "RELATORE_NON_IDENTIFICATO",
+        "video": "v1", "intervento": "v1-i001", "campo": "relatori",
+        "messaggio": "Identificare il relatore.",
+    }] if critical else []
+    return IntermediateCourseReport.model_validate({
+        "versione": 1, "stato": "da_verificare",
+        "corso": {
+            "titolo": "Corso di prova", "sinossi_corso": "Sintesi del corso.",
+            "inventario": {"foglio": "Formazione", "ordine": 2},
+        },
+        "relatori": speakers,
+        "video": [{
+            "chiave": "v1", "guid": VIDEO_ID, "titolo_bunny": VIDEO_TITLE,
+            "durata_secondi": 3600, "ordine": 1,
+            "interventi": [{
+                "id": "v1-i001", "inizio": "0:00:00", "fine": "1:00:00",
+                "tipo": "intervento", "relatori": [] if critical else ["Marco Rossi"],
+                "titolo": "Corso di prova", "sintesi": "Sviluppo del tema.",
+                "punti_chiave": ["Uno", "Due", "Tre"], "confidenza": .9,
+            }],
+            "slide": [{
+                "inizio": "0:05:00", "titolo": "Slide introduttiva",
+                "testo_principale": "Contenuto visibile", "confidenza": .8,
+            }],
+        }],
+        "verifiche_richieste": verifications,
+    })
+
+
+def seed_intermediate(client, *, critical=False):
+    prepare_course(client)
+    client.app.state.course_store.attach_run("0:2", UUID(int=50), [UUID(int=51)])
+    client.app.state.course_store.save_intermediate("0:2", intermediate_report(critical=critical))
+
+
+def test_inventory_page_groups_workflow_states_in_sheet_order(client):
+    client.app.state.course_store.sync_inventory([
+        inventory_course(),
+        InventoryCourse(
+            id="0:3", foglio="Formazione", gid="0", posizione_foglio=0, riga=3,
+            titolo="Secondo corso", relatori_attesi=[], materiali=[], link=None,
+            colonna_link="D", guid_esplicito=None,
+        ),
+    ])
+
+    response = client.get("/inventory")
+
+    assert response.status_code == 200
+    assert "Inventario corsi" in response.text
+    assert "Da verificare" in response.text
+    assert "Pronti per l'Academy" in response.text
+    assert response.text.index("Corso di prova") < response.text.index("Secondo corso")
+    assert 'action="/inventory/sync"' in response.text
+    assert 'href="/"' in response.text and "Catalogo Bunny" in response.text
+    assert "inventory.js" in response.text
+
+
+def test_inventory_sync_saves_rows_and_proposals_without_writing_sheet(client):
+    writes = []
+    client.app.state.inventory.fetch = lambda: [inventory_course()]
+    client.app.state.inventory.update_link = lambda *_: writes.append(True)
+    client.app.state.bunny.list_videos = lambda: catalog(
+        catalog_video(VIDEO_ID, VIDEO_TITLE, 3600)
+    )
+
+    response = client.post("/inventory/sync", follow_redirects=False)
+
+    assert response.status_code == 303
+    record = client.app.state.course_store.get_course("0:2")
+    assert record.proposte[0].video_id == UUID(VIDEO_ID)
+    assert writes == []
+
+
+def test_match_confirmation_and_separate_sheet_write_are_explicit(client):
+    client.app.state.course_store.sync_inventory([inventory_course()])
+    from app.inventory import MatchProposal
+    client.app.state.course_store.replace_proposals([
+        MatchProposal(course_id="0:2", video_id=UUID(VIDEO_ID), score=1, reason="titolo_univoco")
+    ])
+    written = []
+    client.app.state.inventory.update_link = lambda course, url: written.append((course.id, url))
+
+    confirmed = client.post(
+        "/courses/0:2/match", data={"video_id": VIDEO_ID}, follow_redirects=False,
+    )
+    assert confirmed.status_code == 303
+    assert client.app.state.course_store.get_course("0:2").video_confermati == [UUID(VIDEO_ID)]
+    assert written == []
+
+    saved = client.post("/courses/0:2/write-link", follow_redirects=False)
+    assert saved.status_code == 303
+    assert written == [("0:2", f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")]
+
+
+def test_review_page_links_timestamps_to_streaming_player_and_downloads_json(client):
+    seed_intermediate(client)
+
+    page = client.get("/courses/0:2/review")
+    download = client.get("/courses/0:2/report-intermedio.json")
+
+    assert page.status_code == 200
+    assert 'data-intervention-row' in page.text
+    assert 'data-field="inizio"' in page.text
+    assert f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}" in page.text
+    assert "#t=0" in page.text
+    assert "course_review.js" in page.text
+    assert download.status_code == 200
+    assert download.headers["content-type"].startswith("application/json")
+    assert "attachment" in download.headers["content-disposition"]
+    assert download.json()["video"][0]["interventi"][0]["inizio"] == "0:00:00"
+
+
+def test_review_api_validates_timeline_and_saves_literal_edits(client):
+    seed_intermediate(client)
+    payload = intermediate_report().model_dump(mode="json", by_alias=True, exclude_none=True)
+    payload["video"][0]["interventi"][0]["fine"] = "0:59:59"
+    assert client.put("/api/courses/0:2/report", json=payload).status_code == 422
+
+    payload = intermediate_report().model_dump(mode="json", by_alias=True, exclude_none=True)
+    payload["video"][0]["interventi"][0]["titolo"] = "<script>testo letterale</script>"
+    response = client.put("/api/courses/0:2/report", json=payload)
+
+    assert response.status_code == 200
+    saved = client.app.state.course_store.get_course("0:2").intermediate
+    assert saved.video[0].interventi[0].titolo == "<script>testo letterale</script>"
+    assert "<script>testo letterale</script>" not in client.get("/courses/0:2/review").text
+
+
+def test_critical_verification_blocks_confirmation_then_valid_report_confirms(client):
+    seed_intermediate(client, critical=True)
+
+    blocked = client.post("/courses/0:2/confirm")
+    assert blocked.status_code == 409
+    client.app.state.course_store.save_intermediate("0:2", intermediate_report())
+    confirmed = client.post("/courses/0:2/confirm", follow_redirects=False)
+
+    assert confirmed.status_code == 303
+    assert client.app.state.course_store.get_course("0:2").intermediate.stato == "verificato"
+
+
+@pytest.mark.parametrize("method,path", [
+    ("post", "/inventory/sync"),
+    ("post", "/courses/0:2/match"),
+    ("put", "/api/courses/0:2/report"),
+    ("post", "/courses/0:2/confirm"),
+])
+def test_inventory_and_review_mutations_require_csrf(client, method, path):
+    response = getattr(client, method)(path, headers={"X-CSRF-Token": ""})
+    assert response.status_code == 403

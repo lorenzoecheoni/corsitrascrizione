@@ -5,7 +5,7 @@ from uuid import UUID
 import hmac
 import time
 
-from fastapi import APIRouter, Form, HTTPException, Request
+from fastapi import APIRouter, Body, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
@@ -25,15 +25,18 @@ from app.bunny import (
 )
 from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report, sign_course_selection
+from app.course_models import IntermediateCourseReport, format_hms
 from app.inventory import InventoryError, propose_matches
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
+from pydantic import ValidationError
 
 
 router = APIRouter()
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 templates.env.globals["format_timestamp"] = format_timestamp
+templates.env.globals["format_hms"] = format_hms
 
 
 def _transcription_provider(request: Request) -> str:
@@ -175,6 +178,58 @@ def sync_inventory(request: Request) -> RedirectResponse:
     return RedirectResponse("/inventory", status_code=303)
 
 
+@router.get("/inventory", response_class=HTMLResponse)
+def inventory_page(request: Request) -> HTMLResponse:
+    courses = request.app.state.course_store.list_courses()
+    try:
+        catalog = request.app.state.bunny.list_videos()
+        videos = catalog.videos
+        catalog_error = None
+    except BunnyError as exc:
+        videos = []
+        catalog_error = _catalog_error_message(exc)
+    video_by_id = {str(video.video_id): video for video in videos}
+    return templates.TemplateResponse(request, "inventory.html", {
+        "courses": courses,
+        "video_by_id": video_by_id,
+        "catalog_error": catalog_error,
+        "review_count": sum(course.stato == "da_verificare" for course in courses),
+        "ready_count": sum(course.stato == "pronto_academy" for course in courses),
+    })
+
+
+@router.post("/courses/{course_id}/match")
+def confirm_proposed_match(
+    request: Request, course_id: str, video_id: str = Form(""),
+) -> RedirectResponse:
+    course = get_course(request, course_id)
+    try:
+        parsed = UUID(video_id)
+    except ValueError:
+        raise _selection_error() from None
+    if parsed not in {proposal.video_id for proposal in course.proposte}:
+        raise _selection_error()
+    request.app.state.course_store.confirm_videos(course_id, [parsed])
+    return RedirectResponse(f"/courses/{course_id}", status_code=303)
+
+
+@router.post("/courses/{course_id}/write-link")
+def write_confirmed_match(request: Request, course_id: str) -> RedirectResponse:
+    course = get_course(request, course_id)
+    if len(course.video_confermati) != 1:
+        raise HTTPException(409, "Il link può essere scritto solo per un singolo video confermato")
+    video_id = course.video_confermati[0]
+    url = (
+        f"https://iframe.mediadelivery.net/embed/"
+        f"{request.app.state.settings.bunny_library_id}/{video_id}"
+    )
+    try:
+        request.app.state.inventory.update_link(course, url)
+    except InventoryError:
+        raise HTTPException(503, "Scrittura Google non disponibile; verifica il service account") from None
+    return RedirectResponse(f"/courses/{course_id}", status_code=303)
+
+
 @router.post("/courses/{course_id}/videos")
 def confirm_course_videos(
     request: Request, course_id: str, video_ids: list[str] = Form(default=[]),
@@ -287,6 +342,138 @@ def course_status(request: Request, course_id: str) -> dict:
             for job in jobs
         ],
     }
+
+
+@router.get("/courses/{course_id}", response_class=HTMLResponse)
+def course_page(request: Request, course_id: str) -> HTMLResponse:
+    course, assembly_error = _refresh_course_report(request, get_course(request, course_id))
+    try:
+        catalog = request.app.state.bunny.list_videos()
+        videos = catalog.videos
+        catalog_error = None
+    except BunnyError as exc:
+        videos = []
+        catalog_error = _catalog_error_message(exc)
+    video_by_id = {str(video.video_id): video for video in videos}
+    jobs = [request.app.state.store.get(job_id) for job_id in course.job_ids]
+    return templates.TemplateResponse(request, "course.html", {
+        "course": course,
+        "videos": videos,
+        "video_by_id": video_by_id,
+        "confirmed_ids": {str(item) for item in course.video_confermati},
+        "jobs": jobs,
+        "assembly_error": assembly_error,
+        "catalog_error": catalog_error,
+    })
+
+
+def _same_report_sources(
+    current: IntermediateCourseReport, candidate: IntermediateCourseReport
+) -> bool:
+    if current.versione != candidate.versione or current.corso.titolo != candidate.corso.titolo:
+        return False
+    current_videos = [
+        (item.chiave, item.guid, item.durata_secondi, item.ordine, item.titolo_bunny)
+        for item in current.video
+    ]
+    candidate_videos = [
+        (item.chiave, item.guid, item.durata_secondi, item.ordine, item.titolo_bunny)
+        for item in candidate.video
+    ]
+    return current_videos == candidate_videos
+
+
+def _with_required_speaker_checks(report: IntermediateCourseReport) -> IntermediateCourseReport:
+    data = report.model_dump(mode="json", by_alias=True, exclude_none=True)
+    checks = [
+        item for item in data["verifiche_richieste"]
+        if item.get("codice") != "RELATORE_NON_IDENTIFICATO"
+    ]
+    for video in report.video:
+        for intervention in video.interventi:
+            if intervention.tipo in {"pausa", "logistica"} or intervention.relatori:
+                continue
+            checks.append({
+                "livello": "critico",
+                "codice": "RELATORE_NON_IDENTIFICATO",
+                "video": video.chiave,
+                "intervento": intervention.id,
+                "campo": "relatori",
+                "messaggio": "Identificare il relatore di questo intervento prima della conferma.",
+            })
+    data["verifiche_richieste"] = checks
+    data["stato"] = "da_verificare"
+    return IntermediateCourseReport.model_validate(data)
+
+
+@router.get("/courses/{course_id}/review", response_class=HTMLResponse)
+def course_review_page(request: Request, course_id: str) -> HTMLResponse:
+    course, assembly_error = _refresh_course_report(request, get_course(request, course_id))
+    if assembly_error:
+        raise HTTPException(409, assembly_error)
+    if course.intermediate is None:
+        raise HTTPException(409, "Il report intermedio non è ancora disponibile")
+    report_data = course.intermediate.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return templates.TemplateResponse(request, "course_review.html", {
+        "course": course,
+        "report": course.intermediate,
+        "report_data": report_data,
+        "library_id": request.app.state.settings.bunny_library_id,
+    })
+
+
+@router.put("/api/courses/{course_id}/report")
+def save_course_review(
+    request: Request, course_id: str, payload: dict = Body(...),
+) -> dict:
+    course = get_course(request, course_id)
+    if course.intermediate is None:
+        raise HTTPException(409, "Il report intermedio non è disponibile")
+    try:
+        candidate = IntermediateCourseReport.model_validate(payload)
+        if not _same_report_sources(course.intermediate, candidate):
+            raise ValueError
+        candidate = _with_required_speaker_checks(candidate)
+        request.app.state.course_store.save_intermediate(course_id, candidate)
+    except (ValidationError, ValueError):
+        raise HTTPException(422, "Il report non rispetta timeline e contratto") from None
+    return {"ok": True, "stato": candidate.stato,
+            "verifiche_richieste": len(candidate.verifiche_richieste)}
+
+
+@router.post("/courses/{course_id}/confirm")
+def confirm_course_report(request: Request, course_id: str) -> RedirectResponse:
+    course = get_course(request, course_id)
+    if course.intermediate is None:
+        raise HTTPException(409, "Il report intermedio non è disponibile")
+    checked = _with_required_speaker_checks(course.intermediate)
+    if any(item.livello == "critico" for item in checked.verifiche_richieste):
+        raise HTTPException(409, "Risolvi le verifiche critiche prima della conferma")
+    data = checked.model_dump(mode="json", by_alias=True, exclude_none=True)
+    data["stato"] = "verificato"
+    try:
+        verified = IntermediateCourseReport.model_validate(data)
+        request.app.state.course_store.confirm_intermediate(course_id, verified)
+    except (ValidationError, ValueError):
+        raise HTTPException(422, "Il report non può essere confermato") from None
+    return RedirectResponse(f"/courses/{course_id}/review", status_code=303)
+
+
+@router.get("/courses/{course_id}/report-intermedio.json")
+def download_intermediate(request: Request, course_id: str) -> Response:
+    course = get_course(request, course_id)
+    if course.intermediate is None:
+        raise HTTPException(409, "Il report intermedio non è disponibile")
+    body = course.intermediate.model_dump_json(
+        indent=2, by_alias=True, exclude_none=True
+    )
+    return Response(
+        body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="report-intermedio-{course_id.replace(":", "-")}.json"'
+        },
+    )
 
 
 @router.post("/selections/preview", response_class=HTMLResponse)

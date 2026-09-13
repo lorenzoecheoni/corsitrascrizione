@@ -1,7 +1,7 @@
 import re
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 
 Confidence = Literal["alta", "media", "bassa"]
@@ -9,6 +9,31 @@ GENERIC_SPEAKER_LABEL = re.compile(r"^Relatore [1-9]\d*$")
 IDENTITY_EVIDENCE_KINDS = {"introduzione", "sottopancia", "slide", "metadata"}
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Counter = Annotated[int, Field(ge=0, strict=True)]
+UnitConfidence = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
+InterventionKind = Literal[
+    "intervento", "saluti", "logistica", "domande", "pausa", "cambio_relatore"
+]
+GENERIC_INTERVENTION_SPEAKER = re.compile(
+    r"^(?:relatore|speaker)(?:[\s_-]*\d+)?$", re.IGNORECASE
+)
+
+
+def _parse_intervention_second(value: object) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError("Il tempo non può essere booleano")
+    if isinstance(value, (int, float)):
+        return value
+    if not isinstance(value, str) or not re.fullmatch(r"\d+:[0-5]\d:[0-5]\d", value):
+        raise ValueError("Il tempo deve essere h:mm:ss")
+    hours, minutes, seconds = (int(part) for part in value.split(":"))
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def _format_intervention_second(value: float) -> str:
+    seconds = int(value + 0.5)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
 class ReportModel(BaseModel):
@@ -48,6 +73,58 @@ class SlideChange(ReportModel):
     title: str | None = None
     visible_content: list[str] = Field(default_factory=list)
     confidence: Confidence
+
+
+class Intervention(ReportModel):
+    """One factual timeline segment, stored numerically and exported as h:mm:ss."""
+
+    id: str
+    start_seconds: Nonnegative = Field(
+        validation_alias=AliasChoices("start_seconds", "inizio"), serialization_alias="inizio"
+    )
+    end_seconds: Nonnegative = Field(
+        validation_alias=AliasChoices("end_seconds", "fine"), serialization_alias="fine"
+    )
+    tipo: InterventionKind
+    relatori: list[str] = Field(default_factory=list)
+    titolo: str
+    sintesi: str
+    punti_chiave: list[str] = Field(default_factory=list)
+    confidenza: UnitConfidence
+
+    @field_validator("start_seconds", "end_seconds", mode="before")
+    @classmethod
+    def parse_timestamp(cls, value: object) -> object:
+        return _parse_intervention_second(value)
+
+    @field_serializer("start_seconds", "end_seconds")
+    def serialize_timestamp(self, value: float) -> str:
+        return _format_intervention_second(value)
+
+    @field_validator("relatori", mode="before")
+    @classmethod
+    def omit_generic_speaker_labels(cls, value: object) -> object:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            return value
+        return [
+            name.strip()
+            for name in value
+            if isinstance(name, str)
+            and name.strip()
+            and not GENERIC_INTERVENTION_SPEAKER.fullmatch(name.strip())
+        ]
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> "Intervention":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("fine deve essere successiva a inizio")
+        if self.tipo == "intervento" and not 3 <= len(self.punti_chiave) <= 7:
+            raise ValueError("un intervento richiede da 3 a 7 punti_chiave")
+        if self.tipo != "intervento" and len(self.punti_chiave) > 7:
+            raise ValueError("punti_chiave ammette al massimo 7 elementi")
+        return self
 
 
 class CostEstimate(ReportModel):
@@ -119,6 +196,7 @@ class AcademyContent(ReportModel):
     speakers: list[SpeakerProfile]
     slides: list[SlideChange]
     uncertainties: list[str]
+    interventions: list[Intervention] = Field(default_factory=list)
 
 
 class AcademyReport(AcademyContent):

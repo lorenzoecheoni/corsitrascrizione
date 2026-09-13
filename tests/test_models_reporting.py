@@ -21,8 +21,9 @@ def test_report_fixture_covers_requested_text_report() -> None:
     assert report.slides[0].timestamp_seconds == 95
     assert set(report.model_dump()) == {
         "title", "duration_seconds", "detected_language", "synopsis",
-        "speakers", "slides", "uncertainties", "cost", "bunny_title", "usage",
+        "speakers", "slides", "uncertainties", "interventions", "cost", "bunny_title", "usage",
     }
+    assert report.interventions == []
 
 
 def test_one_hour_cost_is_in_approved_range() -> None:

@@ -16,6 +16,8 @@ from app.assemblyai import AssemblyAITranscriber
 from app.auth import SESSION_COOKIE, session_is_valid
 from app.bunny import BunnyClient
 from app.config import Settings
+from app.course_store import CourseStore
+from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient
 from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
@@ -39,6 +41,8 @@ class Services:
     pipeline: AnalysisPipeline
     store: JobStore
     runner: SingleWorkerRunner
+    inventory: InventoryClient
+    course_store: CourseStore
 
 
 def build_services(settings: Settings) -> Services:
@@ -64,7 +68,16 @@ def build_services(settings: Settings) -> Services:
     )
     store = JobStore(settings.database_path)
     runner = SingleWorkerRunner(store, pipeline.run)
-    return Services(bunny, media, openai, transcriber, analyzer, assemblyai, pipeline, store, runner)
+    inventory = InventoryClient(
+        settings.google_sheet_id,
+        DEFAULT_INVENTORY_TABS,
+        service_account_json=settings.google_service_account_json,
+    )
+    course_store = CourseStore(settings.database_path)
+    return Services(
+        bunny, media, openai, transcriber, analyzer, assemblyai, pipeline,
+        store, runner, inventory, course_store,
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -86,6 +99,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # The active worker owns media cleanup; allow it to finish without
             # blocking the event loop or closing its remote client prematurely.
             services.runner.shutdown(wait=False)
+            services.inventory.close()
+            services.course_store.close()
 
     app = FastAPI(title="Bunny Video Report", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
@@ -99,6 +114,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.pipeline = services.pipeline
     app.state.store = services.store
     app.state.runner = services.runner
+    app.state.inventory = services.inventory
+    app.state.course_store = services.course_store
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
     app.state.confirmations = ConfirmationStore()

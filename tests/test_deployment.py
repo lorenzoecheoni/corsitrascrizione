@@ -87,6 +87,19 @@ def test_settings_default_to_local_report_database(monkeypatch):
     )
 
     assert settings.database_path == "bunny-video-report.sqlite3"
+    assert settings.google_sheet_id == "1yw2K-1cH5goQER1tP3KItvluXMv7N_H5RoratcWZoZo"
+    assert settings.google_service_account_json is None
+
+
+def test_google_write_secret_is_optional_and_hidden():
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", google_service_account_json="PRIVATE-GOOGLE-JSON",
+        _env_file=None,
+    )
+
+    assert "PRIVATE-GOOGLE-JSON" not in repr(settings)
 
 
 def test_create_app_rejects_missing_database_parent_without_leaking_path(tmp_path):

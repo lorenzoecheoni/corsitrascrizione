@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 from time import monotonic
 import secrets
 
@@ -61,7 +62,7 @@ def build_services(settings: Settings) -> Services:
         settings, bunny, media, transcriber, analyzer,
         fast_transcriber=assemblyai,
     )
-    store = JobStore()
+    store = JobStore(settings.database_path)
     runner = SingleWorkerRunner(store, pipeline.run)
     return Services(bunny, media, openai, transcriber, analyzer, assemblyai, pipeline, store, runner)
 
@@ -72,7 +73,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     except Exception:
         raise RuntimeError("Configurazione applicazione non valida; verificare le variabili richieste") from None
     configure_logging(app_settings)
-    services = build_services(app_settings)
+    try:
+        services = build_services(app_settings)
+    except (OSError, sqlite3.Error):
+        raise RuntimeError("Configurazione applicazione non valida; verificare le variabili richieste") from None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -29,3 +29,6 @@ tmp/
 *.m3u8
 frame_*.jpg
 frame-*.jpg
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

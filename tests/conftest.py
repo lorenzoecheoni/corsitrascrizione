@@ -6,8 +6,9 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def offline_network_only(request, monkeypatch):
+def offline_network_only(request, monkeypatch, tmp_path):
     """Allow local media fixtures; fail before external DNS or socket traffic."""
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "reports.sqlite3"))
     if request.node.get_closest_marker("live"):
         return
     connect = socket.socket.connect

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     assemblyai_api_key: str | None = Field(default=None, repr=False)
     assemblyai_region: Literal["eu", "global"] = "eu"
     app_password: str = Field(repr=False)
+    database_path: str = "bunny-video-report.sqlite3"
     temp_root: str | None = None
     media_runtime_seconds: float = Field(default=21600, gt=0, allow_inf_nan=False)
     media_inactivity_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)

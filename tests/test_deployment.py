@@ -11,7 +11,9 @@ from uvicorn.main import main as uvicorn_command
 
 from app.auth import SESSION_COOKIE
 from app.config import Settings
+from app.jobs import JobState
 from app.main import build_services, create_app
+from app.models import AcademyReport
 
 
 @pytest.fixture
@@ -74,6 +76,53 @@ def test_assemblyai_is_optional_eu_fast_path_and_secret_is_not_represented():
     finally:
         fallback_services.runner.shutdown(wait=True)
         fallback_services.openai.close()
+
+
+def test_settings_default_to_local_report_database(monkeypatch):
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", _env_file=None,
+    )
+
+    assert settings.database_path == "bunny-video-report.sqlite3"
+
+
+def test_create_app_rejects_missing_database_parent_without_leaking_path(tmp_path):
+    unavailable = tmp_path / "secret-parent-name" / "reports.sqlite3"
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", database_path=str(unavailable), _env_file=None,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        create_app(settings)
+
+    assert "Configurazione applicazione non valida" in str(raised.value)
+    assert "secret-parent-name" not in str(raised.value)
+
+
+def test_two_app_instances_reopen_the_same_completed_report(tmp_path):
+    database = tmp_path / "reports.sqlite3"
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="bunny-secret",
+        bunny_cdn_hostname="cdn.example.com", openai_api_key="openai-secret",
+        app_password="team-secret", database_path=str(database), _env_file=None,
+    )
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    first = create_app(settings)
+    created = first.state.store.create("canonical-source", source_title="Persistente")
+    first.state.store.update(created.id, state=JobState.PROCESSING)
+    first.state.store.update(created.id, state=JobState.COMPLETED, report=report)
+    first.state.runner.shutdown(wait=True)
+
+    reopened = create_app(settings)
+    try:
+        assert reopened.state.store.get(created.id).report == report
+    finally:
+        reopened.state.runner.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("peer", ["127.0.0.1", "100.64.0.42", "100.255.0.1"])

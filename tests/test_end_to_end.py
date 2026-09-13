@@ -116,7 +116,8 @@ def run_smoke_scenario(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "OpenAI", OfflineOpenAI)
     settings = Settings(bunny_library_id=123, bunny_stream_api_key="TEST_ONLY_BUNNY",
                         bunny_cdn_hostname="cdn.example.invalid", openai_api_key="TEST_ONLY_OPENAI",
-                        app_password="TEST_ONLY_PASSWORD", temp_root=str(temporary), _env_file=None)
+                        app_password="TEST_ONLY_PASSWORD", temp_root=str(temporary),
+                        database_path=str(tmp_path / "reports.sqlite3"), _env_file=None)
     app = main.create_app(settings)
     location = None
     try:
@@ -173,7 +174,10 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             "csrf_token": restarted_app.state.csrf_token,
         }, follow_redirects=False)
         assert login.status_code == 303
-        assert restarted.get(location).status_code == 404
+        reopened = restarted.get(location)
+        assert reopened.status_code == 200
+        assert "Corso sintetico" in reopened.text
+        assert restarted.get(f"{location}/report.txt").status_code == 200
     assert monotonic() - started < 15
 
 

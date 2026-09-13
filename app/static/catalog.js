@@ -11,12 +11,32 @@
   const submitSelection = document.getElementById('analyse-selection');
   const form = document.getElementById('catalog-form');
   const selectionStatus = document.getElementById('selection-status');
+  const catalogGrid = document.getElementById('catalog-grid');
+  const cardsView = document.getElementById('catalog-view-cards');
+  const listView = document.getElementById('catalog-view-list');
   const maxSelection = 50;
   if (!search || !statusFilter || !collectionFilter || !selectedOnly || !selectVisible
       || !clearSelection || !selectionCount || !selectionDuration || !selectionBar
-      || !submitSelection || !form || !selectionStatus) return;
+      || !submitSelection || !form || !selectionStatus || !catalogGrid || !cardsView
+      || !listView) return;
   const rows = [...document.querySelectorAll('[data-video-row]')];
   const selects = [...document.querySelectorAll('[data-video-select]')];
+  const viewStorageKey = 'bunny-video-report:catalog-view';
+
+  const setView = (view, persist = false) => {
+    const selectedView = view === 'list' ? 'list' : 'cards';
+    catalogGrid.dataset.view = selectedView;
+    cardsView.setAttribute('aria-pressed', String(selectedView === 'cards'));
+    listView.setAttribute('aria-pressed', String(selectedView === 'list'));
+    if (persist) {
+      try { localStorage.setItem(viewStorageKey, selectedView); } catch {}
+    }
+  };
+  let storedView = 'cards';
+  try { storedView = localStorage.getItem(viewStorageKey) || 'cards'; } catch {}
+  setView(storedView);
+  cardsView.addEventListener('click', () => setView('cards', true));
+  listView.addEventListener('click', () => setView('list', true));
 
   const normalize = value => String(value || '').trim().toLocaleLowerCase('it');
   const duration = value => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;

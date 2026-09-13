@@ -11,15 +11,19 @@ function createElement({dataset = {}, value = '', checked = false, hidden = fals
     checked,
     hidden,
     textContent: '',
+    attributes: {},
     handlers: {},
     addEventListener(type, callback) {
       this.handlers[type] = callback;
     },
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    getAttribute(name) { return this.attributes[name]; },
   };
 }
 
-function setup(size = 3) {
+function setup(size = 3, storageOptions = {}) {
   const elements = new Map();
+  const storageWrites = [];
   let rows = [
     createElement({dataset: {
       videoRow: '', title: 'Corso Python', description: 'Fondamenti pratici',
@@ -50,6 +54,20 @@ function setup(size = 3) {
   elements.set('catalog-form', createElement());
   elements.set('analyse-selection', createElement());
   elements.set('selection-status', createElement());
+  elements.set('catalog-grid', createElement({dataset: {view: 'cards'}}));
+  elements.set('catalog-view-cards', createElement());
+  elements.set('catalog-view-list', createElement());
+
+  const localStorage = {
+    getItem(key) {
+      if (storageOptions.throwOnGet) throw new Error('storage unavailable');
+      return storageOptions.storedValue ?? null;
+    },
+    setItem(key, value) {
+      if (storageOptions.throwOnSet) throw new Error('storage unavailable');
+      storageWrites.push([key, value]);
+    },
+  };
 
   vm.runInNewContext(source, {
     document: {
@@ -60,8 +78,9 @@ function setup(size = 3) {
         return [];
       },
     },
+    localStorage,
   });
-  return {elements, rows, selects};
+  return {elements, rows, selects, storageWrites};
 }
 
 function fire(element, type) {
@@ -86,6 +105,23 @@ const selectedOnly = ui.elements.get('selected-only');
 assert.equal(ui.elements.get('selection-bar').hidden, true, 'The empty selection bar stays hidden');
 assert.equal(ui.elements.get('selection-count').textContent, '0');
 assert.equal(ui.elements.get('selection-duration').textContent, '00:00');
+assert.equal(ui.elements.get('catalog-grid').dataset.view, 'cards');
+assert.equal(ui.elements.get('catalog-view-cards').getAttribute('aria-pressed'), 'true');
+assert.equal(ui.elements.get('catalog-view-list').getAttribute('aria-pressed'), 'false');
+
+fire(ui.elements.get('catalog-view-list'), 'click');
+assert.equal(ui.elements.get('catalog-grid').dataset.view, 'list');
+assert.equal(ui.elements.get('catalog-view-cards').getAttribute('aria-pressed'), 'false');
+assert.equal(ui.elements.get('catalog-view-list').getAttribute('aria-pressed'), 'true');
+assert.deepEqual(ui.storageWrites, [['bunny-video-report:catalog-view', 'list']]);
+
+const restored = setup(3, {storedValue: 'list'});
+assert.equal(restored.elements.get('catalog-grid').dataset.view, 'list', 'Saved list view is restored');
+assert.doesNotThrow(() => {
+  const unavailable = setup(3, {throwOnGet: true, throwOnSet: true});
+  fire(unavailable.elements.get('catalog-view-list'), 'click');
+  assert.equal(unavailable.elements.get('catalog-grid').dataset.view, 'list');
+}, 'Catalog view remains usable when browser storage is unavailable');
 
 search.value = 'pYtHoN';
 fire(search, 'input');
@@ -110,6 +146,7 @@ assert.deepEqual(ui.rows.map(row => row.hidden), [true, false, true], 'Selected-
 
 selectedOnly.checked = false;
 fire(selectedOnly, 'change');
+assert.equal(ui.elements.get('catalog-grid').dataset.view, 'list', 'Filtering does not reset list view');
 search.value = 'corso';
 fire(search, 'input');
 fire(ui.elements.get('select-visible'), 'click');

@@ -163,6 +163,10 @@ def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(cli
     assert 'id="selection-limit"' in response.text
     assert 'aria-describedby="selection-limit selection-status"' in response.text
     assert 'id="selection-status" role="status"' in response.text
+    assert 'id="catalog-view-cards"' in response.text
+    assert 'id="catalog-view-list"' in response.text
+    assert 'role="group" aria-label="Vista catalogo"' in response.text
+    assert 'id="catalog-grid"' in response.text and 'data-view="cards"' in response.text
     assert "Massimo 50 video per conferma" in response.text
     selection_bar = re.search(r'<aside id="selection-bar"(.*?)</aside>', response.text, re.S)[1]
     assert '/ 50 video selezionati' in selection_bar

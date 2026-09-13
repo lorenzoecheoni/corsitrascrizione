@@ -55,12 +55,16 @@
       <label class="check-control" for="selected-only">
         <input id="selected-only" type="checkbox"> Solo selezionati
       </label>
+      <div class="catalog-view-switch" role="group" aria-label="Vista catalogo">
+        <button id="catalog-view-cards" type="button" class="secondary view-button" aria-pressed="true">Schede</button>
+        <button id="catalog-view-list" type="button" class="secondary view-button" aria-pressed="false">Elenco</button>
+      </div>
       <div class="catalog-control-actions">
         <button id="select-visible" type="button" class="secondary">Seleziona visibili</button>
         <button id="clear-selection" type="button" class="secondary">Azzera</button>
       </div>
     </section>
-    <fieldset class="catalog-grid">
+    <fieldset id="catalog-grid" class="catalog-grid" data-view="cards">
       <legend class="sr-only">Scegli da uno a cinquanta video</legend>
       {% for video in videos %}
       <article class="video-card" data-video-row data-title="{{ video.title }}" data-description="{{ video.description or '' }}" data-status="{{ video.status if video.status is not none else 'unknown' }}" data-collection="{{ video.collection_id or 'none' }}" data-duration="{{ video.duration_seconds }}">

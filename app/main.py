@@ -19,7 +19,7 @@ from app.bunny import BunnyClient
 from app.config import Settings
 from app.course_store import CourseStore
 from app.courses import CourseConfirmationStore
-from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient
+from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient, speaker_hints_for_video
 from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
@@ -57,6 +57,17 @@ def build_services(settings: Settings) -> Services:
     openai = OpenAI(api_key=settings.openai_api_key, max_retries=0)
     transcriber = OpenAITranscriber(openai)
     analyzer = OpenAIAnalyzer(openai)
+    inventory = InventoryClient(
+        settings.google_sheet_id,
+        DEFAULT_INVENTORY_TABS,
+        service_account_json=settings.google_service_account_json,
+    )
+
+    def speaker_hint_provider(metadata):
+        return speaker_hints_for_video(
+            inventory.fetch(), metadata.video_id, metadata.title,
+        )
+
     assemblyai = None
     if settings.assemblyai_api_key:
         base_url = (
@@ -68,14 +79,10 @@ def build_services(settings: Settings) -> Services:
     pipeline = AnalysisPipeline(
         settings, bunny, media, transcriber, analyzer,
         fast_transcriber=assemblyai,
+        speaker_hint_provider=speaker_hint_provider,
     )
     store = JobStore(settings.database_path)
     runner = SingleWorkerRunner(store, pipeline.run)
-    inventory = InventoryClient(
-        settings.google_sheet_id,
-        DEFAULT_INVENTORY_TABS,
-        service_account_json=settings.google_service_account_json,
-    )
     course_store = CourseStore(settings.database_path)
     academy_generator = AcademyGenerator(openai)
     return Services(

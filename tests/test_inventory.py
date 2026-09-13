@@ -14,6 +14,7 @@ from app.inventory import (
     normalize_title,
     organize_catalog,
     propose_matches,
+    speaker_hints_for_video,
 )
 
 
@@ -25,7 +26,7 @@ def csv_by_gid():
     return {
         "0": (
             'webinar,Relatore,Slide,Link\n'
-            'Webinar: Governance delle holding,"Mario Rossi\nAnna Bianchi",Dispensa,bunny\n'
+            'Webinar: Governance delle holding,"Mario Rossi, Anna Bianchi",Dispensa,bunny\n'
             ',,,\n'
             'Fiscalità dei gruppi,Luca Verdi,Slide 2024,'
             'https://iframe.mediadelivery.net/embed/748068/cbf23d46-d210-4716-809e-e2c1dbb3f4f1\n'
@@ -235,6 +236,30 @@ def test_catalog_places_duplicate_titles_and_master_lessons_at_their_sheet_row()
         (4, "Master - Lezione 4.1.mp4"),
     ]
     assert groups[-1].items == []
+
+
+def test_speaker_hints_use_only_explicit_guid_or_exact_normalized_title():
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    courses = [
+        InventoryCourse(
+            id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+            titolo="Titolo diverso", relatori_attesi=["Furio d'Andrea", "Luigi Morra"],
+            materiali=[], link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+        InventoryCourse(
+            id="1719623483:5", foglio="Corsi Premium", gid="1719623483",
+            posizione_foglio=2, riga=5, titolo="Webinar: Governance delle holding",
+            relatori_attesi=["Antonio Sibilia"], materiali=[], link=None,
+            colonna_link="D", guid_esplicito=None,
+        ),
+        inventory_course("Governance delle società", row=9),
+    ]
+
+    hints = speaker_hints_for_video(
+        courses, target_id, "Governance delle holding",
+    )
+
+    assert hints == ["Furio d'Andrea", "Luigi Morra", "Antonio Sibilia"]
 
 
 def test_sheet_write_requires_optional_credentials(csv_by_gid):

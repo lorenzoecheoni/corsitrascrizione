@@ -101,6 +101,22 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert "private raw transcript" not in " ".join(messages)
 
 
+def test_pipeline_passes_optional_inventory_spelling_hints_to_analysis(components):
+    received = []
+    components.pipeline.speaker_hint_provider = lambda metadata: ["Furio d'Andrea"]
+
+    def analyze(meta, transcript, frames, *, cancellation_event, progress_callback,
+                speaker_name_hints):
+        received.extend(speaker_name_hints)
+        return components.content
+
+    components.pipeline.analyzer.analyze = analyze
+
+    components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert received == ["Furio d'Andrea"]
+
+
 def test_pipeline_uses_direct_global_transcription_and_single_fast_analysis_when_configured(components):
     transcription_started = Event()
 

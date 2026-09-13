@@ -148,6 +148,35 @@ def test_supported_window_identity_is_attached_to_intervention(inputs, content):
     assert result.interventions[-1].end_seconds == 90
 
 
+def test_inventory_hints_canonicalize_spelling_but_provider_letters_stay_generic(inputs, content):
+    inputs["frames"] = []
+    evidence = [{
+        "kind": "introduzione", "timestamp_seconds": 0,
+        "note": "Il relatore viene introdotto oralmente.",
+    }]
+    mapped = window_result()
+    mapped["speakers"] = [
+        {"diarization_labels": ["chunk-0:A"], "display_name": "Fulvio D'Andrea",
+         "role": "Relatore", "confidence": "alta", "evidence": evidence},
+        {"diarization_labels": ["assembly:F"], "display_name": "F",
+         "role": "Relatore", "confidence": "alta", "evidence": evidence},
+    ]
+    content["speakers"] = [
+        {"id": "furio", "display_name": "Fulvio D'Andrea", "role": "Relatore",
+         "confidence": "alta", "evidence": evidence},
+        {"id": "provider-f", "display_name": "F", "role": "Relatore",
+         "confidence": "alta", "evidence": evidence},
+    ]
+
+    result = OpenAIAnalyzer(FakeClient(mapped, content)).analyze(
+        **inputs, speaker_name_hints=["Furio d'Andrea"],
+    )
+
+    assert result.speakers[0].display_name == "Furio d'Andrea"
+    assert result.speakers[1].display_name == "Relatore 1"
+    assert result.interventions[0].relatori == ["Furio d'Andrea"]
+
+
 def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):
     inputs["metadata"].duration_seconds = 5760
     inputs["transcription"] = TranscriptionResult(

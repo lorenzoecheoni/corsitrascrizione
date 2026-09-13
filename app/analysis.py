@@ -3,10 +3,13 @@
 import base64
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
+from difflib import SequenceMatcher
 import json
 import math
+import re
 from threading import Event
 from typing import Literal, TypeVar
+import unicodedata
 
 import httpx
 from openai import APIStatusError, APITimeoutError, OpenAI
@@ -36,6 +39,7 @@ from app.usage import record_usage
 _VISUAL_BATCH_SIZE = 25
 _MAX_VISUAL_REPAIR_CHARS = 30_000
 AnalysisStage = Literal["visual", "window", "consolidation"]
+_PROVIDER_SPEAKER_NAME = re.compile(r"^(?:speaker\s+)?(?:[a-z]|\d+)$", re.I)
 
 
 class ClassifiedFrame(ReportModel):
@@ -117,7 +121,61 @@ def _valid_time(value: float, duration: float) -> bool:
     return math.isfinite(value) and 0 <= value <= duration
 
 
-def _normalize_speakers(data: dict) -> None:
+def _name_key(value: str) -> str:
+    folded = "".join(
+        character for character in unicodedata.normalize("NFKD", value.lower())
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[a-z]+", folded))
+
+
+def _canonical_name(value: str, hints: Sequence[str]) -> str:
+    key = _name_key(value)
+    tokens = key.split()
+    if len(tokens) < 2:
+        return value
+    ranked = sorted(
+        (
+            (SequenceMatcher(None, key, _name_key(hint)).ratio(), hint)
+            for hint in hints
+            if len(_name_key(hint).split()) >= 2
+            and _name_key(hint).split()[-1] == tokens[-1]
+        ),
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < .82:
+        return value
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < .08:
+        return value
+    return ranked[0][1]
+
+
+def _normalize_window_speakers(data: dict, hints: Sequence[str]) -> None:
+    for speaker in data.get("speakers", []):
+        if not isinstance(speaker, dict):
+            continue
+        name = speaker.get("display_name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if _PROVIDER_SPEAKER_NAME.fullmatch(name.strip()):
+            speaker["display_name"] = None
+        else:
+            speaker["display_name"] = _canonical_name(name.strip(), hints)
+
+
+def _window_payload(window, hints: Sequence[str]) -> str:
+    payload = json.loads(window.to_payload())
+    cleaned = list(dict.fromkeys(
+        name.strip()[:120] for name in hints[:20]
+        if isinstance(name, str) and name.strip()
+    ))
+    if cleaned:
+        payload["speaker_name_hints"] = cleaned
+    serialized = json.dumps(payload, ensure_ascii=False)
+    return serialized if len(serialized) <= MAX_WINDOW_CHARS else window.to_payload()
+
+
+def _normalize_speakers(data: dict, hints: Sequence[str] = ()) -> None:
     """Conservative fallback before our defensive second Pydantic validation.
 
     Normal SDK parsing already enforces identity evidence. This also protects
@@ -129,9 +187,13 @@ def _normalize_speakers(data: dict) -> None:
     number = 1
     for index, speaker in enumerate(speakers):
         name = speaker.get("display_name", "")
-        supported = any(item.get("kind") in IDENTITY_EVIDENCE_KINDS
+        provider_label = bool(_PROVIDER_SPEAKER_NAME.fullmatch(name.strip()))
+        supported = not provider_label and any(item.get("kind") in IDENTITY_EVIDENCE_KINDS
                         and isinstance(item.get("note"), str) and item["note"].strip()
                         for item in speaker.get("evidence", []))
+        if supported:
+            speaker["display_name"] = _canonical_name(name.strip(), hints)
+            name = speaker["display_name"]
         if not supported and not GENERIC_SPEAKER_LABEL.fullmatch(name):
             while f"Relatore {number}" in reserved:
                 number += 1
@@ -334,6 +396,7 @@ class OpenAIAnalyzer:
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
         frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
+        speaker_name_hints: Sequence[str] = (),
     ) -> AnalysisResult:
         check_cancelled(cancellation_event)
         usage = ProviderUsage()
@@ -352,7 +415,8 @@ class OpenAIAnalyzer:
             check_cancelled(cancellation_event)
             analyses.append(self._structured(
                 text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
-                payload=window.to_payload(), prepare=lambda data: None,
+                payload=_window_payload(window, speaker_name_hints),
+                prepare=lambda data: _normalize_window_speakers(data, speaker_name_hints),
                 validate=lambda result, current=window: _window_errors(current, result),
                 cancellation_event=cancellation_event,
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
@@ -380,7 +444,8 @@ class OpenAIAnalyzer:
 
         result = self._structured(
             text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
-            prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
+            prepare=lambda data: _normalize_speakers(data, speaker_name_hints),
+            validate=lambda content: _content_errors(content, metadata.duration_seconds),
             cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
             max_output_tokens=4000,
             max_repair_chars=MAX_CONSOLIDATION_CHARS,
@@ -443,6 +508,7 @@ class OpenAIAnalyzer:
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
         frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
+        speaker_name_hints: Sequence[str] = (),
     ) -> AnalysisResult:
         """Analyze every globally diarized segment through the bounded window path."""
         return self.analyze(
@@ -451,6 +517,7 @@ class OpenAIAnalyzer:
             frames,
             cancellation_event=cancellation_event,
             progress_callback=progress_callback,
+            speaker_name_hints=speaker_name_hints,
         )
 
     @staticmethod

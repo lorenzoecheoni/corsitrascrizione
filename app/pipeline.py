@@ -1,6 +1,6 @@
 """Connect ephemeral media and AI stages without retaining source artifacts."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from concurrent.futures import CancelledError, FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -86,6 +86,7 @@ class AnalysisPipeline:
         self, settings: Settings, bunny: BunnyClient, media: FFmpegProcessor,
         transcriber: OpenAITranscriber, analyzer: OpenAIAnalyzer,
         *, fast_transcriber: AssemblyAITranscriber | None = None,
+        speaker_hint_provider: Callable[[object], Sequence[str]] | None = None,
         temp_root: Path | None = None,
     ) -> None:
         self.settings = settings
@@ -94,6 +95,7 @@ class AnalysisPipeline:
         self.transcriber = transcriber
         self.fast_transcriber = fast_transcriber
         self.analyzer = analyzer
+        self.speaker_hint_provider = speaker_hint_provider
         self.temp_root = temp_root if temp_root is not None else settings.temp_root
 
     def _run_fast_media_and_transcription(
@@ -177,6 +179,14 @@ class AnalysisPipeline:
             next_phase("metadata")
             metadata = read_metadata(self.bunny, str(ref.video_id), event)
             progress(5, "Metadati letti")
+            speaker_name_hints: Sequence[str] = ()
+            if self.speaker_hint_provider is not None:
+                try:
+                    speaker_name_hints = self.speaker_hint_provider(metadata)
+                except Exception:
+                    # Inventory names improve spelling only; the report must
+                    # remain available when the optional sheet cannot be read.
+                    speaker_name_hints = ()
             if metadata.duration_seconds > 14_400:
                 raise PipelineError("unsupported_duration")
             with ExitStack() as workspaces:
@@ -227,8 +237,13 @@ class AnalysisPipeline:
                         progress(90, "Consolidamento del report")
 
                 analyze = self.analyzer.analyze_fast if transcript.provider == "assemblyai" else self.analyzer.analyze
-                content = analyze(metadata, transcript, media.frame_candidates,
-                                  cancellation_event=event, progress_callback=analysis_progress)
+                analysis_options = {
+                    "cancellation_event": event,
+                    "progress_callback": analysis_progress,
+                }
+                if self.speaker_hint_provider is not None:
+                    analysis_options["speaker_name_hints"] = speaker_name_hints
+                content = analyze(metadata, transcript, media.frame_candidates, **analysis_options)
                 progress(92, "Preparazione del report")
                 next_phase("report")
                 usage = APIUsage(transcription=transcript.usage,

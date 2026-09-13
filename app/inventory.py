@@ -116,7 +116,7 @@ def _column_letter(index: int) -> str:
 
 
 def _people(value: str) -> list[str]:
-    parts = re.split(r"[\n;•]+", value)
+    parts = re.split(r"[,\n;•]+", value)
     return list(dict.fromkeys(part.strip(" -–—\t") for part in parts if part.strip(" -–—\t")))
 
 
@@ -395,3 +395,24 @@ def organize_catalog(
         items=[CatalogItem(video=video) for video in videos if video.video_id not in matched_ids],
     ))
     return groups
+
+
+def speaker_hints_for_video(
+    courses: list[InventoryCourse], video_id: UUID, video_title: str,
+) -> list[str]:
+    """Return human-entered spelling hints, never evidence that a person spoke."""
+    normalized_title = normalize_title(video_title)
+    names: list[str] = []
+    for course in sorted(courses, key=lambda item: (item.posizione_foglio, item.riga, item.id)):
+        matches = (
+            course.guid_esplicito == video_id
+            if course.guid_esplicito is not None
+            else normalize_title(course.titolo) == normalized_title
+        )
+        if not matches:
+            continue
+        for name in course.relatori_attesi:
+            cleaned = name.strip()
+            if cleaned and cleaned not in names:
+                names.append(cleaned)
+    return names

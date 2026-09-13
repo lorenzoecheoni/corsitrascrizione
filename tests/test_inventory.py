@@ -12,6 +12,7 @@ from app.inventory import (
     InventoryCourse,
     InventoryWriteUnavailable,
     normalize_title,
+    organize_catalog,
     propose_matches,
 )
 
@@ -154,6 +155,86 @@ def test_matching_rejects_ambiguous_or_low_confidence_titles():
     )
 
     assert matches == []
+
+
+def test_catalog_groups_follow_sheet_tabs_and_row_order_without_losing_videos():
+    videos = [
+        bunny_video("00000000-0000-0000-0000-000000000001", "Video senza riga"),
+        bunny_video("00000000-0000-0000-0000-000000000002", "Secondo in formazione"),
+        bunny_video("00000000-0000-0000-0000-000000000003", "Primo in formazione"),
+        bunny_video("00000000-0000-0000-0000-000000000004", "Lezione master"),
+    ]
+    courses = [
+        inventory_course("Primo in formazione", row=2),
+        inventory_course("Secondo in formazione", row=7),
+        InventoryCourse(
+            id="996207322:3", foglio="Corsi premium - Master", gid="996207322",
+            posizione_foglio=1, riga=3, titolo="Lezione master",
+            relatori_attesi=[], materiali=[], link=None, colonna_link="E",
+            guid_esplicito=None,
+        ),
+    ]
+
+    groups = organize_catalog(courses, videos)
+
+    assert [group.title for group in groups] == [
+        "Formazione", "Corsi premium - Master", "Corsi Premium", "Altri video Bunny",
+    ]
+    assert [(item.sheet_row, item.video.title) for item in groups[0].items] == [
+        (2, "Primo in formazione"), (7, "Secondo in formazione"),
+    ]
+    assert [item.video.title for item in groups[1].items] == ["Lezione master"]
+    assert groups[2].items == []
+    assert [item.video.title for item in groups[3].items] == ["Video senza riga"]
+
+
+def test_catalog_keeps_a_sheet_duplicate_visible_in_each_relevant_tab():
+    video = bunny_video("00000000-0000-0000-0000-000000000001", "Governance delle holding")
+    courses = [
+        inventory_course("Governance delle holding"),
+        InventoryCourse(
+            id="1719623483:8", foglio="Corsi Premium", gid="1719623483",
+            posizione_foglio=2, riga=8, titolo="Governance delle holding",
+            relatori_attesi=[], materiali=[], link=None, colonna_link="D",
+            guid_esplicito=None,
+        ),
+    ]
+
+    groups = organize_catalog(courses, [video])
+
+    assert [str(groups[index].items[0].video.video_id) for index in (0, 2)] == [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000001",
+    ]
+    assert groups[-1].items == []
+
+
+def test_catalog_places_duplicate_titles_and_master_lessons_at_their_sheet_row():
+    videos = [
+        bunny_video("00000000-0000-0000-0000-000000000001", "Compliance integrata"),
+        bunny_video("00000000-0000-0000-0000-000000000002", "Compliance integrata"),
+        bunny_video("00000000-0000-0000-0000-000000000003", "Master - Lezione 4.1.mp4"),
+    ]
+    courses = [
+        inventory_course("Compliance integrata"),
+        InventoryCourse(
+            id="996207322:4", foglio="Corsi premium - Master", gid="996207322",
+            posizione_foglio=1, riga=4,
+            titolo="Modulo 4 | Lezione 4.1 – Le operazioni straordinarie",
+            relatori_attesi=[], materiali=[], link=None, colonna_link="E",
+            guid_esplicito=None,
+        ),
+    ]
+
+    groups = organize_catalog(courses, videos)
+
+    assert [(item.sheet_row, item.video.title) for item in groups[0].items] == [
+        (2, "Compliance integrata"), (2, "Compliance integrata"),
+    ]
+    assert [(item.sheet_row, item.video.title) for item in groups[1].items] == [
+        (4, "Master - Lezione 4.1.mp4"),
+    ]
+    assert groups[-1].items == []
 
 
 def test_sheet_write_requires_optional_credentials(csv_by_gid):

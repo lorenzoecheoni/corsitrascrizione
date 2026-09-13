@@ -21,7 +21,7 @@ function createElement({dataset = {}, value = '', checked = false, hidden = fals
   };
 }
 
-function setup(size = 3, storageOptions = {}) {
+function setup(size = 3, storageOptions = {}, tabKeys = []) {
   const elements = new Map();
   const storageWrites = [];
   let rows = [
@@ -41,7 +41,16 @@ function setup(size = 3, storageOptions = {}) {
   if (size !== 3) rows = Array.from({length: size}, (_, index) => createElement({dataset: {
     title: `Video ${index + 1}`, description: '', status: 'ready', collection: 'academy', duration: '60',
   }}));
-  const selects = rows.map(row => createElement({dataset: {videoSelect: ''}}));
+  rows.forEach((row, index) => { row.dataset.catalogTab = tabKeys[index] || 'sheet-0'; });
+  const selects = rows.map((row, index) => createElement({
+    dataset: {videoSelect: ''}, value: `video-${index + 1}`,
+  }));
+  const tabs = [
+    createElement({dataset: {catalogTabButton: 'sheet-0'}}),
+    createElement({dataset: {catalogTabButton: 'sheet-1'}}),
+  ];
+  tabs[0].setAttribute('aria-pressed', 'true');
+  tabs[1].setAttribute('aria-pressed', 'false');
   elements.set('catalog-search', createElement());
   elements.set('status-filter', createElement({value: 'all'}));
   elements.set('collection-filter', createElement({value: 'all'}));
@@ -75,12 +84,13 @@ function setup(size = 3, storageOptions = {}) {
       querySelectorAll(selector) {
         if (selector === '[data-video-row]') return rows;
         if (selector === '[data-video-select]') return selects;
+        if (selector === '[data-catalog-tab-button]') return tabs;
         return [];
       },
     },
     localStorage,
   });
-  return {elements, rows, selects, storageWrites};
+  return {elements, rows, selects, tabs, storageWrites};
 }
 
 function fire(element, type) {
@@ -108,6 +118,25 @@ assert.equal(ui.elements.get('selection-duration').textContent, '00:00');
 assert.equal(ui.elements.get('catalog-grid').dataset.view, 'cards');
 assert.equal(ui.elements.get('catalog-view-cards').getAttribute('aria-pressed'), 'true');
 assert.equal(ui.elements.get('catalog-view-list').getAttribute('aria-pressed'), 'false');
+
+const tabbed = setup(3, {}, ['sheet-0', 'sheet-0', 'sheet-1']);
+assert.deepEqual(tabbed.rows.map(row => row.hidden), [false, false, true], 'First sheet tab is active');
+fire(tabbed.tabs[1], 'click');
+assert.deepEqual(tabbed.rows.map(row => row.hidden), [true, true, false], 'Sheet tabs filter the catalog');
+assert.equal(tabbed.tabs[0].getAttribute('aria-pressed'), 'false');
+assert.equal(tabbed.tabs[1].getAttribute('aria-pressed'), 'true');
+
+const duplicated = setup(3, {}, ['sheet-0', 'sheet-1', 'sheet-1']);
+duplicated.selects[1].value = duplicated.selects[0].value;
+duplicated.selects[0].checked = true;
+fire(duplicated.selects[0], 'change');
+assert.equal(duplicated.selects[1].checked, true, 'The same Bunny video stays selected across tabs');
+assert.equal(duplicated.elements.get('selection-count').textContent, '1', 'Duplicate placements count once');
+assert.equal(duplicated.elements.get('selection-duration').textContent, '01:01');
+const duplicatedSubmit = fire(duplicated.elements.get('catalog-form'), 'submit');
+assert.equal(duplicatedSubmit.defaultPrevented, false);
+assert.equal(duplicated.selects.filter(select => select.checked && !select.disabled).length, 1,
+  'Only one field per Bunny GUID is submitted');
 
 fire(ui.elements.get('catalog-view-list'), 'click');
 assert.equal(ui.elements.get('catalog-grid').dataset.view, 'list');

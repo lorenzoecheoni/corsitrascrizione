@@ -20,6 +20,7 @@
     <p class="catalog-total">{{ total_items }} video <span aria-hidden="true">·</span> Durata complessiva: {{ format_timestamp(total_duration) }}</p>
   </section>
   {% if fast_mode %}<p class="notice" role="status">Modalità veloce AssemblyAI attiva</p>{% endif %}
+  {% if catalog_inventory_error %}<p class="notice form-error" role="status">{{ catalog_inventory_error }}</p>{% endif %}
   {% if catalog_error %}
   <p class="notice form-error" role="alert">{{ catalog_error }}</p>
   {% elif not videos %}
@@ -65,23 +66,33 @@
         <button id="clear-selection" type="button" class="secondary">Azzera</button>
       </div>
     </section>
+    <nav class="catalog-tabs" aria-label="Schede del foglio inventario">
+      {% for group in catalog_groups %}
+      <button type="button" class="secondary catalog-tab" data-catalog-tab-button="{{ group.key }}" aria-pressed="{{ 'true' if group.key == active_catalog_group else 'false' }}">
+        {{ group.title }} <span>{{ group.items|length }}</span>
+      </button>
+      {% endfor %}
+    </nav>
     <fieldset id="catalog-grid" class="catalog-grid" data-view="cards">
       <legend class="sr-only">Scegli da uno a cinquanta video</legend>
-      {% for video in videos %}
-      <article class="video-card" data-video-row data-title="{{ video.title }}" data-description="{{ video.description or '' }}" data-status="{{ video.status if video.status is not none else 'unknown' }}" data-collection="{{ video.collection_id or 'none' }}" data-duration="{{ video.duration_seconds }}">
+      {% for group in catalog_groups %}
+      {% for item in group.items %}
+      {% set video = item.video %}
+      <article class="video-card" data-video-row data-catalog-tab="{{ group.key }}" data-title="{{ video.title }}" data-description="{{ video.description or '' }}" data-status="{{ video.status if video.status is not none else 'unknown' }}" data-collection="{{ video.collection_id or 'none' }}" data-duration="{{ video.duration_seconds }}" {% if group.key != active_catalog_group %}hidden{% endif %}>
         <div class="video-select">
-          <input id="video-{{ loop.index }}" data-video-select type="checkbox" name="video_ids" value="{{ video.video_id }}">
-          <label for="video-{{ loop.index }}">Seleziona {{ video.title }}</label>
+          <input id="video-{{ group.key }}-{{ loop.index }}" data-video-select type="checkbox" name="video_ids" value="{{ video.video_id }}">
+          <label for="video-{{ group.key }}-{{ loop.index }}">Seleziona {{ video.title }}</label>
         </div>
         {% if video.thumbnail_url %}<img src="{{ video.thumbnail_url }}" alt="" loading="lazy">{% endif %}
         <div class="video-card-body">
-          <p class="video-meta">Stato {{ video.status if video.status is not none else 'non disponibile' }} · {{ video.collection_id or 'Senza collezione' }}</p>
+          <p class="video-meta">{% if item.sheet_row %}Riga {{ item.sheet_row }} del foglio · {% endif %}Stato {{ video.status if video.status is not none else 'non disponibile' }} · {{ video.collection_id or 'Senza collezione' }}</p>
           <h2>{{ video.title }}</h2>
           <p class="duration">{{ format_timestamp(video.duration_seconds) }}</p>
           {% if video.uploaded_at %}<p class="video-meta">Caricato {{ video.uploaded_at.strftime('%d/%m/%Y') }}</p>{% endif %}
           {% if video.description %}<p>{{ video.description }}</p>{% endif %}
         </div>
       </article>
+      {% endfor %}
       {% endfor %}
     </fieldset>
     <aside id="selection-bar" class="selection-bar" aria-live="polite" hidden>

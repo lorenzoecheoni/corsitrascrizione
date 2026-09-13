@@ -26,6 +26,19 @@ class InventoryTab:
     gid: str
 
 
+@dataclass(frozen=True)
+class CatalogItem:
+    video: BunnyCatalogVideo
+    sheet_row: int | None = None
+
+
+@dataclass(frozen=True)
+class CatalogGroup:
+    key: str
+    title: str
+    items: list[CatalogItem]
+
+
 DEFAULT_INVENTORY_TABS = (
     InventoryTab("Formazione", "0"),
     InventoryTab("Corsi premium - Master", "996207322"),
@@ -267,6 +280,15 @@ def _similarity(left: str, right: str) -> float:
     return max(sequence, token_score)
 
 
+def _lesson_code(value: str) -> str | None:
+    folded = _fold(value).lower()
+    match = re.search(
+        r"(?:lezione\s+(?:master\s+)?|master\s*[-:·]?\s*lezione\s+)(\d+[._]\d+)",
+        folded,
+    )
+    return match.group(1).replace("_", ".") if match else None
+
+
 def propose_matches(
     courses: list[InventoryCourse],
     videos: list[BunnyCatalogVideo],
@@ -304,3 +326,72 @@ def propose_matches(
                 reason="titolo_univoco",
             ))
     return proposals
+
+
+def organize_catalog(
+    courses: list[InventoryCourse],
+    videos: list[BunnyCatalogVideo],
+    *,
+    tabs: tuple[InventoryTab, ...] = DEFAULT_INVENTORY_TABS,
+    threshold: float = .88,
+    margin: float = .08,
+) -> list[CatalogGroup]:
+    """Order Bunny videos by the inventory without turning rows into courses.
+
+    A video may intentionally appear in more than one sheet tab, but duplicate
+    rows inside the same tab collapse to the first position. Provider-order
+    videos with no safe match remain available in a separate final group.
+    """
+    video_by_id = {video.video_id: video for video in videos}
+    proposal_by_course = {
+        proposal.course_id: proposal.video_id
+        for proposal in propose_matches(courses, videos, threshold=threshold, margin=margin)
+    }
+    videos_by_title: dict[str, list[BunnyCatalogVideo]] = {}
+    videos_by_lesson: dict[str, list[BunnyCatalogVideo]] = {}
+    for video in videos:
+        videos_by_title.setdefault(normalize_title(video.title), []).append(video)
+        lesson_code = _lesson_code(video.title)
+        if lesson_code is not None:
+            videos_by_lesson.setdefault(lesson_code, []).append(video)
+    courses_by_tab: dict[str, list[InventoryCourse]] = {tab.gid: [] for tab in tabs}
+    for course in courses:
+        if course.gid in courses_by_tab:
+            courses_by_tab[course.gid].append(course)
+    for tab_courses in courses_by_tab.values():
+        tab_courses.sort(key=lambda course: (course.riga, course.id))
+
+    matched_ids: set[UUID] = set()
+    groups: list[CatalogGroup] = []
+    for tab in tabs:
+        items: list[CatalogItem] = []
+        seen_in_tab: set[UUID] = set()
+        for course in courses_by_tab[tab.gid]:
+            candidates: list[BunnyCatalogVideo] = []
+            if course.guid_esplicito is not None:
+                explicit = video_by_id.get(course.guid_esplicito)
+                if explicit is not None:
+                    candidates = [explicit]
+            else:
+                candidates = videos_by_title.get(normalize_title(course.titolo), [])
+                lesson_code = _lesson_code(course.titolo)
+                if not candidates and lesson_code is not None:
+                    candidates = videos_by_lesson.get(lesson_code, [])
+                if not candidates and course.id in proposal_by_course:
+                    proposed = video_by_id.get(proposal_by_course[course.id])
+                    if proposed is not None:
+                        candidates = [proposed]
+            for video in candidates:
+                if video.video_id in seen_in_tab:
+                    continue
+                items.append(CatalogItem(video=video, sheet_row=course.riga))
+                seen_in_tab.add(video.video_id)
+                matched_ids.add(video.video_id)
+        groups.append(CatalogGroup(key=f"sheet-{tab.gid}", title=tab.title, items=items))
+
+    groups.append(CatalogGroup(
+        key="unmatched",
+        title="Altri video Bunny",
+        items=[CatalogItem(video=video) for video in videos if video.video_id not in matched_ids],
+    ))
+    return groups

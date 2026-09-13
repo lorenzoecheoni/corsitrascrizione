@@ -71,6 +71,7 @@ def client(monkeypatch):
         _env_file=None,
     ))
     app.state.bunny.list_videos = lambda: catalog()
+    app.state.inventory.fetch = lambda: []
     app.state.bunny.get_metadata = lambda video_id: BunnyVideoMetadata(
         video_id=video_id,
         title=VIDEO_TITLE if str(video_id) == VIDEO_ID else OTHER_VIDEO_TITLE,
@@ -183,6 +184,48 @@ def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(cli
     assert "Massimo 50 video per conferma" in response.text
     selection_bar = re.search(r'<aside id="selection-bar"(.*?)</aside>', response.text, re.S)[1]
     assert '/ 50 video selezionati' in selection_bar
+
+
+def test_dashboard_tabs_and_video_order_follow_the_three_sheet_tabs(client):
+    client.app.state.bunny.list_videos = lambda: catalog(
+        catalog_video(OTHER_VIDEO_ID, OTHER_VIDEO_TITLE, 1800),
+        catalog_video(VIDEO_ID, VIDEO_TITLE, 3600),
+    )
+    client.app.state.inventory.fetch = lambda: [
+        inventory_course(),
+        InventoryCourse(
+            id="0:8", foglio="Formazione", gid="0", posizione_foglio=0, riga=8,
+            titolo=OTHER_VIDEO_TITLE, relatori_attesi=[], materiali=[], link=None,
+            colonna_link="D", guid_esplicito=None,
+        ),
+    ]
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.text.index(VIDEO_TITLE) < response.text.index(OTHER_VIDEO_TITLE)
+    assert response.text.count('data-catalog-tab-button') == 4
+    assert re.search(r'>\s*Formazione <span>', response.text)
+    assert re.search(r'>\s*Corsi premium - Master <span>', response.text)
+    assert re.search(r'>\s*Corsi Premium <span>', response.text)
+    assert re.search(r'>\s*Altri video Bunny <span>', response.text)
+    assert 'data-catalog-tab="sheet-0"' in response.text
+    assert 'Riga 2 del foglio' in response.text
+
+
+def test_dashboard_keeps_bunny_catalog_available_when_sheet_is_unreachable(client):
+    from app.inventory import InventoryError
+
+    client.app.state.bunny.list_videos = lambda: catalog(
+        catalog_video(VIDEO_ID, VIDEO_TITLE, 3600),
+    )
+    client.app.state.inventory.fetch = lambda: (_ for _ in ()).throw(InventoryError("safe"))
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert VIDEO_TITLE in response.text
+    assert "Ordine del foglio temporaneamente non disponibile" in response.text
 
 
 def test_catalog_script_is_limited_to_the_authenticated_dashboard(client):

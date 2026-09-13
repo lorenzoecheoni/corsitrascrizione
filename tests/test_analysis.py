@@ -766,3 +766,20 @@ def test_incomplete_response_is_never_returned_as_complete_report(inputs, conten
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
     assert caught.value.code == "response"
+
+
+def test_output_limit_incomplete_window_retries_once_with_double_budget(inputs, content):
+    inputs["frames"] = []
+    incomplete = lambda kwargs: SimpleNamespace(
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        output_parsed=None,
+        usage=SimpleNamespace(input_tokens=20, output_tokens=2000),
+    )
+    client = FakeClient(incomplete, window_result(), content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert result.title == "Pubblicazione Academy"
+    assert [call["max_output_tokens"] for call in client.calls] == [2000, 4000, 4000]
+    assert result.usage.requests == 3

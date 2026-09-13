@@ -29,7 +29,7 @@ from app.bunny import (
 from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report, sign_course_selection
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
-from app.inventory import InventoryError, propose_matches
+from app.inventory import InventoryError, organize_catalog, propose_matches
 from app.jobs import JobRecord, JobState
 from app.reporting import build_video_report_payload, format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
@@ -151,8 +151,26 @@ def home(request: Request) -> HTMLResponse:
             "saved_reports": request.app.state.store.list_completed(),
             "fast_mode": request.app.state.assemblyai is not None,
         })
+    inventory_error = None
+    try:
+        courses = request.app.state.inventory.fetch()
+    except Exception:
+        # The sheet controls presentation order only: any connector or parsing
+        # failure must leave the core per-video Bunny workflow available.
+        courses = []
+        inventory_error = "Ordine del foglio temporaneamente non disponibile; mostro comunque tutti i video Bunny."
+    groups = organize_catalog(
+        courses,
+        catalog.videos,
+        threshold=request.app.state.settings.inventory_match_threshold,
+        margin=request.app.state.settings.inventory_match_margin,
+    )
+    active_group = next((group.key for group in groups if group.items), groups[0].key)
     return templates.TemplateResponse(request, "home.html", {
         "videos": catalog.videos,
+        "catalog_groups": groups,
+        "active_catalog_group": active_group,
+        "catalog_inventory_error": inventory_error,
         "status_options": list(dict.fromkeys(video.status for video in catalog.videos)),
         "collection_options": list(dict.fromkeys(video.collection_id for video in catalog.videos)),
         "total_items": catalog.total_items,

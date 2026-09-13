@@ -70,6 +70,11 @@ input:not([type="checkbox"]), select {
 .view-button { min-width: 5rem; }
 .view-button[aria-pressed="true"] { border-color: #142033; background: #142033; color: #fff; }
 .view-button[aria-pressed="true"]:hover { background: #203652; color: #fff; }
+.catalog-tabs { display: flex; gap: .55rem; overflow-x: auto; padding: .15rem .1rem .35rem; }
+.catalog-tab { flex: 0 0 auto; gap: .5rem; white-space: nowrap; }
+.catalog-tab span { display: inline-grid; min-width: 1.7rem; min-height: 1.7rem; place-items: center; padding: 0 .35rem; border-radius: 999px; background: #edf2f8; color: #42536b; font-size: .78rem; }
+.catalog-tab[aria-pressed="true"] { border-color: #142033; background: #142033; color: #fff; }
+.catalog-tab[aria-pressed="true"] span { background: #ff8d84; color: #081525; }
 .catalog-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: 1rem; min-width: 0; margin: 0; padding: 0; border: 0; }
 .video-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid #d7e0ec; border-radius: 18px; background: #fff; box-shadow: 0 8px 20px rgb(20 32 51 / 5%); }
 .video-card img { display: block; width: 100%; aspect-ratio: 16 / 9; background: #e8eef5; object-fit: cover; }

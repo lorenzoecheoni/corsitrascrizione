@@ -234,7 +234,10 @@ class OpenAIAnalyzer:
         max_output_tokens: int = 4000,
     ) -> T:
         attempts = 0
-        for repair in range(2):
+        repair_used = False
+        output_limit_retry_used = False
+        current_max_output_tokens = max_output_tokens
+        while attempts < 3:
             def request():
                 nonlocal attempts
                 check_cancelled(cancellation_event)
@@ -250,7 +253,9 @@ class OpenAIAnalyzer:
                 images = (sum(part.get("type") == "input_image" and part.get("detail") == "low"
                               for message in payload for part in message.get("content", []))
                           if isinstance(payload, list) else 0)
-                required_tokens = max(max_output_tokens, math.ceil(len(serialized) / 3)) + 300 * images
+                required_tokens = max(
+                    current_max_output_tokens, math.ceil(len(serialized) / 3)
+                ) + 300 * images
                 self._rate_gate.wait(model, required_tokens, cancellation_event)
                 check_cancelled(cancellation_event)
                 attempts += 1
@@ -258,7 +263,7 @@ class OpenAIAnalyzer:
                     raw = self._client.responses.with_raw_response.parse(
                         model=model, store=False, text_format=text_format,
                         instructions=instructions, input=payload,
-                        max_output_tokens=max_output_tokens,
+                        max_output_tokens=current_max_output_tokens,
                     )
                     try:
                         self._rate_gate.observe(model, raw.headers)
@@ -280,9 +285,27 @@ class OpenAIAnalyzer:
                 attempts=3 - attempts, delay_for=_analysis_retry_delay,
                 cancellation_event=cancellation_event,
             )
+            status = getattr(response, "status", "completed")
+            if status != "completed":
+                details = getattr(response, "incomplete_details", None)
+                reason = (
+                    details.get("reason") if isinstance(details, dict)
+                    else getattr(details, "reason", None)
+                )
+                if (
+                    status == "incomplete"
+                    and reason == "max_output_tokens"
+                    and not output_limit_retry_used
+                    and attempts < 3
+                ):
+                    # A dense transcript window can legitimately need more JSON
+                    # than the normal economical cap. Retry only this explicit
+                    # incomplete condition and keep the shared three-call budget.
+                    current_max_output_tokens = max_output_tokens * 2
+                    output_limit_retry_used = True
+                    continue
+                raise AnalysisError("response", stage=stage) from None
             try:
-                if getattr(response, "status", "completed") != "completed":
-                    raise ValueError
                 parsed = response.output_parsed
                 if parsed is None:
                     raise ValueError
@@ -297,14 +320,15 @@ class OpenAIAnalyzer:
             if not errors:
                 check_cancelled(cancellation_event)
                 return result
-            if repair or attempts >= 3:
+            if repair_used or attempts >= 3:
                 raise AnalysisError("response", stage=stage)
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)
             if len(payload) > max_repair_chars:
                 raise AnalysisError("response", stage=stage) from None
             instructions = REPAIR_PROMPT
-        raise AnalysisError("response", stage=stage)  # Defensive; both iterations return or raise.
+            repair_used = True
+        raise AnalysisError("response", stage=stage)  # Defensive; the loop returns or raises.
 
     def analyze(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,

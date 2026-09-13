@@ -44,6 +44,20 @@ def render_markdown(report: AcademyReport) -> str:
             )
             lines.append(f"  - Evidenza{timestamp}: {evidence.note}")
 
+    if report.interventions:
+        lines.extend(["", "## Interventi"])
+        for intervention in report.interventions:
+            speakers = _csv(intervention.relatori) if intervention.relatori else "Da verificare"
+            lines.append(
+                f"- {format_timestamp(intervention.start_seconds)}–"
+                f"{format_timestamp(intervention.end_seconds)} · {intervention.tipo}: "
+                f"{intervention.titolo}"
+            )
+            lines.append(f"  Relatori: {speakers}; confidenza: {intervention.confidenza:.2f}")
+            lines.append(f"  {intervention.sintesi}")
+            for point in intervention.punti_chiave:
+                lines.append(f"  - {point}")
+
     lines.extend(["", "## Slide"])
     for slide in report.slides:
         title = slide.title or "Senza titolo"

@@ -21,8 +21,9 @@ def test_report_fixture_covers_requested_text_report() -> None:
     assert report.slides[0].timestamp_seconds == 95
     assert set(report.model_dump()) == {
         "title", "duration_seconds", "detected_language", "synopsis",
-        "speakers", "slides", "uncertainties", "cost", "bunny_title", "usage",
+        "speakers", "slides", "uncertainties", "interventions", "cost", "bunny_title", "usage",
     }
+    assert report.interventions == []
 
 
 def test_one_hour_cost_is_in_approved_range() -> None:
@@ -47,6 +48,25 @@ def test_markdown_and_text_are_exportable() -> None:
     assert "## Punti chiave" not in markdown
     assert "Relatori" in plain
     assert format_timestamp(3661) == "1:01:01"
+
+
+def test_interventions_are_rendered_without_transcript_text() -> None:
+    from app.models import Intervention
+
+    report = load_report()
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Marco Rossi"], titolo="Assetti di governance",
+        sintesi="Il relatore descrive gli assetti.",
+        punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
+    )]
+
+    rendered = render_markdown(report)
+
+    assert "## Interventi" in rendered
+    assert "00:00–10:00" in rendered
+    assert "Assetti di governance" in rendered
+    assert "TRASCRIZIONE" not in rendered
 
 
 def test_speaker_rejects_personal_name_with_inference_only() -> None:

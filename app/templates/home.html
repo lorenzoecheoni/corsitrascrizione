@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Catalogo · Bunny Video Report{% endblock %}
 {% block header_actions %}
-  <nav aria-label="Azioni account">
+  <nav class="header-nav" aria-label="Azioni account">
+    <a href="/inventory">Inventario corsi</a>
     <form action="/logout" method="post">
       <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
       <button class="text-button" type="submit">Esci</button>

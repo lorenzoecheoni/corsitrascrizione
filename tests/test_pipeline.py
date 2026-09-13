@@ -95,7 +95,7 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert values == sorted(values)
     assert all(p in values for p in (5, 10, 27, 45, 50, 72, 75, 98, 100))
     assert "Slide 2/5" in messages
-    assert "Relatori 7/10" in messages
+    assert "Interventi 7/10" in messages
     assert list(tmp_path.iterdir()) == []
     assert "private raw transcript" not in report.model_dump_json()
     assert "private raw transcript" not in " ".join(messages)

@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ course.titolo }} · Bunny Video Report{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='inventory.js') }}" defer></script>{% endblock %}
+{% block header_actions %}<nav class="header-nav" aria-label="Navigazione"><a href="/inventory">Inventario</a><a href="/">Catalogo Bunny</a></nav>{% endblock %}
+{% block content %}
+  <section class="page-intro" aria-labelledby="course-title">
+    <div><p class="eyebrow">{{ course.foglio }} · riga {{ course.riga }}</p><h1 id="course-title">{{ course.titolo }}</h1><p class="status-chip status-{{ course.stato }}">{{ course.stato|replace('_', ' ') }}</p></div>
+  </section>
+  {% if assembly_error %}<p class="notice form-error" role="alert">{{ assembly_error }}</p>{% endif %}
+  {% if course.intermediate %}
+  <section class="panel course-next"><div><p class="eyebrow">Report del corso</p><h2>Timeline pronta per la revisione</h2></div><a class="button" href="/courses/{{ course.id }}/review">Rivedi il report</a></section>
+  {% elif jobs %}
+  <section id="course-status" class="panel" data-course-id="{{ course.id }}" data-state="in_elaborazione">
+    <h2>Analisi in corso</h2>
+    {% for job in jobs %}<div class="course-job"><p>{{ job.source_title }} · <span data-job-message="{{ job.id }}">{{ job.message }}</span></p><progress data-job-progress="{{ job.id }}" value="{{ job.progress }}" max="100">{{ job.progress }}%</progress></div>{% endfor %}
+  </section>
+  {% else %}
+  <section class="panel">
+    <h2>Video del corso</h2>
+    {% if course.proposte %}
+      {% for proposal in course.proposte %}
+      <form class="proposal" action="/courses/{{ course.id }}/match" method="post">
+        <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><input type="hidden" name="video_id" value="{{ proposal.video_id }}">
+        <span>Proposta: {{ video_by_id.get(proposal.video_id|string).title if video_by_id.get(proposal.video_id|string) else proposal.video_id }}</span><button type="submit">Conferma</button>
+      </form>
+      {% endfor %}
+    {% endif %}
+    {% if catalog_error %}<p class="form-error">{{ catalog_error }}</p>{% elif videos %}
+    <form id="course-video-form" action="/courses/{{ course.id }}/videos" method="post">
+      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+      <p class="muted">Seleziona i video nell'ordine in cui devono apparire nel corso.</p>
+      <ol class="compact-video-list">
+      {% for video in videos %}
+        <li><label><input type="checkbox" name="video_ids" value="{{ video.video_id }}" {% if video.video_id|string in confirmed_ids %}checked{% endif %}> <span>{{ video.title }}</span> <small>{{ format_timestamp(video.duration_seconds) }}</small></label></li>
+      {% endfor %}
+      </ol>
+      <button type="submit">Salva video e ordine</button>
+    </form>
+    {% endif %}
+  </section>
+  {% endif %}
+  {% if course.video_confermati and not jobs %}
+  <div class="actions"><a class="button" href="/courses/{{ course.id }}/analysis-preview">Controlla costi e avvia analisi</a>
+  <form action="/courses/{{ course.id }}/write-link" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button class="secondary" type="submit">Scrivi il link confermato nel foglio</button></form></div>
+  {% endif %}
+{% endblock %}

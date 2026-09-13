@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Inventario corsi · Bunny Video Report{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='inventory.js') }}" defer></script>{% endblock %}
+{% block header_actions %}
+  <nav class="header-nav" aria-label="Navigazione principale">
+    <a href="/">Catalogo Bunny</a>
+    <form action="/logout" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button class="text-button" type="submit">Esci</button></form>
+  </nav>
+{% endblock %}
+{% block content %}
+<div id="inventory">
+  <section class="page-intro" aria-labelledby="inventory-title">
+    <div><p class="eyebrow">Assoholding Academy</p><h1 id="inventory-title">Inventario corsi</h1><p class="muted">Ordine editoriale sincronizzato dai tre fogli Google.</p></div>
+    <form action="/inventory/sync" method="post">
+      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+      <button type="submit">Sincronizza inventario</button>
+    </form>
+  </section>
+  {% if catalog_error %}<p class="notice form-error" role="alert">{{ catalog_error }}</p>{% endif %}
+  <section class="workflow-summary" aria-label="Stato preparazione corsi">
+    <article><span>{{ courses|length }}</span><strong>Inventario corsi</strong></article>
+    <article><span>{{ review_count }}</span><strong>Da verificare</strong></article>
+    <article><span>{{ ready_count }}</span><strong>Pronti per l'Academy</strong></article>
+  </section>
+  <section class="panel inventory-controls" aria-label="Filtra inventario">
+    <div><label for="inventory-search">Cerca corso o relatore</label><input id="inventory-search" type="search"></div>
+    <div class="filter-pills" role="group" aria-label="Stato corso">
+      <button type="button" class="secondary" data-inventory-filter="all" aria-pressed="true">Tutti</button>
+      <button type="button" class="secondary" data-inventory-filter="review" aria-pressed="false">Da verificare</button>
+      <button type="button" class="secondary" data-inventory-filter="ready" aria-pressed="false">Pronti</button>
+    </div>
+    <p id="inventory-status" class="muted" role="status">{{ courses|length }} corsi visibili</p>
+  </section>
+  {% if courses %}
+  <ol class="course-list">
+    {% for course in courses %}
+    <li class="course-row" data-course-row data-state="{{ course.stato }}" data-search="{{ course.titolo }} {{ course.relatori_attesi|join(' ') }}">
+      <div class="course-order"><span>{{ course.foglio }}</span><strong>{{ course.riga }}</strong></div>
+      <div class="course-copy">
+        <p class="status-chip status-{{ course.stato }}">{{ course.stato|replace('_', ' ') }}</p>
+        <h2><a href="/courses/{{ course.id }}">{{ course.titolo }}</a></h2>
+        {% if course.relatori_attesi %}<p class="muted">{{ course.relatori_attesi|join(' · ') }}</p>{% endif %}
+        {% if course.video_confermati %}<p>{{ course.video_confermati|length }} video confermati</p>{% endif %}
+        {% for proposal in course.proposte %}
+        <form class="proposal" action="/courses/{{ course.id }}/match" method="post">
+          <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+          <input type="hidden" name="video_id" value="{{ proposal.video_id }}">
+          <span>Proposta {{ '%.0f'|format(proposal.score * 100) }}%: {{ video_by_id.get(proposal.video_id|string).title if video_by_id.get(proposal.video_id|string) else proposal.video_id }}</span>
+          <button class="secondary" type="submit">Conferma abbinamento</button>
+        </form>
+        {% endfor %}
+      </div>
+      <a class="button secondary" href="/courses/{{ course.id }}">Apri</a>
+    </li>
+    {% endfor %}
+  </ol>
+  {% else %}
+  <section class="panel empty-state"><h2>Nessun corso sincronizzato</h2><p>Avvia la sincronizzazione: la lettura del foglio non ha costi API.</p></section>
+  {% endif %}
+</div>
+{% endblock %}

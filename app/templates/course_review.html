@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Revisione · {{ course.titolo }}{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='course_review.js') }}" defer></script>{% endblock %}
+{% block header_actions %}<nav class="header-nav" aria-label="Navigazione"><a href="/courses/{{ course.id }}">Corso</a><a href="/inventory">Inventario</a></nav>{% endblock %}
+{% block content %}
+  <section class="page-intro"><div><p class="eyebrow">Revisione editoriale</p><h1>{{ course.titolo }}</h1><p class="muted">Correggi fatti e tempi. Moduli e lezioni saranno creati nel passaggio Academy.</p></div><a class="button secondary" href="/courses/{{ course.id }}/report-intermedio.json">Scarica report intermedio</a></section>
+  {% if report.verifiche_richieste %}<section class="panel verification-panel"><h2>Verifiche richieste</h2><ul>{% for item in report.verifiche_richieste %}<li class="{{ item.livello }}"><strong>{{ item.codice }}</strong> — {{ item.messaggio }}</li>{% endfor %}</ul></section>{% endif %}
+  <script id="course-report-data" type="application/json">{{ report_data|tojson }}</script>
+  <form id="course-review-form" data-csrf-token="{{ request.app.state.csrf_token }}" data-course-id="{{ course.id }}">
+    <section class="panel speaker-editor">
+      <label for="course-speaker-list"><strong>Relatori verificati</strong></label>
+      <p class="muted">Uno per riga: Nome e cognome | Ruolo | Organizzazione. Puoi aggiungere il nome mancante e poi assegnarlo agli interventi.</p>
+      <textarea id="course-speaker-list" data-speaker-list rows="{{ [report.relatori|length + 1, 4]|max }}">{% for speaker in report.relatori %}{{ speaker.nome }} | {{ speaker.ruolo or '' }} | {{ speaker.organizzazione or '' }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+    </section>
+    {% for video in report.video %}
+    {% set video_index = loop.index0 %}
+    <section class="review-video panel" data-video-duration="{{ video.durata_secondi }}">
+      <div class="section-heading"><div><p class="eyebrow">{{ video.chiave }} · {{ format_timestamp(video.durata_secondi) }}</p><h2>{{ video.titolo_bunny }}</h2></div><span class="muted">{{ video.guid }}</span></div>
+      <div class="timeline-table-wrap"><table class="timeline-table"><thead><tr><th>Tempi</th><th>Tipo e titolo</th><th>Relatori</th><th>Sintesi e punti chiave</th><th>Conf.</th></tr></thead><tbody>
+      {% for item in video.interventi %}
+      <tr data-intervention-row data-video-index="{{ video_index }}" data-intervention-index="{{ loop.index0 }}">
+        <td><a class="timestamp-link" target="_blank" rel="noopener" href="https://iframe.mediadelivery.net/embed/{{ library_id }}/{{ video.guid }}?autoplay=true#t={{ item.start_seconds|int }}">Apri {{ format_hms(item.start_seconds) }}</a><input data-field="inizio" value="{{ format_hms(item.start_seconds) }}"><input data-field="fine" value="{{ format_hms(item.end_seconds) }}"></td>
+        <td><select data-field="tipo">{% for kind in ['intervento','saluti','logistica','domande','pausa','cambio_relatore'] %}<option value="{{ kind }}" {% if item.tipo == kind %}selected{% endif %}>{{ kind|replace('_',' ') }}</option>{% endfor %}</select><input data-field="titolo" value="{{ item.titolo }}"></td>
+        <td><textarea data-field="relatori" rows="3">{{ item.relatori|join(', ') }}</textarea></td>
+        <td><textarea data-field="sintesi" rows="3">{{ item.sintesi }}</textarea><textarea data-field="punti_chiave" rows="4">{{ item.punti_chiave|join('\n') }}</textarea></td>
+        <td><input data-field="confidenza" type="number" min="0" max="1" step="0.01" value="{{ item.confidenza }}"></td>
+      </tr>
+      {% endfor %}
+      </tbody></table></div>
+      {% if video.slide %}<details><summary>Slide rilevate ({{ video.slide|length }})</summary><ul class="slide-evidence">{% for slide in video.slide %}<li><strong>{{ format_hms(slide.start_seconds) }} · {{ slide.titolo or 'Senza titolo' }}</strong><p>{{ slide.testo_principale }}</p></li>{% endfor %}</ul></details>{% endif %}
+    </section>
+    {% endfor %}
+    <div class="review-actions"><p id="review-status" role="status" aria-live="polite"></p><button type="submit">Salva correzioni</button></div>
+  </form>
+  <div class="actions">
+    {% if report.stato not in ['verificato', 'confermato'] %}
+    <form action="/courses/{{ course.id }}/confirm" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button type="submit" {% if report.verifiche_richieste|selectattr('livello', 'equalto', 'critico')|list %}disabled{% endif %}>Conferma report per l'Academy</button></form>
+    {% else %}
+    <form action="/courses/{{ course.id }}/generate-academy" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button type="submit">Genera JSON Academy</button></form>
+    {% endif %}
+    {% if course.academy_json %}<a class="button secondary" href="/courses/{{ course.id }}/import-academy.json">Scarica JSON Academy</a>{% endif %}
+  </div>
+{% endblock %}

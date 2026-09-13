@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Conferma analisi corso · Bunny Video Report{% endblock %}
+{% block header_actions %}<nav aria-label="Navigazione"><a class="button secondary" href="/courses/{{ course.id }}">Torna al corso</a></nav>{% endblock %}
+{% block content %}
+  <section class="page-intro" aria-labelledby="confirmation-title">
+    <div><p class="eyebrow">Conferma richiesta</p><h1 id="confirmation-title">{{ course.titolo }}</h1></div>
+  </section>
+  <section class="panel confirmation-card">
+    <ul class="selection-list">
+      {% for video in videos %}
+      <li><span>{{ video.title }}</span><strong>{{ format_timestamp(video.duration_seconds) }}</strong></li>
+      {% endfor %}
+    </ul>
+    <dl class="summary-list">
+      <div><dt>Durata totale</dt><dd>{{ format_timestamp(total_duration) }}</dd></div>
+      <div><dt>Stima preventiva</dt><dd>{{ '%.4f'|format(cost.estimated_low_usd) }}–{{ '%.4f'|format(cost.estimated_high_usd) }} USD</dd></div>
+    </dl>
+    <p>L'analisi a pagamento parte solo dopo questa conferma.</p>
+    <form action="/courses/{{ course.id }}/analyze" method="post">
+      <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+      <input type="hidden" name="confirmation" value="{{ confirmation }}">
+      <button type="submit">Conferma e analizza il corso</button>
+    </form>
+  </section>
+{% endblock %}

@@ -15,7 +15,7 @@ chmod 600 .env
 .venv/bin/python -m uvicorn app.main:create_app --factory --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-Aprire `http://127.0.0.1:8000/login`. L'utente è fisso: `team`; la password è `APP_PASSWORD`. Un accesso valido rilascia un cookie firmato, `HttpOnly` e `SameSite=Strict`, valido 12 ore; su HTTPS è anche `Secure`. Logout e ogni azione che crea, annulla o conferma un lavoro richiedono CSRF. Un riavvio invalida cookie, coda e conferme in memoria.
+Aprire `http://127.0.0.1:8000/login`. L'utente è fisso: `team`; la password è `APP_PASSWORD`. Un accesso valido rilascia un cookie firmato, `HttpOnly` e `SameSite=Strict`, valido 12 ore; su HTTPS è anche `Secure`. Logout e ogni azione che crea, annulla, conferma o elimina un lavoro richiedono CSRF. Un riavvio può invalidare cookie e conferme in memoria, ma non elimina i report completati salvati nel database.
 
 Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente hanno precedenza. Non attivare access log, debug con variabili locali o logging dei corpi delle richieste. Nessuna chiamata remota viene effettuata all'import del modulo; `create_app` è una factory e `build_services(settings)` costruisce le dipendenze sostituibili.
 
@@ -31,6 +31,7 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `ASSEMBLYAI_API_KEY` | Opzionale ma consigliata: abilita la trascrizione globale veloce con diarizzazione e identificazione relatori |
 | `ASSEMBLYAI_REGION` | `eu` (predefinito) per endpoint europeo, oppure `global` |
 | `APP_PASSWORD` | Password lunga e casuale condivisa esclusivamente con il team |
+| `DATABASE_PATH` | File SQLite dei report; in produzione Railway usare `/data/bunny-video-report.sqlite3` su volume persistente |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 
@@ -40,7 +41,7 @@ La chiave Bunny deve avere permessi di sola lettura. L'applicazione legge i meta
 
 ## Catalogo, selezione e utilizzo
 
-Dopo il login, la dashboard legge il catalogo della sola libreria Bunny configurata a ogni apertura o aggiornamento. Non salva il catalogo: il limite operativo è **10.000 video per caricamento**; una libreria più grande richiede paginazione lato server prima di poter proseguire. Ricerca, filtri e selezione agiscono nel browser sui dati visualizzati.
+Dopo il login, la dashboard legge il catalogo della sola libreria Bunny configurata a ogni apertura o aggiornamento. Non salva il catalogo: il limite operativo è **10.000 video per caricamento**; una libreria più grande richiede paginazione lato server prima di poter proseguire. Ricerca, filtri e selezione agiscono nel browser sui dati visualizzati. Il controllo `Schede / Elenco` cambia la densità del catalogo e ricorda la preferenza nel browser.
 
 Selezionare da **1 a 50 video** e scegliere `Analizza selezionati`. Il server rilegge i metadati Bunny e mostra durata e stima totale prima di creare alcun lavoro. Solo `Conferma e genera report` accoda un lavoro indipendente per ogni video; più di 50 report richiedono gruppi successivi. La conferma firmata scade dopo dieci minuti. Un errore di un video non deve bloccare gli altri lavori del gruppo.
 
@@ -58,13 +59,15 @@ Con AssemblyAI attivo viene usato l'MP4 Bunny alla risoluzione minima disponibil
 
 I limiti configurabili sono `MEDIA_RUNTIME_SECONDS=21600` (sei ore per estrazione, incluse le operazioni locali), `MEDIA_INACTIVITY_SECONDS=120` e `MEDIA_MAX_WORKSPACE_BYTES=2000000000` (2 GB). Un controllo circa ogni 100 ms interrompe e raccoglie il processo quando supera uno dei limiti; brevi superamenti della soglia di spazio fra due controlli sono possibili. I file vengono rimossi prima del lavoro successivo. Gli errori temporanei Bunny hanno al massimo tre tentativi; un errore di accesso al playback protetto rigenera il token una sola volta, ripartendo in una directory pulita. Questa ripartenza può rileggere media già scaricato nel tentativo fallito.
 
-Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. Inserire il link nel form, seguire l'avanzamento e riaprire l'URL del lavoro nella stessa sessione del server. Dal report si possono scaricare **Markdown (.md)** e **testo (.txt)**, copiare il contenuto oppure scegliere **Stampa / Salva PDF** nel browser. Il PDF usa la stampa browser, non un generatore server.
+Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. La pagina del singolo lavoro e quella del gruppo aggiornano automaticamente stato e barre ogni tre secondi; `Aggiorna ora` resta disponibile come controllo manuale. Dal report si possono scaricare **Markdown (.md)** e **testo (.txt)**, copiare il contenuto oppure scegliere **Stampa / Salva PDF** nel browser. Il PDF usa la stampa browser, non un generatore server.
 
 Nomi e ruoli richiedono evidenze testuali o visive; in caso di dubbio compaiono etichette generiche e incertezze. L'identità dei relatori non viene dedotta biometricamente dalla voce. Il report richiede revisione umana prima dell'uso editoriale.
 
 ## Dati temporanei, persistenza e riavvio
 
-Non sono presenti database, storage persistente o storage video applicativo. Il catalogo Bunny non viene memorizzato. In modalità veloce l'app scrive soltanto frame temporanei; nel fallback scrive anche segmenti audio temporanei. Tutti vengono rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline; l'artefatto AssemblyAI viene cancellato via API in uscita. I report, la coda, i batch e le sessioni restano nella memoria del singolo processo: **un riavvio perde tutti i lavori e report**, e i vecchi URL restituiscono 404. Scaricare gli export prima della manutenzione; i file scaricati sul computer dell'utente restano finché l'utente li elimina.
+Il database SQLite conserva soltanto metadati sicuri dei lavori, appartenenza ai gruppi e JSON strutturato dei report finali. Non contiene chiavi, cookie, token, trascrizioni, prompt, video, audio o immagini delle slide. Il catalogo Bunny non viene memorizzato. In modalità veloce l'app scrive soltanto frame temporanei; nel fallback scrive anche segmenti audio temporanei. Tutti vengono rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline; l'artefatto AssemblyAI viene cancellato via API in uscita.
+
+I report completati restano nell'archivio senza scadenza e sopravvivono ai riavvii quando `DATABASE_PATH` si trova sul volume persistente. L'eliminazione autenticata rimuove esclusivamente il record locale e non chiama mai Bunny. Un lavoro trovato in coda o in elaborazione all'avvio non può essere ripreso senza i file temporanei: viene marcato come fallito con l'indicazione di rilanciare l'analisi. Dopo un riavvio può essere necessario effettuare nuovamente il login.
 
 L'annullamento attende che la fase in corso riconosca la richiesta e pulisca i file; una chiamata remota già in corso può terminare prima dell'annullamento. Durante l'arresto ordinato il worker può finire i lavori già accodati. Prima di riavviare, annullare o attendere tutti i lavori. Un arresto forzato, un crash o la perdita dell'host possono impedire la pulizia: usare storage temporaneo effimero, senza backup, e rimuovere le sole directory residue `bunny-video-*` quando nessun worker è attivo. Non promettere pulizia Python dopo SIGKILL.
 
@@ -80,7 +83,9 @@ L'immagine include FFmpeg, template e asset statici, esegue l'app come `appuser`
 
 La distribuzione prevista è Railway. Per pubblicare, configurare il dominio con TLS valido e usare sempre **HTTPS** per l'accesso remoto, così il cookie di sessione viene emesso con `Secure`. Impedire l'accesso pubblico diretto alla porta del container e inoltrare gli header proxy soltanto da proxy fidati. Disabilitare anche sul proxy il logging di cookie, body, query e URL completi sensibili.
 
-Usare **esattamente una replica e un processo Uvicorn**, senza `--workers` multipli, autoscaling o rolling overlap: queue e report sono in memoria e non sono condivisi fra processi. Configurare il provider senza sospensione automatica durante i lavori, con risorse CPU/RAM e spazio temporaneo adeguati ai video lunghi. Misurare il fabbisogno sul primo video reale; non è stato ancora calibrato.
+Su Railway aggiungere al servizio un volume persistente montato in `/data` e impostare `DATABASE_PATH=/data/bunny-video-report.sqlite3`. Il file e i relativi file SQLite `-wal`/`-shm` non devono entrare nel repository o nell'immagine. Questo non richiede un nuovo abbonamento API: usa soltanto una quantità minima dello storage Railway già associato al servizio.
+
+Usare **esattamente una replica e un processo Uvicorn**, senza `--workers` multipli, autoscaling o rolling overlap: il database SQLite e il singolo worker non autorizzano l'elaborazione concorrente fra repliche. Configurare il provider senza sospensione automatica durante i lavori, con risorse CPU/RAM e spazio temporaneo adeguati ai video lunghi.
 
 `GET /healthz`, `/login` e gli asset statici sono pubblici; dashboard, batch, lavori, download e API richiedono una sessione. L'healthcheck prova che il processo HTTP risponde, non che Bunny/OpenAI siano raggiungibili o che le credenziali siano corrette. Il Dockerfile include questa verifica di salute.
 
@@ -103,13 +108,13 @@ Suite offline, senza credenziali reali né accesso ai servizi (fornire FFmpeg e 
 PATH='/percorso/a/ffmpeg:'"$PATH" .venv/bin/python -m pytest -m 'not live' -q
 ```
 
-Lo smoke `tests/test_end_to_end.py` genera un video sintetico con FFmpeg, usa confini Bunny/OpenAI finti e attraversa form, worker, schema, download e pulizia temporanea entro 15 secondi. Verifica anche autenticazione, healthcheck e perdita del lavoro al riavvio. FFmpeg e FFprobe devono essere disponibili nel `PATH`.
+Lo smoke `tests/test_end_to_end.py` genera un video sintetico con FFmpeg, usa confini Bunny/OpenAI finti e attraversa form, worker, schema, download e pulizia temporanea entro 15 secondi. Verifica anche autenticazione, healthcheck e persistenza del report dopo il riavvio. FFmpeg e FFprobe devono essere disponibili nel `PATH`.
 
 ## Analisi rapida e verifica prima della pubblicazione
 
 Con AssemblyAI l'intero video viene diarizzato in un solo lavoro, così una stessa voce mantiene un'identità globale. L'app costruisce poi un unico payload OpenAI limitato a 30.000 caratteri: apertura, primo intervento di ogni voce, campioni lungo tutta la durata, conclusione e contesto slide. Tutti i cambi slide classificati restano nel report locale, anche quando soltanto un campione dei loro titoli serve alla sinossi. Senza AssemblyAI resta disponibile l'analisi a finestre cronologiche da 600 secondi.
 
-Non viene introdotto database, bucket, storage video o storage del transcript nell'applicazione. Per la modalità veloce servono Bunny Stream read-only, OpenAI API, AssemblyAI API e Railway. Non è richiesto un nuovo abbonamento mensile: AssemblyAI è pay-as-you-go, ma richiede account, chiave e credito/fatturazione propri. Credito e limiti API restano distinti.
+Viene usato un database SQLite esclusivamente per report testuali e stato dei lavori; non viene introdotto storage video o del transcript. Per la modalità veloce servono Bunny Stream read-only, OpenAI API, AssemblyAI API e Railway. Non è richiesto un nuovo abbonamento mensile: AssemblyAI è pay-as-you-go, ma richiede account, chiave e credito/fatturazione propri. Credito e limiti API restano distinti.
 
 Prima di pubblicare, eseguire la suite disponibile nell'ambiente locale privo di FFmpeg/FFprobe:
 

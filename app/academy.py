@@ -5,9 +5,9 @@ from __future__ import annotations
 from concurrent.futures import CancelledError
 import json
 from threading import Event
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from app.academy_prompt import ACADEMY_REPAIR_PROMPT, ACADEMY_SYSTEM_PROMPT
 from app.course_models import (
@@ -18,10 +18,95 @@ from app.course_models import (
     validate_academy_import,
 )
 from app.retry import check_cancelled
+from app.models import ReportModel
 
 
 class AcademyGenerationError(Exception):
     """Safe, user-facing generation failure."""
+
+
+class DraftFAQ(ReportModel):
+    domanda: str
+    risposta: str
+
+
+class DraftQuote(ReportModel):
+    testo: str
+    autore: str | None = None
+    nota: str | None = None
+
+
+class DraftCourse(ReportModel):
+    titolo: str
+    slug: str | None = None
+    sottotitolo: str
+    lead: str | None = None
+    area: str
+    formato: str | None = None
+    durata: str | None = None
+    ore: float | None = None
+    prezzo: float | None = None
+    presentazione: str
+    competenze: list[str]
+    profili: list[str]
+    faq: list[DraftFAQ] = Field(default_factory=list)
+    citazione: DraftQuote | None = None
+
+
+class DraftSpeaker(ReportModel):
+    nome: str
+    ruolo: str | None = None
+    organizzazione: str | None = None
+    slug: str | None = None
+
+
+class DraftVideo(ReportModel):
+    chiave: str
+    sorgente: Literal["bunny"] = "bunny"
+    guid: str
+    durata_secondi: int
+    titolo: str | None = None
+
+
+class DraftAnswer(ReportModel):
+    testo: str
+    corretta: bool = False
+
+
+class DraftQuestion(ReportModel):
+    testo: str
+    risposte: list[DraftAnswer]
+    spiegazione: str
+
+
+class DraftLesson(ReportModel):
+    titolo: str
+    tipo: Literal["video", "quiz", "testo"] = "video"
+    video: str | None = None
+    inizio: str | None = None
+    fine: str | None = None
+    relatori: list[str] = Field(default_factory=list)
+    descrizione: str | None = None
+    hero: bool = False
+    anteprima: bool = False
+    domande: list[DraftQuestion] = Field(default_factory=list)
+    corpo: str | None = None
+
+
+class DraftModule(ReportModel):
+    titolo: str
+    sommario: str | None = None
+    lezioni: list[DraftLesson]
+
+
+class AcademyDraft(ReportModel):
+    """Strict JSON shape without editorial validators, so one repair remains possible."""
+
+    versione: Literal[1] = 1
+    corso: DraftCourse
+    relatori: list[DraftSpeaker]
+    video: list[DraftVideo]
+    moduli: list[DraftModule]
 
 
 def _pydantic_errors(error: ValidationError) -> list[dict[str, Any]]:
@@ -70,7 +155,7 @@ class AcademyGenerator:
             raw = self._client.responses.with_raw_response.parse(
                 model=self.MODEL,
                 store=False,
-                text_format=AcademyImport,
+                text_format=AcademyDraft,
                 instructions=instructions,
                 input=payload,
                 max_output_tokens=self.MAX_OUTPUT_TOKENS,
@@ -140,4 +225,4 @@ class AcademyGenerator:
         raise AcademyGenerationError("Non è stato possibile creare un JSON Academy valido")
 
 
-__all__ = ["AcademyGenerationError", "AcademyGenerator"]
+__all__ = ["AcademyDraft", "AcademyGenerationError", "AcademyGenerator"]

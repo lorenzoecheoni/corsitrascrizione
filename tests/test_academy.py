@@ -138,7 +138,7 @@ def test_generator_returns_valid_schema_and_overwrites_price_from_lesson_seconds
     call = client.calls[0]
     assert call["store"] is False
     assert call["model"] == "gpt-4o-mini"
-    assert call["text_format"].__name__ == "AcademyImport"
+    assert call["text_format"].__name__ == "AcademyDraft"
     assert "Governance delle holding" not in call["instructions"]
     assert "Governance delle holding" in call["input"]
 
@@ -174,6 +174,29 @@ def test_generator_repairs_once_using_only_previous_json_and_machine_errors():
     assert set(__import__("json").loads(repair["input"])) == {"errors", "previous_json"}
     assert "sinossi_corso" not in repair["input"]
     assert "Correggi esclusivamente" in repair["instructions"]
+
+
+def test_sdk_structured_parse_can_return_an_editorially_invalid_draft_for_repair():
+    class ValidatingClient(FakeClient):
+        def raw_parse(self, **kwargs):
+            self.calls.append(copy.deepcopy(kwargs))
+            outcome = self.outcomes.pop(0)
+            parsed = kwargs["text_format"].model_validate(outcome)
+            response = SimpleNamespace(status="completed", output_parsed=parsed)
+            return SimpleNamespace(headers={}, parse=lambda: response)
+
+    invalid = valid_academy()
+    invalid["corso"].pop("prezzo")
+    invalid["corso"]["area"] = "Area inventata"
+    repaired = valid_academy()
+    repaired["corso"].pop("prezzo")
+    client = ValidatingClient(invalid, repaired)
+
+    result = AcademyGenerator(client).generate(source_report())
+
+    assert result.corso.area == "Governance"
+    assert result.corso.prezzo == 97
+    assert len(client.calls) == 2
 
 
 def test_generator_never_makes_a_third_request_and_returns_a_safe_error():

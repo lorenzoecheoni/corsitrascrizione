@@ -199,6 +199,28 @@ def test_one_oversized_text_segment_is_split_deterministically_with_original_tim
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
 
+def test_one_long_provider_utterance_is_split_by_time_without_text_loss():
+    from app.analysis_chunks import MAX_WINDOW_SECONDS, split_transcript_windows
+
+    segment = TranscriptSegment(
+        start_seconds=120,
+        end_seconds=1921,
+        diarization_label="assembly:A",
+        text="Intervento continuativo " * 900,
+    )
+
+    windows = split_transcript_windows([segment])
+    pieces = [piece for window in windows for piece in window.segments]
+
+    assert len(pieces) >= 4
+    assert "".join(piece.text for piece in pieces) == segment.text
+    assert pieces[0].start_seconds == segment.start_seconds
+    assert pieces[-1].end_seconds == segment.end_seconds
+    assert all(left.end_seconds == right.start_seconds for left, right in zip(pieces, pieces[1:]))
+    assert all(piece.end_seconds - piece.start_seconds <= MAX_WINDOW_SECONDS for piece in pieces)
+    assert all(window.end_seconds - window.start_seconds <= MAX_WINDOW_SECONDS for window in windows)
+
+
 def test_consolidation_payload_prioritizes_supported_evidence_and_stays_bounded():
     from app.analysis_chunks import (
         MAX_CONSOLIDATION_CHARS,

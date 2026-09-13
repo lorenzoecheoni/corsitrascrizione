@@ -6,6 +6,7 @@ transcript text.
 
 from collections.abc import Sequence
 import json
+import math
 from typing import Annotated, Mapping
 
 from pydantic import Field, field_validator, model_validator
@@ -143,6 +144,8 @@ def _fits_window(segments: list[TranscriptSegment]) -> bool:
 
 def _split_oversized_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
     """Split only the text, retaining the source segment's timing and label."""
+    if not segment.text:
+        return [segment] if _fits_window([segment]) else []
     pieces: list[TranscriptSegment] = []
     offset = 0
     while offset < len(segment.text):
@@ -163,6 +166,28 @@ def _split_oversized_segment(segment: TranscriptSegment) -> list[TranscriptSegme
     return pieces
 
 
+def _split_long_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
+    """Bound a provider utterance in time while preserving its text exactly once."""
+    duration = segment.end_seconds - segment.start_seconds
+    part_count = max(1, math.ceil(duration / MAX_WINDOW_SECONDS))
+    pieces: list[TranscriptSegment] = []
+    for index in range(part_count):
+        text_start = len(segment.text) * index // part_count
+        text_end = len(segment.text) * (index + 1) // part_count
+        start = segment.start_seconds + duration * index / part_count
+        end = (
+            segment.end_seconds
+            if index == part_count - 1
+            else segment.start_seconds + duration * (index + 1) / part_count
+        )
+        pieces.append(segment.model_copy(update={
+            "start_seconds": start,
+            "end_seconds": end,
+            "text": segment.text[text_start:text_end],
+        }))
+    return pieces
+
+
 def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[TranscriptWindow]:
     """Return chronological payload-sized windows without retaining transcript data."""
     ordered = sorted(segments, key=lambda segment: (segment.start_seconds, segment.end_seconds))
@@ -170,18 +195,28 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
     current: list[TranscriptSegment] = []
 
     for segment in ordered:
-        if segment.end_seconds - segment.start_seconds > MAX_WINDOW_SECONDS:
-            raise ValueError("Un segmento supera la durata massima della finestra")
-        pieces = [segment] if _fits_window([segment]) else _split_oversized_segment(segment)
-        for piece in pieces:
-            candidate = [*current, piece]
-            if current and not _fits_window(candidate):
-                windows.append(_window_for(current))
-                current = [piece]
-            else:
-                current = candidate
-            if not _fits_window(current):
-                raise ValueError("Una finestra non puo rispettare i limiti richiesti")
+        time_pieces = (
+            _split_long_segment(segment)
+            if segment.end_seconds - segment.start_seconds > MAX_WINDOW_SECONDS
+            else [segment]
+        )
+        for time_piece in time_pieces:
+            pieces = (
+                [time_piece]
+                if _fits_window([time_piece])
+                else _split_oversized_segment(time_piece)
+            )
+            if not pieces:
+                raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
+            for piece in pieces:
+                candidate = [*current, piece]
+                if current and not _fits_window(candidate):
+                    windows.append(_window_for(current))
+                    current = [piece]
+                else:
+                    current = candidate
+                if not _fits_window(current):
+                    raise ValueError("Una finestra non puo rispettare i limiti richiesti")
 
     if current:
         windows.append(_window_for(current))

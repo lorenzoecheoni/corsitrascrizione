@@ -251,16 +251,23 @@ def test_all_visual_slides_survive_bounded_final_context(inputs, content):
     assert all(slide.visible_content == ["x" * 1000] * 5 for slide in result.slides)
 
 
-def test_unrepresentable_windows_have_safe_error(inputs, caplog, capsys):
+def test_long_provider_segment_is_split_before_remote_analysis(inputs, content, caplog, capsys):
     inputs["frames"] = []
+    inputs["metadata"].duration_seconds = 601
+    content["duration_seconds"] = 601
     inputs["transcription"].segments = [TranscriptSegment(
         start_seconds=0, end_seconds=601, text="PRIVATE SEGMENT", diarization_label="A")]
-    client = FakeClient()
-    with pytest.raises(AnalysisError) as caught:
-        OpenAIAnalyzer(client).analyze(**inputs)
-    assert caught.value.code == "response"
-    assert "PRIVATE" not in str(caught.value) + caplog.text + capsys.readouterr().out
-    assert not client.calls
+    client = FakeClient(
+        window_result(diarization_labels=["A"]),
+        window_result(diarization_labels=["A"]),
+        content,
+    )
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert result.duration_seconds == 601
+    assert "PRIVATE" not in caplog.text + capsys.readouterr().out
+    assert len(client.calls) == 3
 
 
 def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, content):

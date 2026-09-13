@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
 from threading import Event
 from uuid import uuid4
 
@@ -42,6 +43,112 @@ def test_job_reopens_from_same_store_but_not_after_restart() -> None:
     assert "secret" not in repr(loaded)
     with pytest.raises(KeyError):
         JobStore().get(created.id)
+
+
+def test_sqlite_store_persists_completed_report_and_ordered_batch(tmp_path, report) -> None:
+    path = tmp_path / "reports.sqlite3"
+    first = JobStore(path)
+    batch, jobs = first.create_batch([
+        ("https://private.invalid/first", "Primo"),
+        ("https://private.invalid/second", "Secondo"),
+    ])
+    first.update(jobs[0].id, state=JobState.PROCESSING, progress=75)
+    first.update(jobs[0].id, state=JobState.COMPLETED, report=report)
+
+    reopened = JobStore(path)
+
+    loaded = reopened.get(jobs[0].id)
+    assert loaded.report == report
+    assert loaded.source_url == "https://private.invalid/first"
+    assert reopened.get_batch(batch.id).job_ids == batch.job_ids
+    loaded.report.speakers.clear()
+    assert len(reopened.get(jobs[0].id).report.speakers) == 3
+
+
+def test_sqlite_store_marks_interrupted_jobs_failed_on_reopen(tmp_path) -> None:
+    path = tmp_path / "reports.sqlite3"
+    store = JobStore(path)
+    queued = store.create("queued")
+    processing = store.create("processing")
+    store.update(processing.id, state=JobState.PROCESSING, progress=50)
+
+    reopened = JobStore(path)
+
+    for job_id in (queued.id, processing.id):
+        assert reopened.get(job_id).state == JobState.FAILED
+        assert reopened.get(job_id).error == (
+            "Elaborazione interrotta dal riavvio; avvia nuovamente l’analisi"
+        )
+    assert reopened.get(queued.id).progress == 0
+    assert reopened.get(processing.id).progress == 50
+
+
+def test_completed_and_uncompleted_lists_are_separate_and_ordered(tmp_path, report) -> None:
+    store = JobStore(tmp_path / "reports.sqlite3")
+    completed = store.create("completed", source_title="Completato")
+    failed = store.create("failed", source_title="Fallito")
+    processing = store.create("processing", source_title="In corso")
+    store.update(completed.id, state=JobState.PROCESSING)
+    store.update(completed.id, state=JobState.COMPLETED, report=report)
+    store.update(failed.id, state=JobState.PROCESSING)
+    store.update(failed.id, state=JobState.FAILED, error="Errore controllato")
+    store.update(processing.id, state=JobState.PROCESSING)
+
+    assert [job.id for job in store.list_completed()] == [completed.id]
+    assert [job.id for job in store.list_uncompleted(limit=2)] == [processing.id, failed.id]
+
+
+def test_delete_completed_removes_only_local_job_and_batch_membership(tmp_path, report) -> None:
+    store = JobStore(tmp_path / "reports.sqlite3")
+    batch, jobs = store.create_batch([("first", "Primo"), ("second", "Secondo")])
+    store.update(jobs[0].id, state=JobState.PROCESSING)
+    store.update(jobs[0].id, state=JobState.COMPLETED, report=report)
+
+    store.delete_completed(jobs[0].id)
+
+    with pytest.raises(KeyError):
+        store.get(jobs[0].id)
+    assert store.get_batch(batch.id).job_ids == [jobs[1].id]
+    with pytest.raises(ValueError):
+        store.delete_completed(jobs[1].id)
+    assert store.get(jobs[1].id).source_title == "Secondo"
+
+
+def test_delete_last_completed_job_preserves_empty_batch(tmp_path, report) -> None:
+    store = JobStore(tmp_path / "reports.sqlite3")
+    batch, jobs = store.create_batch([("only", "Unico")])
+    store.update(jobs[0].id, state=JobState.PROCESSING)
+    store.update(jobs[0].id, state=JobState.COMPLETED, report=report)
+
+    store.delete_completed(jobs[0].id)
+
+    assert store.get_batch(batch.id).job_ids == []
+
+
+def test_corrupt_saved_report_is_safe_and_does_not_hide_valid_reports(
+    tmp_path, report, caplog,
+) -> None:
+    path = tmp_path / "reports.sqlite3"
+    store = JobStore(path)
+    corrupt = store.create("corrupt", source_title="Corrotto")
+    valid = store.create("valid", source_title="Valido")
+    for job in (corrupt, valid):
+        store.update(job.id, state=JobState.PROCESSING)
+        store.update(job.id, state=JobState.COMPLETED, report=report)
+    secret_body = "secret-invalid-report-body"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE jobs SET report_json = ? WHERE id = ?",
+            (secret_body, str(corrupt.id)),
+        )
+
+    loaded = JobStore(path).list_completed()
+
+    by_id = {job.id: job for job in loaded}
+    assert by_id[valid.id].report == report
+    assert by_id[corrupt.id].report is None
+    assert by_id[corrupt.id].error == "Report salvato non leggibile"
+    assert secret_body not in caplog.text
 
 
 def test_create_batch_keeps_titles_and_order_without_exposing_source_urls() -> None:

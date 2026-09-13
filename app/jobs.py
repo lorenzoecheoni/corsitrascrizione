@@ -1,14 +1,17 @@
-"""Volatile job records and cooperative execution in a single worker thread.
+"""Persistent job records and cooperative execution in a single worker thread.
 
-Restarting the process intentionally loses every job and report. The pipeline
-owns cleanup before returning or raising JobCancelled. Progress messages must
-be application-authored status text, never upstream diagnostics or content.
+The pipeline owns cleanup before returning or raising JobCancelled. Progress
+messages must be application-authored status text, never upstream diagnostics
+or content. Only final report JSON and safe job metadata are stored.
 """
 
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import StrEnum
+import logging
+from pathlib import Path
+import sqlite3
 from threading import Event, RLock
 from uuid import UUID, uuid4
 
@@ -58,15 +61,81 @@ _TRANSITIONS = {
     JobState.QUEUED: {JobState.PROCESSING, JobState.CANCELLED},
     JobState.PROCESSING: _TERMINAL_STATES | {JobState.PROCESSING},
 }
+_RESTART_ERROR = "Elaborazione interrotta dal riavvio; avvia nuovamente l’analisi"
+_CORRUPT_REPORT_ERROR = "Report salvato non leggibile"
+_LOGGER = logging.getLogger(__name__)
 
 
 class JobStore:
-    """Thread-safe in-memory store; callers never receive mutable stored data."""
+    """Thread-safe SQLite store; callers never receive mutable stored data."""
 
-    def __init__(self) -> None:
+    def __init__(self, database_path: str | Path = ":memory:") -> None:
         self._lock = RLock()
-        self._records: dict[UUID, JobRecord] = {}
-        self._batches: dict[UUID, BatchRecord] = {}
+        path = str(database_path)
+        if path != ":memory:":
+            parent = Path(path).expanduser().parent
+            if not parent.is_dir():
+                raise OSError("Database directory is unavailable")
+        self._connection = sqlite3.connect(path, check_same_thread=False, timeout=5)
+        self._connection.row_factory = sqlite3.Row
+        self._connection.execute("PRAGMA foreign_keys = ON")
+        self._connection.execute("PRAGMA busy_timeout = 5000")
+        if path != ":memory:":
+            self._connection.execute("PRAGMA journal_mode = WAL")
+        self._initialize_schema()
+        self._recover_interrupted_jobs()
+
+    def _initialize_schema(self) -> None:
+        with self._connection:
+            self._connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS jobs (
+                    id TEXT PRIMARY KEY,
+                    source_url TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    progress INTEGER NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    report_json TEXT,
+                    error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS batches (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS batch_jobs (
+                    batch_id TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (batch_id, position)
+                );
+                CREATE INDEX IF NOT EXISTS jobs_created_at_idx
+                    ON jobs(created_at DESC);
+                CREATE INDEX IF NOT EXISTS batch_jobs_job_idx
+                    ON batch_jobs(job_id);
+                """
+            )
+
+    def _recover_interrupted_jobs(self) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE jobs
+                SET state = ?, message = ?, error = ?, updated_at = ?
+                WHERE state IN (?, ?)
+                """,
+                (
+                    JobState.FAILED.value,
+                    "Elaborazione interrotta",
+                    _RESTART_ERROR,
+                    now,
+                    JobState.QUEUED.value,
+                    JobState.PROCESSING.value,
+                ),
+            )
 
     @staticmethod
     def _new_record(source_url: str, source_title: str, now: datetime) -> JobRecord:
@@ -78,9 +147,26 @@ class JobStore:
 
     def create(self, source_url: str, *, source_title: str = "") -> JobRecord:
         record = self._new_record(source_url, source_title, datetime.now(timezone.utc))
-        with self._lock:
-            self._records[record.id] = record
-            return record.model_copy(deep=True)
+        with self._lock, self._connection:
+            self._insert_job(record)
+        return record.model_copy(deep=True)
+
+    def _insert_job(self, record: JobRecord) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO jobs (
+                id, source_url, source_title, state, progress, message,
+                created_at, updated_at, report_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(record.id), record.source_url, record.source_title,
+                record.state.value, record.progress, record.message,
+                record.created_at.isoformat(), record.updated_at.isoformat(),
+                record.report.model_dump_json() if record.report is not None else None,
+                record.error,
+            ),
+        )
 
     def create_batch(self, items: list[tuple[str, str]]) -> tuple[BatchRecord, list[JobRecord]]:
         """Atomically store a batch and its independently queued jobs."""
@@ -90,26 +176,109 @@ class JobStore:
             batch = BatchRecord(
                 id=uuid4(), job_ids=[record.id for record in records], created_at=now,
             )
-            self._records.update({record.id: record for record in records})
-            self._batches[batch.id] = batch
-            return batch.model_copy(deep=True), [record.model_copy(deep=True) for record in records]
+            with self._connection:
+                for record in records:
+                    self._insert_job(record)
+                self._connection.execute(
+                    "INSERT INTO batches (id, created_at) VALUES (?, ?)",
+                    (str(batch.id), batch.created_at.isoformat()),
+                )
+                self._connection.executemany(
+                    "INSERT INTO batch_jobs (batch_id, job_id, position) VALUES (?, ?, ?)",
+                    [(str(batch.id), str(record.id), index) for index, record in enumerate(records)],
+                )
+        return batch.model_copy(deep=True), [record.model_copy(deep=True) for record in records]
 
     def get_batch(self, batch_id: UUID) -> BatchRecord:
         with self._lock:
-            return self._batches[batch_id].model_copy(deep=True)
+            row = self._connection.execute(
+                "SELECT id, created_at FROM batches WHERE id = ?", (str(batch_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(batch_id)
+            job_rows = self._connection.execute(
+                "SELECT job_id FROM batch_jobs WHERE batch_id = ? ORDER BY position",
+                (str(batch_id),),
+            ).fetchall()
+        return BatchRecord(
+            id=UUID(row["id"]),
+            job_ids=[UUID(item["job_id"]) for item in job_rows],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
     def list_recent(self, limit: int = 20) -> list[JobRecord]:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Il limite dei lavori recenti deve essere tra 1 e 100")
         with self._lock:
-            recent = sorted(
-                self._records.values(), key=lambda record: record.created_at, reverse=True,
-            )[:limit]
-            return [record.model_copy(deep=True) for record in recent]
+            rows = self._connection.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
+    def list_completed(self) -> list[JobRecord]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM jobs WHERE state = ? ORDER BY created_at DESC, rowid DESC",
+                (JobState.COMPLETED.value,),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
+
+    def list_uncompleted(self, limit: int = 20) -> list[JobRecord]:
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("Il limite dei lavori recenti deve essere tra 1 e 100")
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM jobs WHERE state != ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (JobState.COMPLETED.value, limit),
+            ).fetchall()
+        return [self._row_to_record(row) for row in rows]
 
     def get(self, job_id: UUID) -> JobRecord:
         with self._lock:
-            return self._records[job_id].model_copy(deep=True)
+            row = self._connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (str(job_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        return self._row_to_record(row)
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> JobRecord:
+        report = None
+        stored_error = row["error"]
+        if row["report_json"] is not None:
+            try:
+                report = AcademyReport.model_validate_json(row["report_json"])
+            except (ValidationError, ValueError):
+                _LOGGER.warning(
+                    "stored_report_invalid",
+                    extra={"job_id": row["id"], "error_code": "stored_report_invalid"},
+                )
+                stored_error = _CORRUPT_REPORT_ERROR
+        record = JobRecord(
+            id=UUID(row["id"]),
+            source_url=row["source_url"],
+            source_title=row["source_title"],
+            state=JobState(row["state"]),
+            progress=row["progress"],
+            message=row["message"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            report=report,
+            error=stored_error,
+        )
+        return record.model_copy(deep=True)
+
+    def delete_completed(self, job_id: UUID) -> None:
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT state FROM jobs WHERE id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if JobState(row["state"]) != JobState.COMPLETED:
+                raise ValueError("Solo un report completato può essere eliminato")
+            self._connection.execute("DELETE FROM jobs WHERE id = ?", (str(job_id),))
 
     def update(
         self,
@@ -127,7 +296,7 @@ class JobStore:
         Messages and errors passed directly here must be safe application text.
         """
         with self._lock:
-            current = self._records[job_id]
+            current = self.get(job_id)
             try:
                 next_state = current.state if state is None else JobState(state)
             except ValueError:
@@ -159,7 +328,21 @@ class JobStore:
                 updated = JobRecord.model_validate(data).model_copy(deep=True)
             except ValidationError:
                 raise ValueError("Dati del lavoro non validi") from None
-            self._records[job_id] = updated
+            with self._connection:
+                self._connection.execute(
+                    """
+                    UPDATE jobs SET
+                        source_url = ?, source_title = ?, state = ?, progress = ?,
+                        message = ?, updated_at = ?, report_json = ?, error = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        updated.source_url, updated.source_title, updated.state.value,
+                        updated.progress, updated.message, updated.updated_at.isoformat(),
+                        updated.report.model_dump_json() if updated.report is not None else None,
+                        updated.error, str(updated.id),
+                    ),
+                )
             return updated.model_copy(deep=True)
 
 

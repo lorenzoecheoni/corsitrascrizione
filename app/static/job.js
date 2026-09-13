@@ -5,6 +5,7 @@
   const terminal = new Set(["completed", "failed", "cancelled"]);
   const report = document.getElementById("report-text");
   const pollError = document.getElementById("poll-error");
+  const deleteForm = document.getElementById("delete-report-form");
   let timer;
   let stopped = false;
   let generation = 0;
@@ -18,6 +19,7 @@
     error.textContent = data.error || "";
     error.hidden = !data.error;
     document.getElementById("cancel-form").hidden = terminal.has(data.state);
+    if (deleteForm) deleteForm.hidden = data.state !== "completed";
     if (data.state === "completed" && data.report_text) {
       report.textContent = data.report_text;
       document.getElementById("report-section").hidden = false;
@@ -66,6 +68,9 @@
     }
   });
   document.getElementById("print-report").addEventListener("click", () => window.print());
+  if (deleteForm) deleteForm.addEventListener("submit", event => {
+    if (!window.confirm(deleteForm.dataset.confirmDelete)) event.preventDefault();
+  });
   window.addEventListener("pagehide", () => { generation++; stopped = true; clearTimeout(timer); });
   window.addEventListener("pageshow", (event) => {
     if (event.persisted) {

@@ -1,4 +1,4 @@
-"""Authenticated HTTP interface over the current process's volatile jobs."""
+"""Authenticated HTTP interface over persistent report jobs."""
 
 from pathlib import Path
 from uuid import UUID
@@ -71,7 +71,7 @@ def get_job(request: Request, job_id: str) -> JobRecord:
     try:
         return request.app.state.store.get(UUID(job_id))
     except (KeyError, ValueError):
-        raise HTTPException(404, "Lavoro non trovato; potrebbe essere terminata la sessione del server") from None
+        raise HTTPException(404, "Lavoro non trovato") from None
 
 
 def _catalog_error_message(error: BunnyError) -> str:
@@ -122,7 +122,7 @@ def get_batch(request: Request, batch_id: str):
     try:
         return request.app.state.store.get_batch(UUID(batch_id))
     except (KeyError, ValueError):
-        raise HTTPException(404, "Gruppo di lavori non trovato; potrebbe essere terminata la sessione del server") from None
+        raise HTTPException(404, "Gruppo di lavori non trovato") from None
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -132,7 +132,8 @@ def home(request: Request) -> HTMLResponse:
     except BunnyError as exc:
         return templates.TemplateResponse(request, "home.html", {
             "catalog_error": _catalog_error_message(exc), "videos": [], "total_items": 0,
-            "total_duration": 0, "recent_jobs": request.app.state.store.list_recent(),
+            "total_duration": 0, "recent_jobs": request.app.state.store.list_uncompleted(),
+            "saved_reports": request.app.state.store.list_completed(),
             "fast_mode": request.app.state.assemblyai is not None,
         })
     return templates.TemplateResponse(request, "home.html", {
@@ -141,7 +142,8 @@ def home(request: Request) -> HTMLResponse:
         "collection_options": list(dict.fromkeys(video.collection_id for video in catalog.videos)),
         "total_items": catalog.total_items,
         "total_duration": sum(video.duration_seconds for video in catalog.videos),
-        "recent_jobs": request.app.state.store.list_recent(),
+        "recent_jobs": request.app.state.store.list_uncompleted(),
+        "saved_reports": request.app.state.store.list_completed(),
         "fast_mode": request.app.state.assemblyai is not None,
     })
 
@@ -196,6 +198,16 @@ def batch_page(request: Request, batch_id: str) -> HTMLResponse:
     batch = get_batch(request, batch_id)
     jobs = [request.app.state.store.get(job_id) for job_id in batch.job_ids]
     return templates.TemplateResponse(request, "batch.html", {"batch": batch, "jobs": jobs})
+
+
+@router.get("/api/batches/{batch_id}")
+def batch_status(request: Request, batch_id: str) -> dict:
+    batch = get_batch(request, batch_id)
+    jobs = [request.app.state.store.get(job_id) for job_id in batch.job_ids]
+    return {
+        "id": str(batch.id),
+        "jobs": [job.model_dump(mode="json", exclude={"report"}) for job in jobs],
+    }
 
 
 @router.post("/preview", response_class=HTMLResponse)
@@ -266,6 +278,18 @@ def cancel_job(request: Request, job_id: str) -> RedirectResponse:
     job = get_job(request, job_id)
     request.app.state.runner.cancel(job.id)
     return RedirectResponse(f"/jobs/{job.id}", status_code=303)
+
+
+@router.post("/jobs/{job_id}/delete")
+def delete_report(request: Request, job_id: str) -> RedirectResponse:
+    try:
+        parsed_id = UUID(job_id)
+        request.app.state.store.delete_completed(parsed_id)
+    except (KeyError, ValueError) as exc:
+        if isinstance(exc, KeyError):
+            raise HTTPException(404, "Report non trovato") from None
+        raise HTTPException(409, "Solo un report completato può essere eliminato") from None
+    return RedirectResponse("/", status_code=303)
 
 
 def export_report(request: Request, job_id: str, extension: str) -> Response:

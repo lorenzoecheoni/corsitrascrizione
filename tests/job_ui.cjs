@@ -5,7 +5,7 @@ const source = fs.readFileSync('app/static/job.js', 'utf8');
 
 function setup(state = 'processing') {
   const elements = new Map(), events = {}, timers = new Map(), requests = [];
-  let nextTimer = 0, copied, printed = 0;
+  let nextTimer = 0, copied, printed = 0, confirmResult = false, confirmations = 0;
   const element = id => {
     if (!elements.has(id)) elements.set(id, {dataset: {}, textContent: '', hidden: false, handlers: {},
       addEventListener(type, callback) {this.handlers[type] = callback;}});
@@ -15,12 +15,14 @@ function setup(state = 'processing') {
   vm.runInNewContext(source, {
     document: {getElementById: element},
     navigator: {clipboard: {async writeText(text) {copied = text;}}},
-    window: {addEventListener(type, callback) {events[type] = callback;}, print() {printed++;}},
+    window: {addEventListener(type, callback) {events[type] = callback;}, print() {printed++;},
+      confirm() {confirmations++; return confirmResult;}},
     setTimeout(callback, ms) {assert.equal(ms, 3000); timers.set(++nextTimer, callback); return nextTimer;},
     clearTimeout(id) {timers.delete(id);},
     fetch(url, options) {return new Promise(resolve => requests.push({url, options, resolve}));},
   });
-  return {element, events, timers, requests, copied: () => copied, printed: () => printed};
+  return {element, events, timers, requests, copied: () => copied, printed: () => printed,
+    setConfirmResult(value) {confirmResult = value;}, confirmations: () => confirmations};
 }
 function fireTimer(ui) {
   const [id, callback] = ui.timers.entries().next().value;
@@ -56,6 +58,14 @@ async function flush() {await new Promise(resolve => setImmediate(resolve));}
   assert.equal(ui.copied(), '<script>literal text</script>');
   ui.element('print-report').handlers.click();
   assert.equal(ui.printed(), 1);
+  const deleteEvent = {prevented: false, preventDefault() {this.prevented = true;}};
+  ui.element('delete-report-form').handlers.submit(deleteEvent);
+  assert.equal(deleteEvent.prevented, true, 'Deletion stops when the team does not confirm');
+  ui.setConfirmResult(true);
+  const confirmedDelete = {prevented: false, preventDefault() {this.prevented = true;}};
+  ui.element('delete-report-form').handlers.submit(confirmedDelete);
+  assert.equal(confirmedDelete.prevented, false, 'Confirmed deletion may submit');
+  assert.equal(ui.confirmations(), 2);
   for (const state of ['completed', 'failed', 'cancelled']) assert.equal(setup(state).timers.size, 0);
   console.log('PASS: BFCache stale response isolation, single timer, terminal stop, literal rendering, copy, print');
 })().catch(error => {console.error(error); process.exitCode = 1;});

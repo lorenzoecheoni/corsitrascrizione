@@ -22,6 +22,8 @@ button:disabled { cursor: not-allowed; opacity: .6; }
 .secondary:hover { background: #edf2f8; color: #142033; }
 .text-button { min-height: auto; padding: .5rem; border: 0; background: transparent; color: #f7f9fc; }
 .text-button:hover { background: #173052; color: #fff; }
+.danger { border-color: #972a2f; background: #fff; color: #972a2f; }
+.danger:hover { background: #fff0f0; color: #741d22; }
 :focus-visible { outline: 3px solid #ffb1a9; outline-offset: 3px; }
 
 .site-header {
@@ -78,7 +80,13 @@ input:not([type="checkbox"]), select {
 .selection-bar { position: sticky; z-index: 2; bottom: 1rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .8rem .9rem .8rem 1.1rem; border: 1px solid #b7c5d5; border-radius: 18px; background: #081525; box-shadow: 0 18px 38px rgb(8 21 37 / 24%); color: #f7f9fc; }
 .selection-bar p { margin: 0; }
 .selection-bar button { flex: none; }
-.recent-jobs { margin-top: 2rem; }
+.saved-reports, .recent-jobs { margin-top: 2rem; }
+.section-heading { display: flex; align-items: end; justify-content: space-between; gap: 1rem; }
+.report-archive-list { display: grid; gap: .8rem; margin: 0; padding: 0; list-style: none; }
+.report-archive-list li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-bottom: .8rem; border-bottom: 1px solid #e3e9f1; }
+.report-archive-list li:last-child { padding-bottom: 0; border-bottom: 0; }
+.report-archive-list p { margin: .25rem 0 0; }
+.compact-actions { display: flex; flex-wrap: wrap; gap: .8rem; }
 .job-list, .selection-list { display: grid; gap: .75rem; margin: 0; padding: 0; list-style: none; }
 .job-list li, .selection-list li { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding-bottom: .75rem; border-bottom: 1px solid #e3e9f1; }
 .job-list li:last-child, .selection-list li:last-child { padding-bottom: 0; border-bottom: 0; }
@@ -111,7 +119,8 @@ pre { overflow-wrap: anywhere; padding: clamp(1rem, 3vw, 1.5rem); border-radius:
   .catalog-control-actions { display: grid !important; grid-template-columns: 1fr; }
   .catalog-control-actions > * { width: 100%; }
   .selection-bar button, .actions > *, .confirmation-card form button { width: 100%; }
-  .job-list li, .selection-list li { align-items: flex-start; flex-direction: column; gap: .25rem; }
+  .job-list li, .selection-list li, .report-archive-list li { align-items: flex-start; flex-direction: column; gap: .25rem; }
+  .section-heading { align-items: flex-start; flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

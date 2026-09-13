@@ -17,7 +17,7 @@
           <button type="submit" class="secondary">Annulla</button>
         </form>
         <p class="muted">Puoi chiudere questa pagina senza interrompere il lavoro e riaprirla dallo stesso link.
-          Stato e report sono disponibili solo durante il processo corrente del server.</p>
+          Quando è completato, il report resta disponibile nell’archivio.</p>
         <noscript>Aggiorna la pagina per seguire l’elaborazione.</noscript>
       </section>
       <section id="report-section" {% if not report_text %}hidden{% endif %} aria-label="Report completo">
@@ -26,6 +26,12 @@
           <a class="button secondary" href="/jobs/{{ job.id }}/report.md">Download Markdown</a>
           <a class="button secondary" href="/jobs/{{ job.id }}/report.txt">Download TXT</a>
           <button type="button" id="print-report" class="secondary">Stampa / Salva PDF</button>
+          <form id="delete-report-form" method="post" action="/jobs/{{ job.id }}/delete"
+                data-confirm-delete="Eliminare definitivamente questo report? Questa operazione non elimina il video da Bunny."
+                {% if job.state.value != 'completed' %}hidden{% endif %}>
+            <input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}">
+            <button type="submit" class="danger">Elimina report</button>
+          </form>
         </div>
         <p id="copy-status" role="status" class="no-print"></p>
         <pre id="report-text">{{ report_text }}</pre>

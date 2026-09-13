@@ -117,6 +117,30 @@ def test_dashboard_renders_catalog_totals_and_recent_jobs_without_source_url(cli
     assert 'action="/selections/preview"' in response.text
 
 
+def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    store = client.app.state.store
+    completed = store.create("completed-source", source_title="Report salvato")
+    store.update(completed.id, state=JobState.PROCESSING)
+    store.update(completed.id, state=JobState.COMPLETED, report=report)
+    failed = store.create("failed-source", source_title="Lavoro fallito")
+    store.update(failed.id, state=JobState.PROCESSING)
+    store.update(failed.id, state=JobState.FAILED, error="Errore controllato")
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    archive = re.search(r'<section[^>]+aria-labelledby="saved-reports".*?</section>', response.text, re.S)[0]
+    recent = re.search(r'<section[^>]+aria-labelledby="recent-jobs".*?</section>', response.text, re.S)[0]
+    assert "Report salvati" in archive and "Report salvato" in archive
+    assert f'/jobs/{completed.id}' in archive
+    assert f'/jobs/{completed.id}/report.txt' in archive
+    assert f'/jobs/{completed.id}/report.md' in archive
+    assert "Lavoro fallito" not in archive
+    assert "Lavoro fallito" in recent
+    assert "Report salvato" not in recent
+
+
 def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(client):
     client.app.state.bunny.list_videos = lambda: catalog(
         catalog_video(VIDEO_ID, VIDEO_TITLE, 3600),
@@ -415,6 +439,32 @@ def test_missing_batch_is_404(client):
     assert client.get(f"/batches/{uuid4()}").status_code == 404
 
 
+def test_batch_status_api_preserves_order_and_excludes_private_fields(client):
+    batch, jobs = client.app.state.store.create_batch([
+        ("https://private.example/first?token=secret-one", "Primo"),
+        ("https://private.example/second?token=secret-two", "Secondo"),
+    ])
+    client.app.state.store.update(
+        jobs[0].id, state=JobState.PROCESSING, progress=37, message="Analisi",
+    )
+
+    response = client.get(f"/api/batches/{batch.id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == str(batch.id)
+    assert [job["id"] for job in payload["jobs"]] == [str(job.id) for job in jobs]
+    assert payload["jobs"][0]["progress"] == 37
+    serialized = response.text
+    assert "source_url" not in serialized
+    assert "report" not in serialized
+    assert "secret-one" not in serialized and "secret-two" not in serialized
+
+
+def test_missing_batch_status_api_is_404(client):
+    assert client.get(f"/api/batches/{uuid4()}").status_code == 404
+
+
 @pytest.mark.parametrize(("state", "message", "expected_progress"), [
     (JobState.COMPLETED, "Completato", 100),
     (JobState.FAILED, "Errore di elaborazione", 37),
@@ -472,3 +522,34 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         assert obsolete_section not in page.text
     for control in ("Download Markdown", "Download TXT", "Stampa / Salva PDF"):
         assert control in page.text
+    assert f'action="/jobs/{job.id}/delete"' in page.text
+    assert "non elimina il video da Bunny" in page.text
+
+
+def test_completed_report_can_be_deleted_without_calling_bunny(client):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    store = client.app.state.store
+    job = store.create("canonical-source", source_title="Da eliminare")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    client.app.state.bunny.get_metadata = lambda _: (_ for _ in ()).throw(
+        AssertionError("Deleting a local report must not call Bunny")
+    )
+
+    response = client.post(f"/jobs/{job.id}/delete", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
+    assert client.get(f"/jobs/{job.id}").status_code == 404
+    assert client.get(f"/jobs/{job.id}/report.txt").status_code == 404
+
+
+def test_report_deletion_rejects_missing_noncompleted_and_invalid_csrf(client):
+    queued = client.app.state.store.create("queued")
+
+    assert client.post(f"/jobs/{queued.id}/delete").status_code == 409
+    assert client.app.state.store.get(queued.id).state == JobState.QUEUED
+    assert client.post(f"/jobs/{uuid4()}/delete").status_code == 404
+    assert client.post(
+        f"/jobs/{queued.id}/delete", headers={"X-CSRF-Token": ""},
+    ).status_code == 403

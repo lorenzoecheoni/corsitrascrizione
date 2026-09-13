@@ -85,6 +85,30 @@
     </aside>
   </form>
   {% endif %}
+  <section class="saved-reports panel" aria-labelledby="saved-reports">
+    <div class="section-heading">
+      <div><p class="eyebrow">Archivio</p><h2 id="saved-reports">Report salvati</h2></div>
+      {% if saved_reports %}<p class="catalog-total">{{ saved_reports|length }} disponibili</p>{% endif %}
+    </div>
+    {% if saved_reports %}
+    <ul class="report-archive-list">
+      {% for job in saved_reports %}
+      <li>
+        <div>
+          <a href="/jobs/{{ job.id }}">{{ job.source_title or (job.report.title if job.report else 'Report video') }}</a>
+          <p class="video-meta">Completato {{ job.updated_at.strftime('%d/%m/%Y alle %H:%M') }}</p>
+        </div>
+        <div class="compact-actions">
+          <a href="/jobs/{{ job.id }}/report.txt">TXT</a>
+          <a href="/jobs/{{ job.id }}/report.md">Markdown</a>
+        </div>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p>Nessun report salvato.</p>
+    {% endif %}
+  </section>
   <section class="recent-jobs panel" aria-labelledby="recent-jobs">
     <h2 id="recent-jobs">Lavori recenti</h2>
     {% if recent_jobs %}
@@ -94,7 +118,7 @@
       {% endfor %}
     </ul>
     {% else %}
-    <p>Nessun lavoro recente.</p>
+    <p>Nessun lavoro in corso o non completato.</p>
     {% endif %}
   </section>
 {% endblock %}

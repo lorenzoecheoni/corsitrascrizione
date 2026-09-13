@@ -559,6 +559,23 @@ def test_report_deletion_rejects_missing_noncompleted_and_invalid_csrf(client):
     assert client.post(f"/jobs/{queued.id}/delete").status_code == 409
     assert client.app.state.store.get(queued.id).state == JobState.QUEUED
     assert client.post(f"/jobs/{uuid4()}/delete").status_code == 404
+    assert client.post("/jobs/not-a-uuid/delete").status_code == 404
     assert client.post(
         f"/jobs/{queued.id}/delete", headers={"X-CSRF-Token": ""},
     ).status_code == 403
+
+
+def test_completed_job_without_readable_report_still_exposes_delete_action(client):
+    store = client.app.state.store
+    job = store.create("canonical-source", source_title="Non leggibile")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED)
+
+    page = client.get(f"/jobs/{job.id}")
+
+    status_panel = re.search(
+        r'<section class="panel no-print" aria-label="Stato del lavoro">(.*?)</section>',
+        page.text,
+        re.S,
+    )[1]
+    assert f'action="/jobs/{job.id}/delete"' in status_panel

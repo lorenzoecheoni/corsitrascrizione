@@ -284,10 +284,13 @@ def cancel_job(request: Request, job_id: str) -> RedirectResponse:
 def delete_report(request: Request, job_id: str) -> RedirectResponse:
     try:
         parsed_id = UUID(job_id)
+    except ValueError:
+        raise HTTPException(404, "Report non trovato") from None
+    try:
         request.app.state.store.delete_completed(parsed_id)
-    except (KeyError, ValueError) as exc:
-        if isinstance(exc, KeyError):
-            raise HTTPException(404, "Report non trovato") from None
+    except KeyError:
+        raise HTTPException(404, "Report non trovato") from None
+    except ValueError:
         raise HTTPException(409, "Solo un report completato può essere eliminato") from None
     return RedirectResponse("/", status_code=303)
 

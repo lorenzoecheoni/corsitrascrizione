@@ -111,6 +111,7 @@ input:not([type="checkbox"]), select {
 .summary-list dd { margin: .2rem 0 0; font-weight: 800; }
 progress { width: 100%; height: 1.25rem; margin-bottom: 1rem; accent-color: #a92e32; }
 #job-error { color: #972a2f; }
+.delete-report-control { margin: 1rem 0; }
 .actions { display: flex; flex-wrap: wrap; gap: .65rem; margin-top: 1.5rem; }
 pre { overflow-wrap: anywhere; padding: clamp(1rem, 3vw, 1.5rem); border-radius: 18px; background: #fff; font: inherit; line-height: 1.7; white-space: pre-wrap; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }

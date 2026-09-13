@@ -17,6 +17,7 @@ from app.auth import SESSION_COOKIE, session_is_valid
 from app.bunny import BunnyClient
 from app.config import Settings
 from app.course_store import CourseStore
+from app.courses import CourseConfirmationStore
 from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient
 from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
@@ -119,6 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
     app.state.confirmations = ConfirmationStore()
+    app.state.course_confirmations = CourseConfirmationStore()
     app.state.session_key = secrets.token_bytes(32)
 
     @app.exception_handler(RequestValidationError)

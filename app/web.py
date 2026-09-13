@@ -24,6 +24,8 @@ from app.bunny import (
     read_metadata,
 )
 from app.costs import estimate_cost
+from app.courses import CourseAssemblyError, build_intermediate_report, sign_course_selection
+from app.inventory import InventoryError, propose_matches
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
@@ -125,6 +127,13 @@ def get_batch(request: Request, batch_id: str):
         raise HTTPException(404, "Gruppo di lavori non trovato") from None
 
 
+def get_course(request: Request, course_id: str):
+    try:
+        return request.app.state.course_store.get_course(course_id)
+    except KeyError:
+        raise HTTPException(404, "Corso non trovato") from None
+
+
 @router.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
     try:
@@ -146,6 +155,138 @@ def home(request: Request) -> HTMLResponse:
         "saved_reports": request.app.state.store.list_completed(),
         "fast_mode": request.app.state.assemblyai is not None,
     })
+
+
+@router.post("/inventory/sync")
+def sync_inventory(request: Request) -> RedirectResponse:
+    try:
+        courses = request.app.state.inventory.fetch()
+        catalog = request.app.state.bunny.list_videos()
+        proposals = propose_matches(
+            courses,
+            catalog.videos,
+            threshold=request.app.state.settings.inventory_match_threshold,
+            margin=request.app.state.settings.inventory_match_margin,
+        )
+        request.app.state.course_store.sync_inventory(courses)
+        request.app.state.course_store.replace_proposals(proposals)
+    except (InventoryError, BunnyError):
+        raise HTTPException(503, "Impossibile sincronizzare l'inventario; riprova più tardi") from None
+    return RedirectResponse("/inventory", status_code=303)
+
+
+@router.post("/courses/{course_id}/videos")
+def confirm_course_videos(
+    request: Request, course_id: str, video_ids: list[str] = Form(default=[]),
+) -> RedirectResponse:
+    parsed = _canonical_video_ids(video_ids)
+    get_course(request, course_id)
+    try:
+        request.app.state.course_store.confirm_videos(course_id, parsed)
+    except (KeyError, ValueError):
+        raise _selection_error() from None
+    return RedirectResponse(f"/courses/{course_id}", status_code=303)
+
+
+@router.get("/courses/{course_id}/analysis-preview", response_class=HTMLResponse)
+def course_analysis_preview(request: Request, course_id: str) -> HTMLResponse:
+    course = get_course(request, course_id)
+    if not course.video_confermati:
+        raise HTTPException(409, "Conferma prima i video del corso")
+    metadata = _read_selected_metadata(request, course.video_confermati)
+    total_duration = sum(video.duration_seconds for video in metadata)
+    return templates.TemplateResponse(request, "course_analysis_preview.html", {
+        "course": course,
+        "videos": metadata,
+        "total_duration": total_duration,
+        "cost": estimate_cost(
+            total_duration, 0, transcription_provider=_transcription_provider(request),
+        ),
+        "confirmation": sign_course_selection(
+            course.id, course.video_confermati, request.app.state.confirmation_key,
+        ),
+    })
+
+
+@router.post("/courses/{course_id}/analyze")
+def start_course_analysis(
+    request: Request, course_id: str, confirmation: str = Form(""),
+) -> RedirectResponse:
+    def create(token_course_id: str, video_ids: list[UUID]) -> tuple[UUID, list[UUID]]:
+        if token_course_id != course_id:
+            raise ValueError
+        course = get_course(request, course_id)
+        if course.video_confermati != video_ids:
+            raise ValueError
+        metadata = _read_selected_metadata(request, video_ids)
+        library_id = request.app.state.settings.bunny_library_id
+        batch, jobs = request.app.state.store.create_batch([
+            (f"https://iframe.mediadelivery.net/embed/{library_id}/{video_id}", item.title)
+            for video_id, item in zip(video_ids, metadata, strict=True)
+        ])
+        request.app.state.course_store.attach_run(
+            course_id, batch.id, [job.id for job in jobs]
+        )
+        return batch.id, [job.id for job in jobs]
+
+    try:
+        token_course_id, batch_id, job_ids = request.app.state.course_confirmations.create_once(
+            confirmation, request.app.state.confirmation_key, create,
+        )
+        if token_course_id != course_id:
+            raise ValueError
+    except (ValueError, KeyError):
+        raise HTTPException(422, "Conferma corso non valida o scaduta; ripetere l'anteprima") from None
+    for job_id in job_ids:
+        try:
+            request.app.state.runner.submit(job_id)
+        except Exception:
+            request.app.state.runner.cancel(job_id)
+    return RedirectResponse(f"/courses/{course_id}", status_code=303)
+
+
+def _refresh_course_report(request: Request, course):
+    if course.intermediate is not None or not course.job_ids:
+        return course, None
+    jobs = [request.app.state.store.get(job_id) for job_id in course.job_ids]
+    if all(job.state == JobState.COMPLETED and job.report is not None for job in jobs):
+        try:
+            report = build_intermediate_report(course, jobs)
+            request.app.state.course_store.save_intermediate(course.id, report)
+            return request.app.state.course_store.get_course(course.id), None
+        except CourseAssemblyError:
+            return course, "I video devono essere rianalizzati per creare il report Academy"
+    return course, None
+
+
+@router.get("/api/courses/{course_id}")
+def course_status(request: Request, course_id: str) -> dict:
+    course, assembly_error = _refresh_course_report(request, get_course(request, course_id))
+    jobs = [request.app.state.store.get(job_id) for job_id in course.job_ids]
+    if assembly_error:
+        state = "da_rianalizzare"
+    elif any(job.state == JobState.FAILED for job in jobs):
+        state = "fallito"
+    elif any(job.state == JobState.CANCELLED for job in jobs):
+        state = "annullato"
+    else:
+        state = course.stato
+    return {
+        "id": course.id,
+        "stato": state,
+        "messaggio": assembly_error,
+        "intermedio_disponibile": course.intermediate is not None,
+        "academy_disponibile": course.academy_json is not None,
+        "jobs": [
+            {
+                "id": str(job.id),
+                "state": job.state.value,
+                "progress": job.progress,
+                "message": job.message,
+            }
+            for job in jobs
+        ],
+    }
 
 
 @router.post("/selections/preview", response_class=HTMLResponse)

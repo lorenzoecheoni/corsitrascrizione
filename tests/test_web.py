@@ -20,8 +20,9 @@ from app.bunny import (
 )
 from app.config import Settings
 from app.jobs import JobState
+from app.inventory import InventoryCourse
 from app.main import create_app
-from app.models import AcademyReport
+from app.models import AcademyReport, Intervention
 from app.pipeline import AnalysisPipeline
 from app.selection import sign_selection
 
@@ -579,3 +580,82 @@ def test_completed_job_without_readable_report_still_exposes_delete_action(clien
         re.S,
     )[1]
     assert f'action="/jobs/{job.id}/delete"' in status_panel
+
+
+def inventory_course():
+    return InventoryCourse(
+        id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+        titolo="Corso di prova", relatori_attesi=[], materiali=[], link="bunny",
+        colonna_link="D", guid_esplicito=None,
+    )
+
+
+def course_report():
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.duration_seconds = 3600
+    report.bunny_title = VIDEO_TITLE
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=3600, tipo="intervento",
+        relatori=["Marco Rossi"], titolo="Corso di prova",
+        sintesi="Il relatore sviluppa il tema del corso.",
+        punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+    )]
+    return report
+
+
+def prepare_course(client):
+    client.app.state.course_store.sync_inventory([inventory_course()])
+    client.app.state.course_store.confirm_videos("0:2", [UUID(VIDEO_ID)])
+
+
+def test_course_preview_and_start_are_bound_to_confirmed_order(client):
+    prepare_course(client)
+    submitted = []
+    client.app.state.runner.submit = submitted.append
+
+    preview = client.get("/courses/0:2/analysis-preview")
+    token = extract_hidden(preview.text, "confirmation")
+    started = client.post(
+        "/courses/0:2/analyze", data={"confirmation": token}, follow_redirects=False,
+    )
+
+    assert preview.status_code == 200
+    assert "L'analisi a pagamento parte solo dopo questa conferma" in preview.text
+    assert started.status_code == 303
+    assert started.headers["location"] == "/courses/0:2"
+    record = client.app.state.course_store.get_course("0:2")
+    assert len(record.job_ids) == len(submitted) == 1
+    assert record.batch_id is not None
+
+
+def test_course_start_rejects_stale_video_association(client):
+    prepare_course(client)
+    token = extract_hidden(client.get("/courses/0:2/analysis-preview").text, "confirmation")
+    client.app.state.course_store.confirm_videos("0:2", [UUID(OTHER_VIDEO_ID)])
+
+    response = client.post("/courses/0:2/analyze", data={"confirmation": token})
+
+    assert response.status_code == 422
+    assert client.app.state.course_store.get_course("0:2").job_ids == []
+
+
+def test_course_status_assembles_one_intermediate_report_and_hides_report_bodies(client):
+    prepare_course(client)
+    client.app.state.runner.submit = lambda _job_id: None
+    token = extract_hidden(client.get("/courses/0:2/analysis-preview").text, "confirmation")
+    client.post("/courses/0:2/analyze", data={"confirmation": token})
+    record = client.app.state.course_store.get_course("0:2")
+    job_id = record.job_ids[0]
+    client.app.state.store.update(job_id, state=JobState.PROCESSING)
+    client.app.state.store.update(job_id, state=JobState.COMPLETED, report=course_report())
+
+    response = client.get("/api/courses/0:2")
+
+    assert response.status_code == 200
+    assert response.json()["stato"] == "da_verificare"
+    assert response.json()["intermedio_disponibile"] is True
+    saved = client.app.state.course_store.get_course("0:2").intermediate
+    assert saved.video[0].guid == VIDEO_ID
+    assert "report" not in response.text
+    assert "source_url" not in response.text
+    assert "iframe.mediadelivery.net" not in response.text

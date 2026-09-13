@@ -44,7 +44,11 @@ class CourseRecord(ReportModel):
         if self.academy_json is not None:
             return "pronto_academy"
         if self.intermediate is not None:
-            return "verificato" if self.intermediate.stato in {"verificato", "confermato"} else "da_verificare"
+            return (
+                "pronto_generazione"
+                if self.intermediate.stato in {"verificato", "confermato"}
+                else "da_verificare"
+            )
         if self.batch_id is not None:
             return "in_elaborazione"
         if self.video_confermati:
@@ -222,6 +226,18 @@ class CourseStore:
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._connection:
+            run = self._connection.execute(
+                "SELECT intermediate_json FROM course_runs WHERE course_id = ?", (course_id,)
+            ).fetchone()
+            if run is None:
+                raise KeyError(course_id)
+            if not run["intermediate_json"]:
+                raise ValueError("Il report intermedio deve essere verificato")
+            source = IntermediateCourseReport.model_validate_json(run["intermediate_json"])
+            if source.stato not in {"verificato", "confermato"}:
+                raise ValueError("Il report intermedio deve essere verificato")
+            if any(item.livello == "critico" for item in source.verifiche_richieste):
+                raise ValueError("Le verifiche critiche bloccano il JSON Academy")
             cursor = self._connection.execute(
                 """
                 UPDATE course_runs SET academy_json = ?, contract_version = ?,

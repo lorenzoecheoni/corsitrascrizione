@@ -9,6 +9,8 @@ from fastapi import APIRouter, Body, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from app.academy import AcademyGenerationError
+from app.academy_prompt import CONTRACT_VERSION, PROMPT_VERSION
 from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
 from app.bunny import (
     BunnyAuthError,
@@ -25,7 +27,7 @@ from app.bunny import (
 )
 from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report, sign_course_selection
-from app.course_models import IntermediateCourseReport, format_hms
+from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
 from app.inventory import InventoryError, propose_matches
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
@@ -194,7 +196,9 @@ def inventory_page(request: Request) -> HTMLResponse:
         "video_by_id": video_by_id,
         "catalog_error": catalog_error,
         "review_count": sum(course.stato == "da_verificare" for course in courses),
-        "ready_count": sum(course.stato == "pronto_academy" for course in courses),
+        "ready_count": sum(
+            course.stato in {"pronto_generazione", "pronto_academy"} for course in courses
+        ),
     })
 
 
@@ -459,6 +463,28 @@ def confirm_course_report(request: Request, course_id: str) -> RedirectResponse:
     return RedirectResponse(f"/courses/{course_id}/review", status_code=303)
 
 
+@router.post("/courses/{course_id}/generate-academy")
+def generate_academy_import(request: Request, course_id: str) -> RedirectResponse:
+    course = get_course(request, course_id)
+    if course.intermediate is None:
+        raise HTTPException(409, "Il report intermedio non è disponibile")
+    if course.intermediate.stato not in {"verificato", "confermato"}:
+        raise HTTPException(409, "Conferma il report prima di generare il JSON Academy")
+    if any(item.livello == "critico" for item in course.intermediate.verifiche_richieste):
+        raise HTTPException(409, "Risolvi le verifiche critiche prima della generazione")
+    try:
+        result = request.app.state.academy_generator.generate(course.intermediate)
+        data = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+        request.app.state.course_store.save_academy(
+            course_id, data, CONTRACT_VERSION, PROMPT_VERSION,
+        )
+    except AcademyGenerationError as exc:
+        raise HTTPException(503, str(exc)) from None
+    except (ValidationError, ValueError):
+        raise HTTPException(422, "Il JSON Academy generato non rispetta il contratto") from None
+    return RedirectResponse(f"/courses/{course_id}/review", status_code=303)
+
+
 @router.get("/courses/{course_id}/report-intermedio.json")
 def download_intermediate(request: Request, course_id: str) -> Response:
     course = get_course(request, course_id)
@@ -472,6 +498,25 @@ def download_intermediate(request: Request, course_id: str) -> Response:
         media_type="application/json",
         headers={
             "Content-Disposition": f'attachment; filename="report-intermedio-{course_id.replace(":", "-")}.json"'
+        },
+    )
+
+
+@router.get("/courses/{course_id}/import-academy.json")
+def download_academy_import(request: Request, course_id: str) -> Response:
+    course = get_course(request, course_id)
+    if course.academy_json is None:
+        raise HTTPException(409, "Il JSON Academy non è ancora disponibile")
+    try:
+        report = AcademyImport.model_validate(course.academy_json)
+    except ValidationError:
+        raise HTTPException(409, "Il JSON Academy salvato non è valido") from None
+    return Response(
+        report.model_dump_json(indent=2, by_alias=True, exclude_none=True),
+        media_type="application/json",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="import-academy-{course_id.replace(":", "-")}.json"'
         },
     )
 

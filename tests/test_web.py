@@ -19,7 +19,7 @@ from app.bunny import (
     BunnyVideoMetadata,
 )
 from app.config import Settings
-from app.course_models import IntermediateCourseReport
+from app.course_models import AcademyImport, IntermediateCourseReport
 from app.jobs import JobState
 from app.inventory import InventoryCourse
 from app.main import create_app
@@ -703,6 +703,44 @@ def seed_intermediate(client, *, critical=False):
     client.app.state.course_store.save_intermediate("0:2", intermediate_report(critical=critical))
 
 
+def academy_result():
+    question = {
+        "testo": "Qual è un principio del corso?",
+        "risposte": [
+            {"testo": "La risposta corretta", "corretta": True},
+            {"testo": "Distrattore uno"}, {"testo": "Distrattore due"},
+            {"testo": "Distrattore tre"},
+        ],
+        "spiegazione": "La risposta è documentata nel contenuto.",
+    }
+    return AcademyImport.model_validate({
+        "versione": 1,
+        "corso": {
+            "titolo": "Corso di prova", "sottotitolo": "Sottotitolo del corso",
+            "area": "Governance", "prezzo": 97,
+            "presentazione": "Primo paragrafo.\n\nSecondo paragrafo.\n\nTerzo paragrafo.",
+            "competenze": ["Comprendere", "Valutare", "Distinguere", "Applicare", "Riconoscere"],
+            "profili": ["Commercialisti | Che assistono le imprese."],
+        },
+        "relatori": [{"nome": "Marco Rossi"}],
+        "video": [{
+            "chiave": "v1", "sorgente": "bunny", "guid": VIDEO_ID,
+            "durata_secondi": 3600, "titolo": VIDEO_TITLE,
+        }],
+        "moduli": [{
+            "titolo": "Modulo 1 · Fondamenti", "lezioni": [
+                {"titolo": "Prima lezione", "video": "v1", "inizio": "0:00:00",
+                 "fine": "0:10:00", "relatori": ["Marco Rossi"],
+                 "descrizione": "Prima riga.\nSeconda riga.", "hero": True, "anteprima": True},
+                {"titolo": "Seconda lezione", "video": "v1", "inizio": "0:10:00",
+                 "fine": "0:20:00", "relatori": ["Marco Rossi"],
+                 "descrizione": "Prima riga.\nSeconda riga."},
+                {"titolo": "Verifica", "tipo": "quiz", "domande": [question] * 3},
+            ],
+        }],
+    })
+
+
 def test_inventory_page_groups_workflow_states_in_sheet_order(client):
     client.app.state.course_store.sync_inventory([
         inventory_course(),
@@ -808,11 +846,51 @@ def test_critical_verification_blocks_confirmation_then_valid_report_confirms(cl
     assert client.app.state.course_store.get_course("0:2").intermediate.stato == "verificato"
 
 
+def test_verified_report_generates_persists_and_downloads_academy_json(client):
+    seed_intermediate(client)
+    source = intermediate_report().model_copy(update={"stato": "verificato"})
+    client.app.state.course_store.confirm_intermediate("0:2", source)
+
+    calls = []
+    client.app.state.academy_generator = type("FakeGenerator", (), {
+        "generate": lambda self, report: calls.append(report) or academy_result(),
+    })()
+
+    generated = client.post("/courses/0:2/generate-academy", follow_redirects=False)
+    download = client.get("/courses/0:2/import-academy.json")
+    page = client.get("/courses/0:2/review")
+
+    assert generated.status_code == 303
+    assert generated.headers["location"] == "/courses/0:2/review"
+    assert len(calls) == 1 and calls[0].stato == "verificato"
+    assert download.status_code == 200
+    assert download.json()["corso"]["prezzo"] == 97
+    assert "attachment" in download.headers["content-disposition"]
+    assert "Scarica JSON Academy" in page.text
+    saved = client.app.state.course_store.get_course("0:2")
+    assert (saved.contract_version, saved.prompt_version) == (1, 1)
+
+
+def test_academy_generation_is_blocked_before_report_confirmation(client):
+    seed_intermediate(client)
+    calls = []
+    client.app.state.academy_generator = type("FakeGenerator", (), {
+        "generate": lambda self, report: calls.append(report) or academy_result(),
+    })()
+
+    response = client.post("/courses/0:2/generate-academy")
+
+    assert response.status_code == 409
+    assert calls == []
+    assert client.app.state.course_store.get_course("0:2").academy_json is None
+
+
 @pytest.mark.parametrize("method,path", [
     ("post", "/inventory/sync"),
     ("post", "/courses/0:2/match"),
     ("put", "/api/courses/0:2/report"),
     ("post", "/courses/0:2/confirm"),
+    ("post", "/courses/0:2/generate-academy"),
 ])
 def test_inventory_and_review_mutations_require_csrf(client, method, path):
     response = getattr(client, method)(path, headers={"X-CSRF-Token": ""})

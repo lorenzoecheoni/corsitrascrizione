@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
+from app.academy import AcademyGenerator
 from app.analysis import OpenAIAnalyzer
 from app.assemblyai import AssemblyAITranscriber
 from app.auth import SESSION_COOKIE, session_is_valid
@@ -44,6 +45,7 @@ class Services:
     runner: SingleWorkerRunner
     inventory: InventoryClient
     course_store: CourseStore
+    academy_generator: AcademyGenerator
 
 
 def build_services(settings: Settings) -> Services:
@@ -75,9 +77,10 @@ def build_services(settings: Settings) -> Services:
         service_account_json=settings.google_service_account_json,
     )
     course_store = CourseStore(settings.database_path)
+    academy_generator = AcademyGenerator(openai)
     return Services(
         bunny, media, openai, transcriber, analyzer, assemblyai, pipeline,
-        store, runner, inventory, course_store,
+        store, runner, inventory, course_store, academy_generator,
     )
 
 
@@ -117,6 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.runner = services.runner
     app.state.inventory = services.inventory
     app.state.course_store = services.course_store
+    app.state.academy_generator = services.academy_generator
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
     app.state.confirmations = ConfirmationStore()

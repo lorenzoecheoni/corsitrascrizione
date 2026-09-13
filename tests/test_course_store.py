@@ -1,5 +1,7 @@
 from uuid import UUID
 
+import pytest
+
 from app.course_models import IntermediateCourseReport
 from app.course_store import CourseStore
 from app.inventory import InventoryCourse, MatchProposal
@@ -105,3 +107,16 @@ def test_store_persists_jobs_intermediate_confirmation_and_academy_versions(tmp_
         assert (record.contract_version, record.prompt_version) == (1, 1)
     finally:
         reopened.close()
+
+
+def test_store_refuses_academy_output_until_intermediate_is_verified(tmp_path):
+    store = CourseStore(tmp_path / "courses.sqlite3")
+    store.sync_inventory([course()])
+    store.attach_run("0:2", UUID(int=1), [UUID(int=2)])
+    store.save_intermediate("0:2", intermediate_json())
+
+    with pytest.raises(ValueError, match="verificato"):
+        store.save_academy("0:2", {"versione": 1}, 1, 1)
+
+    assert store.get_course("0:2").academy_json is None
+    store.close()

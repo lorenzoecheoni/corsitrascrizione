@@ -27,5 +27,12 @@
     {% endfor %}
     <div class="review-actions"><p id="review-status" role="status" aria-live="polite"></p><button type="submit">Salva correzioni</button></div>
   </form>
-  <form class="actions" action="/courses/{{ course.id }}/confirm" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button type="submit" {% if report.verifiche_richieste|selectattr('livello', 'equalto', 'critico')|list %}disabled{% endif %}>Conferma report per l'Academy</button></form>
+  <div class="actions">
+    {% if report.stato not in ['verificato', 'confermato'] %}
+    <form action="/courses/{{ course.id }}/confirm" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button type="submit" {% if report.verifiche_richieste|selectattr('livello', 'equalto', 'critico')|list %}disabled{% endif %}>Conferma report per l'Academy</button></form>
+    {% else %}
+    <form action="/courses/{{ course.id }}/generate-academy" method="post"><input type="hidden" name="csrf_token" value="{{ request.app.state.csrf_token }}"><button type="submit">Genera JSON Academy</button></form>
+    {% endif %}
+    {% if course.academy_json %}<a class="button secondary" href="/courses/{{ course.id }}/import-academy.json">Scarica JSON Academy</a>{% endif %}
+  </div>
 {% endblock %}

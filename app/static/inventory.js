@@ -8,7 +8,7 @@
     let filter = 'all';
     const matchesState = state => filter === 'all' ||
       (filter === 'review' && ['proposta', 'da_verificare', 'non_abbinato'].includes(state)) ||
-      (filter === 'ready' && state === 'pronto_academy');
+      (filter === 'ready' && ['pronto_generazione', 'pronto_academy'].includes(state));
     const update = () => {
       const query = (search?.value || '').trim().toLocaleLowerCase('it');
       let visible = 0;

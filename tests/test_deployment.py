@@ -146,7 +146,7 @@ def test_container_accepts_valid_csrf_with_nonstandard_origin(container_proxy, p
         headers = {"X-Forwarded-Proto": "https", "Origin": "https://reports.example"}
         response = browser.post("/login", data=data, headers=headers, follow_redirects=False)
         assert response.status_code == 303
-        assert response.headers["location"] == "/"
+        assert response.headers["location"] == "/inventory"
         assert "Secure" in response.headers["set-cookie"]
         headers["Cookie"] = f"{SESSION_COOKIE}={response.cookies[SESSION_COOKIE]}"
         headers["Origin"] = "https://attacker.example"

@@ -62,7 +62,7 @@ class IntermediateSpeaker(ReportModel):
     ruolo: str | None = None
     organizzazione: str | None = None
     confidenza: UnitConfidence
-    origine_nome: list[Literal["audio", "slide", "inventario", "metadata"]] = Field(
+    origine_nome: list[Literal["audio", "slide", "inventario", "metadata", "revisione"]] = Field(
         min_length=1
     )
 

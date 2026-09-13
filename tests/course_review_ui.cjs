@@ -16,6 +16,7 @@ const row = {
 };
 const form = {dataset: {}, handlers: {}, addEventListener(type, callback) {this.handlers[type] = callback;}};
 const status = {textContent: '', className: ''};
+const speakerList = {value: 'Mario Rossi | Commercialista | Studio Rossi\nAnna Bianchi\nLaura Neri | Avvocata | Studio Neri'};
 const data = {textContent: JSON.stringify({
   versione: 1, stato: 'da_verificare', corso: {titolo: 'Corso', sinossi_corso: 'Sintesi'},
   relatori: [{nome: 'Mario Rossi', confidenza: .9, origine_nome: ['audio']},
@@ -29,7 +30,7 @@ const requests = [];
 
 vm.runInNewContext(source, {
   document: {
-    getElementById(id) { return {'course-review-form': form, 'course-report-data': data, 'review-status': status}[id] || null; },
+    getElementById(id) { return {'course-review-form': form, 'course-report-data': data, 'review-status': status, 'course-speaker-list': speakerList}[id] || null; },
     querySelectorAll(selector) { return selector === '[data-intervention-row]' ? [row] : []; },
   },
   fetch(url, options) { requests.push({url, options}); return Promise.resolve({ok: true, json: async () => ({ok: true})}); },
@@ -46,6 +47,9 @@ async function flush() { await new Promise(resolve => setImmediate(resolve)); }
   const payload = JSON.parse(requests[0].options.body);
   assert.equal(payload.video[0].interventi[0].titolo, '<script>letterale</script>');
   assert.deepEqual(payload.video[0].interventi[0].relatori, ['Mario Rossi', 'Anna Bianchi']);
+  assert.equal(payload.relatori[0].ruolo, 'Commercialista');
+  assert.equal(payload.relatori[0].organizzazione, 'Studio Rossi');
+  assert.deepEqual(payload.relatori[2].origine_nome, ['revisione']);
   assert.deepEqual(payload.video[0].interventi[0].punti_chiave, ['Uno', 'Due', 'Tre']);
   assert.equal(requests[0].options.headers['X-CSRF-Token'], undefined, 'Token comes from form dataset only when present');
   assert.match(status.textContent, /salvate/i);

@@ -2,6 +2,7 @@
   const form = document.getElementById('course-review-form');
   const source = document.getElementById('course-report-data');
   const status = document.getElementById('review-status');
+  const speakerList = document.getElementById('course-speaker-list');
   if (!form || !source || !status) return;
   let report;
   try { report = JSON.parse(source.textContent); } catch (_) { return; }
@@ -10,6 +11,22 @@
     return match ? Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) : null;
   };
   const collect = () => {
+    if (speakerList) {
+      const existing = new Map(report.relatori.map(speaker => [speaker.nome, speaker]));
+      report.relatori = speakerList.value.split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+        const [nome, ruolo = '', organizzazione = ''] = line.split('|').map(value => value.trim());
+        const previous = existing.get(nome);
+        const speaker = {
+          nome,
+          confidenza: previous?.confidenza ?? 1,
+          origine_nome: previous?.origine_nome ?? ['revisione'],
+        };
+        if (previous?.slug) speaker.slug = previous.slug;
+        if (ruolo) speaker.ruolo = ruolo;
+        if (organizzazione) speaker.organizzazione = organizzazione;
+        return speaker;
+      });
+    }
     [...document.querySelectorAll('[data-intervention-row]')].forEach(row => {
       const item = report.video[Number(row.dataset.videoIndex)].interventi[Number(row.dataset.interventionIndex)];
       const value = name => row.querySelector(`[data-field="${name}"]`).value;
@@ -50,8 +67,11 @@
         body: JSON.stringify(report),
       });
       if (!response.ok) throw new Error('save');
-      await response.json();
+      const result = await response.json();
       status.textContent = 'Correzioni salvate.';
+      if (result.verifiche_richieste === 0 && typeof window !== 'undefined' && window.location?.reload) {
+        setTimeout(() => window.location.reload(), 400);
+      }
     } catch (_) {
       status.textContent = 'Impossibile salvare: controlla tempi e campi.';
       status.className = 'form-error';

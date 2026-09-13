@@ -137,6 +137,7 @@ input:not([type="checkbox"]), select {
 .verification-panel .critico { color: #972a2f; }
 .review-actions { position: sticky; bottom: 1rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .85rem 1rem; border-radius: 14px; background: #081525; color: #fff; }
 .review-actions p { margin: 0; }
+.speaker-editor textarea { width: 100%; min-height: 7rem; }
 .slide-evidence { display: grid; gap: .5rem; }
 .slide-evidence p { margin: .2rem 0 0; }
 .confirmation-card { display: grid; max-width: 48rem; gap: 1.25rem; }

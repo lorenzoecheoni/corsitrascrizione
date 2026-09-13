@@ -213,6 +213,15 @@ def test_generic_speaker_labels_are_omitted_from_intervention():
     assert item.relatori == ["Mario Rossi"]
 
 
+def test_human_review_is_a_supported_speaker_name_origin():
+    data = source_report().model_dump(mode="json", by_alias=True)
+    data["relatori"][0]["origine_nome"] = ["revisione"]
+
+    report = IntermediateCourseReport.model_validate(data)
+
+    assert report.relatori[0].origine_nome == ["revisione"]
+
+
 def test_intermediate_video_requires_complete_adjacent_coverage():
     data = source_report().model_dump(mode="json", by_alias=True)
     data["video"][0]["interventi"][1]["inizio"] = "0:10:01"

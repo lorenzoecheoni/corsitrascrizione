@@ -7,6 +7,12 @@
   {% if report.verifiche_richieste %}<section class="panel verification-panel"><h2>Verifiche richieste</h2><ul>{% for item in report.verifiche_richieste %}<li class="{{ item.livello }}"><strong>{{ item.codice }}</strong> — {{ item.messaggio }}</li>{% endfor %}</ul></section>{% endif %}
   <script id="course-report-data" type="application/json">{{ report_data|tojson }}</script>
   <form id="course-review-form" data-csrf-token="{{ request.app.state.csrf_token }}" data-course-id="{{ course.id }}">
+    <section class="panel speaker-editor">
+      <label for="course-speaker-list"><strong>Relatori verificati</strong></label>
+      <p class="muted">Uno per riga: Nome e cognome | Ruolo | Organizzazione. Puoi aggiungere il nome mancante e poi assegnarlo agli interventi.</p>
+      <textarea id="course-speaker-list" data-speaker-list rows="{{ [report.relatori|length + 1, 4]|max }}">{% for speaker in report.relatori %}{{ speaker.nome }} | {{ speaker.ruolo or '' }} | {{ speaker.organizzazione or '' }}{% if not loop.last %}
+{% endif %}{% endfor %}</textarea>
+    </section>
     {% for video in report.video %}
     {% set video_index = loop.index0 %}
     <section class="review-video panel" data-video-duration="{{ video.durata_secondi }}">

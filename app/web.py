@@ -59,7 +59,7 @@ def login(request: Request, username: str = Form(""), password: str = Form("")) 
     if not credentials_are_valid(username, password, request.app.state.settings.app_password):
         return templates.TemplateResponse(request, "login.html", {"error": "Credenziali non valide"},
                                           status_code=401)
-    response = RedirectResponse("/", status_code=303)
+    response = RedirectResponse("/inventory", status_code=303)
     response.set_cookie(SESSION_COOKIE, issue_session(request.app.state.session_key),
                         max_age=SESSION_TTL_SECONDS, httponly=True, samesite="strict",
                         secure=secure_cookie(request), path="/")

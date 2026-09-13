@@ -808,6 +808,7 @@ def test_review_page_links_timestamps_to_streaming_player_and_downloads_json(cli
 
     assert page.status_code == 200
     assert 'data-intervention-row' in page.text
+    assert 'data-speaker-list' in page.text
     assert 'data-field="inizio"' in page.text
     assert f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}" in page.text
     assert "#t=0" in page.text
@@ -832,6 +833,26 @@ def test_review_api_validates_timeline_and_saves_literal_edits(client):
     saved = client.app.state.course_store.get_course("0:2").intermediate
     assert saved.video[0].interventi[0].titolo == "<script>testo letterale</script>"
     assert "<script>testo letterale</script>" not in client.get("/courses/0:2/review").text
+
+
+def test_review_api_can_resolve_an_unknown_speaker_with_a_human_verified_name(client):
+    seed_intermediate(client, critical=True)
+    payload = intermediate_report(critical=True).model_dump(
+        mode="json", by_alias=True, exclude_none=True,
+    )
+    payload["relatori"] = [{
+        "nome": "Maria Verdi", "ruolo": "Relatrice", "confidenza": 1,
+        "origine_nome": ["revisione"],
+    }]
+    payload["video"][0]["interventi"][0]["relatori"] = ["Maria Verdi"]
+
+    saved = client.put("/api/courses/0:2/report", json=payload)
+    confirmed = client.post("/courses/0:2/confirm", follow_redirects=False)
+
+    assert saved.status_code == 200
+    assert saved.json()["verifiche_richieste"] == 0
+    assert confirmed.status_code == 303
+    assert client.app.state.course_store.get_course("0:2").intermediate.relatori[0].nome == "Maria Verdi"
 
 
 def test_critical_verification_blocks_confirmation_then_valid_report_confirms(client):

@@ -3,6 +3,7 @@
 from pathlib import Path
 from uuid import UUID
 import hmac
+import json
 import time
 
 from fastapi import APIRouter, Body, Form, HTTPException, Request
@@ -30,7 +31,7 @@ from app.courses import CourseAssemblyError, build_intermediate_report, sign_cou
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
 from app.inventory import InventoryError, propose_matches
 from app.jobs import JobRecord, JobState
-from app.reporting import format_timestamp, render_markdown, render_text
+from app.reporting import build_video_report_payload, format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
 from pydantic import ValidationError
 
@@ -59,7 +60,7 @@ def login(request: Request, username: str = Form(""), password: str = Form("")) 
     if not credentials_are_valid(username, password, request.app.state.settings.app_password):
         return templates.TemplateResponse(request, "login.html", {"error": "Credenziali non valide"},
                                           status_code=401)
-    response = RedirectResponse("/inventory", status_code=303)
+    response = RedirectResponse("/", status_code=303)
     response.set_cookie(SESSION_COOKIE, issue_session(request.app.state.session_key),
                         max_age=SESSION_TTL_SECONDS, httponly=True, samesite="strict",
                         secure=secure_cookie(request), path="/")
@@ -181,25 +182,9 @@ def sync_inventory(request: Request) -> RedirectResponse:
 
 
 @router.get("/inventory", response_class=HTMLResponse)
-def inventory_page(request: Request) -> HTMLResponse:
-    courses = request.app.state.course_store.list_courses()
-    try:
-        catalog = request.app.state.bunny.list_videos()
-        videos = catalog.videos
-        catalog_error = None
-    except BunnyError as exc:
-        videos = []
-        catalog_error = _catalog_error_message(exc)
-    video_by_id = {str(video.video_id): video for video in videos}
-    return templates.TemplateResponse(request, "inventory.html", {
-        "courses": courses,
-        "video_by_id": video_by_id,
-        "catalog_error": catalog_error,
-        "review_count": sum(course.stato == "da_verificare" for course in courses),
-        "ready_count": sum(
-            course.stato in {"pronto_generazione", "pronto_academy"} for course in courses
-        ),
-    })
+def inventory_page(request: Request) -> RedirectResponse:
+    """Keep old bookmarks safe while returning users to the per-video workflow."""
+    return RedirectResponse("/", status_code=303)
 
 
 @router.post("/courses/{course_id}/match")
@@ -686,3 +671,25 @@ def markdown_report(request: Request, job_id: str) -> Response:
 @router.get("/jobs/{job_id}/report.txt")
 def text_report(request: Request, job_id: str) -> Response:
     return export_report(request, job_id, "txt")
+
+
+@router.get("/jobs/{job_id}/report.json")
+def json_report(request: Request, job_id: str) -> Response:
+    job = get_job(request, job_id)
+    if job.state != JobState.COMPLETED or job.report is None:
+        raise HTTPException(409, "Il report non è ancora disponibile")
+    settings = request.app.state.settings
+    try:
+        reference = parse_bunny_url(
+            job.source_url,
+            expected_library_id=settings.bunny_library_id,
+            cdn_hostname=settings.bunny_cdn_hostname,
+        )
+    except BunnyUrlError:
+        raise HTTPException(409, "Il report non contiene un riferimento Bunny valido") from None
+    payload = build_video_report_payload(job.report, reference.video_id)
+    return Response(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="report-{job.id}.json"'},
+    )

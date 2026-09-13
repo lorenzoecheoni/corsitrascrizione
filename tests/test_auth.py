@@ -64,7 +64,7 @@ def test_html_login_issues_session_and_unlocks_home(client: TestClient) -> None:
     response = login(client)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/inventory"
+    assert response.headers["location"] == "/"
     assert f"{SESSION_COOKIE}=" in response.headers["set-cookie"]
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "SameSite=strict" in response.headers["set-cookie"]
@@ -148,7 +148,7 @@ def test_exact_origin_and_valid_csrf_override_in_app_cross_site_hint(client: Tes
     }, follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/inventory"
+    assert response.headers["location"] == "/"
 
 
 def test_login_accepts_correct_credentials_without_origin_or_csrf(client: TestClient) -> None:
@@ -157,7 +157,7 @@ def test_login_accepts_correct_credentials_without_origin_or_csrf(client: TestCl
     }, headers={"Sec-Fetch-Site": "cross-site"}, follow_redirects=False)
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/inventory"
+    assert response.headers["location"] == "/"
     assert f"{SESSION_COOKIE}=" in response.headers["set-cookie"]
 
 

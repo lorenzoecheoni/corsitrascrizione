@@ -32,10 +32,6 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `ASSEMBLYAI_REGION` | `eu` (predefinito) per endpoint europeo, oppure `global` |
 | `APP_PASSWORD` | Password lunga e casuale condivisa esclusivamente con il team |
 | `DATABASE_PATH` | File SQLite dei report; in produzione Railway usare `/data/bunny-video-report.sqlite3` su volume persistente |
-| `GOOGLE_SHEET_ID` | ID dell'inventario corsi; è già impostato sul foglio Assoholding |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Opzionale: credenziale JSON su una riga, necessaria soltanto per scrivere il link confermato nel foglio |
-| `INVENTORY_MATCH_THRESHOLD` | Confidenza minima proposta automatica, predefinita `0.88` |
-| `INVENTORY_MATCH_MARGIN` | Distacco minimo dalla seconda proposta, predefinito `0.08` |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 
@@ -45,7 +41,7 @@ La chiave Bunny deve avere permessi di sola lettura. L'applicazione legge i meta
 
 ## Catalogo, selezione e utilizzo
 
-Dopo il login, la dashboard legge il catalogo della sola libreria Bunny configurata a ogni apertura o aggiornamento. Non salva il catalogo: il limite operativo è **10.000 video per caricamento**; una libreria più grande richiede paginazione lato server prima di poter proseguire. Ricerca, filtri e selezione agiscono nel browser sui dati visualizzati. Il controllo `Schede / Elenco` cambia la densità del catalogo e ricorda la preferenza nel browser.
+Dopo il login si apre direttamente il catalogo della sola libreria Bunny configurata. Ogni video è un lavoro autonomo: non viene abbinato a corsi, inventari o fogli esterni. La dashboard rilegge il catalogo a ogni apertura o aggiornamento e non lo salva: il limite operativo è **10.000 video per caricamento**; una libreria più grande richiede paginazione lato server prima di poter proseguire. Ricerca, filtri e selezione agiscono nel browser sui dati visualizzati. Il controllo `Schede / Elenco` cambia la densità del catalogo e ricorda la preferenza nel browser.
 
 Selezionare da **1 a 50 video** e scegliere `Analizza selezionati`. Il server rilegge i metadati Bunny e mostra durata e stima totale prima di creare alcun lavoro. Solo `Conferma e genera report` accoda un lavoro indipendente per ogni video; più di 50 report richiedono gruppi successivi. La conferma firmata scade dopo dieci minuti. Un errore di un video non deve bloccare gli altri lavori del gruppo.
 
@@ -63,7 +59,9 @@ Con AssemblyAI attivo viene usato l'MP4 Bunny alla risoluzione minima disponibil
 
 I limiti configurabili sono `MEDIA_RUNTIME_SECONDS=21600` (sei ore per estrazione, incluse le operazioni locali), `MEDIA_INACTIVITY_SECONDS=120` e `MEDIA_MAX_WORKSPACE_BYTES=2000000000` (2 GB). Un controllo circa ogni 100 ms interrompe e raccoglie il processo quando supera uno dei limiti; brevi superamenti della soglia di spazio fra due controlli sono possibili. I file vengono rimossi prima del lavoro successivo. Gli errori temporanei Bunny hanno al massimo tre tentativi; un errore di accesso al playback protetto rigenera il token una sola volta, ripartendo in una directory pulita. Questa ripartenza può rileggere media già scaricato nel tentativo fallito.
 
-Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. La pagina del singolo lavoro e quella del gruppo aggiornano automaticamente stato e barre ogni tre secondi; `Aggiorna ora` resta disponibile come controllo manuale. Dal report si possono scaricare **Markdown (.md)** e **testo (.txt)**, copiare il contenuto oppure scegliere **Stampa / Salva PDF** nel browser. Il PDF usa la stampa browser, non un generatore server.
+Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. La pagina del singolo lavoro e quella del gruppo aggiornano automaticamente stato e barre ogni tre secondi; `Aggiorna ora` resta disponibile come controllo manuale. Ogni report può essere scaricato come **JSON (.json)**, **Markdown (.md)** o **testo (.txt)**, copiato oppure stampato/salvato come PDF dal browser.
+
+Il JSON è un documento fattuale relativo a un solo video. Contiene GUID Bunny, titoli, durata, lingua, sinossi, relatori con evidenze, timeline degli interventi (`inizio` e `fine` in `h:mm:ss`), e ogni cambio slide con titolo, testo principale fino a 500 caratteri e confidenza numerica. Non contiene transcript, video, audio, immagini, moduli, lezioni, quiz o scelte editoriali dell'Academy.
 
 Nomi e ruoli richiedono evidenze testuali o visive; in caso di dubbio compaiono etichette generiche e incertezze. L'identità dei relatori non viene dedotta biometricamente dalla voce. Il report richiede revisione umana prima dell'uso editoriale.
 
@@ -105,74 +103,6 @@ Le tariffe seguenti sono riferimenti indicativi, non un preventivo né una garan
 La stima iniziale della modalità veloce è **$0,29-$0,43 per ora di video**, più il piccolo traffico Bunny; il fallback OpenAI resta circa **$0,40-$0,70/ora**. Va ricalibrata sul primo video reale usando usage API e traffico Bunny. Non è un preventivo: modello, numero di frame, retry, contenuti e tariffe possono cambiare il costo. Il traffico mostrato è una stima dai byte dei pacchetti di input FFmpeg con margine del 20%, non traffico di rete misurato. Le costanti iniziali sono in `app/costs.py`.
 
 Il report conserva separatamente titolo Bunny e titolo didattico suggerito. Nei download e nella pagina compaiono i contatori numerici restituiti da trascrizione e Responses per ogni tentativo, inclusi batch, retry e riparazioni quando disponibili. I contatori mancanti sono dichiarati; la stima usa quelli disponibili e aggiunge una quota da durata quando non è possibile calcolare un tentativo. Non sostituisce la fattura. Il traffico di un tentativo FFmpeg fallito non è misurabile dalla sintesi finale ed è escluso dalla stima di banda.
-
-## Inventario corsi e import Academy
-
-La pagina **Inventario** è l'area operativa principale per preparare i corsi. La
-sincronizzazione è sempre esplicita: legge, nell'ordine, i fogli `Formazione`,
-`Corsi premium - Master` e `Corsi Premium` tramite l'esportazione CSV pubblica di
-Google Sheets. La posizione della riga è l'ordine cronologico; ogni riga rimane
-un corso separato, compresi i Master. La lettura non richiede credenziali Google
-né un abbonamento aggiuntivo.
-
-Il matching con Bunny normalizza titolo, accenti e prefissi comuni, ma propone
-un video soltanto quando il punteggio supera `INVENTORY_MATCH_THRESHOLD` ed è
-separato dalla seconda scelta di almeno `INVENTORY_MATCH_MARGIN`. La proposta
-non viene mai confermata automaticamente. È possibile scegliere e ordinare più
-video per lo stesso corso; la sequenza confermata diventa `v1`, `v2` e così via.
-Una nuova sincronizzazione aggiorna i dati del foglio, conserva gli abbinamenti
-già confermati e, in caso di errore remoto, lascia disponibile l'ultima copia
-valida.
-
-Il pulsante per scrivere un link nel foglio è un'azione separata e vale per una
-sola cella della riga confermata. Per abilitarlo creare un service account Google,
-condividere il foglio con l'indirizzo del service account come **Editor** e
-impostare `GOOGLE_SERVICE_ACCOUNT_JSON` nel secret manager Railway. Se la
-variabile manca, lettura, matching, analisi e generazione restano disponibili;
-fallisce soltanto la scrittura esplicita. Non inserire il JSON in file versionati,
-log o schermate diagnostiche.
-
-Il flusso di un corso è:
-
-1. sincronizzare l'inventario e confermare i video nell'ordine corretto;
-2. controllare durata e stima prima di autorizzare l'analisi a pagamento;
-3. rivedere il report intermedio, correggendo relatori, tipi e timestamp;
-4. risolvere tutte le verifiche critiche e confermare il report;
-5. generare e scaricare il JSON Academy.
-
-Il report intermedio è fattuale: contiene una timeline continua di interventi
-con `inizio`, `fine`, `tipo`, relatori, titolo, sintesi, punti chiave e confidenza,
-oltre alle slide come evidenze separate. I tipi ammessi sono `intervento`,
-`saluti`, `logistica`, `domande`, `pausa` e `cambio_relatore`. Non contiene il
-transcript completo né file multimediali. I timestamp aprono direttamente il
-player Bunny per la verifica umana. Nomi generici come `Relatore 1` non entrano
-nel contratto: un intervento sostanziale senza identità certa crea una verifica
-critica e blocca la conferma.
-
-La generazione finale usa il contratto **versione 1** e il prompt editoriale
-**versione 1**, entrambi salvati insieme al JSON. Le lezioni derivano dagli
-interventi; le slide servono come prova per titoli, descrizioni e quiz, mai come
-lezioni automatiche. Ogni modulo contiene da 2 a 6 lezioni video e termina con
-un quiz di 3 domande. La hero coincide con un'unica anteprima rappresentativa.
-Il server rifiuta relatori, ruoli, organizzazioni, GUID o durate non presenti
-nella fonte verificata, controlla tempi, sovrapposizioni e descrizioni su due
-righe, e consente al modello un solo tentativo di riparazione. Le chiamate
-Responses usano output strutturato e `store=False`; un errore non modifica il
-report intermedio confermato.
-
-Il prezzo è calcolato localmente sui soli secondi inclusi nelle lezioni: fino a
-1 ora **€97**, fino a 2 ore **€147**, fino a 3 ore **€197**, fino a 4 ore
-**€247**. I crediti non vengono generati e possono essere aggiunti manualmente
-nell'Academy. I file disponibili per corso sono
-`report-intermedio-<id>.json` e `import-academy-<id>.json`.
-
-Inventario, abbinamenti, ordine video, report intermedi e JSON Academy sono
-salvati nello stesso SQLite persistente dei lavori. I vecchi report video
-restano leggibili; se non contengono la nuova timeline degli interventi devono
-essere rianalizzati prima di diventare un corso. Lo schema database è additivo:
-per un rollback applicativo mantenere il volume e tornare alla release precedente;
-prima di interventi manuali sul database creare una copia coerente del file
-SQLite e dei suoi file WAL/SHM a processo fermo.
 
 Suite offline, senza credenziali reali né accesso ai servizi (fornire FFmpeg e FFprobe nel `PATH`):
 

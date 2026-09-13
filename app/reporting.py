@@ -1,8 +1,79 @@
-"""Text-only renderers for Academy reports."""
+"""Structured and human-readable renderers for per-video reports."""
 
+from uuid import UUID
 import re
 
-from app.models import AcademyReport
+from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
+
+
+_CONFIDENCE_SCORE = {"alta": .95, "media": .65, "bassa": .35}
+
+
+def format_hms_timestamp(seconds: float) -> str:
+    """Format a report timestamp using the stable h:mm:ss interchange format."""
+    total_seconds = max(0, int(seconds + .5))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{remaining_seconds:02d}"
+
+
+def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
+    """Build the factual, one-video JSON interchange document."""
+    speakers = []
+    for speaker in report.speakers:
+        if GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name):
+            continue
+        item = {
+            "nome": speaker.display_name,
+            "confidenza": _CONFIDENCE_SCORE[speaker.confidence],
+            "evidenze": [
+                {
+                    "tipo": evidence.kind,
+                    **(
+                        {"inizio": format_hms_timestamp(evidence.timestamp_seconds)}
+                        if evidence.timestamp_seconds is not None else {}
+                    ),
+                    "nota": evidence.note,
+                }
+                for evidence in speaker.evidence
+            ],
+        }
+        if speaker.role:
+            item["ruolo"] = speaker.role
+        speakers.append(item)
+
+    video = {
+        "guid": str(guid),
+        "titolo_suggerito": report.title,
+        "durata_secondi": int(report.duration_seconds + .5),
+        "lingua": report.detected_language,
+        "sinossi": report.synopsis,
+    }
+    if report.bunny_title:
+        video["titolo_bunny"] = report.bunny_title
+
+    slides = []
+    for slide in report.slides:
+        item = {
+            "inizio": format_hms_timestamp(slide.timestamp_seconds),
+            "testo_principale": " · ".join(slide.visible_content)[:500],
+            "confidenza": _CONFIDENCE_SCORE[slide.confidence],
+        }
+        if slide.title:
+            item["titolo"] = slide.title
+        slides.append(item)
+
+    return {
+        "versione": 1,
+        "video": video,
+        "relatori": speakers,
+        "interventi": [
+            intervention.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for intervention in report.interventions
+        ],
+        "slide": slides,
+        "incertezze": report.uncertainties,
+    }
 
 
 def format_timestamp(seconds: float) -> str:

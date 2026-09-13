@@ -30,7 +30,8 @@ _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protect
           "timeout", "transport", "remote_response", "invalid_request", "unauthorized",
           "log_suppressed"}
 _ROUTES = {"/", "/jobs", "/jobs/{job_id}", "/api/jobs/{job_id}", "/jobs/{job_id}/cancel",
-           "/jobs/{job_id}/report.md", "/jobs/{job_id}/report.txt", "/static/{path:path}",
+           "/jobs/{job_id}/report.md", "/jobs/{job_id}/report.txt",
+           "/jobs/{job_id}/report.json", "/static/{path:path}",
            "/healthz", "unmatched"}
 _RECORD_FIELDS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
 _LOGGER_NAMES = {"root", "app.events", "httpx", "httpcore", "openai", "asyncio",

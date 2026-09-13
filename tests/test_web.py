@@ -117,6 +117,16 @@ def test_dashboard_renders_catalog_totals_and_recent_jobs_without_source_url(cli
     assert "bunny-secret" not in response.text
     assert 'name="video_ids"' in response.text
     assert 'action="/selections/preview"' in response.text
+    assert "Ogni video genera un report autonomo" in response.text
+    assert "Inventario corsi" not in response.text
+    assert 'href="/inventory"' not in response.text
+
+
+def test_obsolete_inventory_page_redirects_to_per_video_catalog(client):
+    response = client.get("/inventory", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/"
 
 
 def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
@@ -138,6 +148,7 @@ def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
     assert f'/jobs/{completed.id}' in archive
     assert f'/jobs/{completed.id}/report.txt' in archive
     assert f'/jobs/{completed.id}/report.md' in archive
+    assert f'/jobs/{completed.id}/report.json' in archive
     assert "Lavoro fallito" not in archive
     assert "Lavoro fallito" in recent
     assert "Report salvato" not in recent
@@ -500,7 +511,7 @@ def test_batch_refresh_shows_progress_and_terminal_transitions(client, state, me
 
 def test_exports_require_completion_and_queued_job_can_be_cancelled(client):
     job = client.app.state.store.create("https://private.example/source")
-    for extension in ("md", "txt"):
+    for extension in ("md", "txt", "json"):
         assert client.get(f"/jobs/{job.id}/report.{extension}").status_code == 409
     response = client.post(f"/jobs/{job.id}/cancel", follow_redirects=False)
     assert response.status_code == 303
@@ -511,7 +522,7 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
     report.title = "<script>alert('unsafe')</script>"
     store = client.app.state.store
-    job = store.create("https://private.example/source")
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
     store.update(job.id, state=JobState.PROCESSING)
     store.update(job.id, state=JobState.COMPLETED, report=report)
     for extension, mime in (("md", "text/markdown"), ("txt", "text/plain")):
@@ -524,6 +535,23 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
             assert section in response.text
         for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
             assert obsolete_section not in response.text
+    json_response = client.get(f"/jobs/{job.id}/report.json")
+    assert json_response.status_code == 200
+    assert json_response.headers["content-type"].startswith("application/json")
+    assert "attachment" in json_response.headers["content-disposition"]
+    payload = json_response.json()
+    assert payload["versione"] == 1
+    assert payload["video"]["guid"] == VIDEO_ID
+    assert payload["video"]["durata_secondi"] == 3720
+    assert payload["relatori"][0]["nome"] == "Giulia Bianchi"
+    assert "Relatore 2" not in [speaker["nome"] for speaker in payload["relatori"]]
+    assert payload["slide"][0] == {
+        "inizio": "0:01:35",
+        "titolo": "Agenda",
+        "testo_principale": "Obiettivi · Flusso di pubblicazione",
+        "confidenza": 0.95,
+    }
+    assert "transcript" not in json_response.text.lower()
     page = client.get(f"/jobs/{job.id}")
     assert "<script>alert('unsafe')</script>" not in page.text
     assert "&lt;script&gt;" in page.text
@@ -531,10 +559,36 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         assert section in page.text
     for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
         assert obsolete_section not in page.text
-    for control in ("Download Markdown", "Download TXT", "Stampa / Salva PDF"):
+    for control in ("Download JSON", "Download Markdown", "Download TXT", "Stampa / Salva PDF"):
         assert control in page.text
     assert f'action="/jobs/{job.id}/delete"' in page.text
     assert "non elimina il video da Bunny" in page.text
+
+
+def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.bunny_title = "Titolo Bunny originale"
+    report.interventions = [Intervention(
+        id="i001", start_seconds=125, end_seconds=905, tipo="intervento",
+        relatori=["Marco Rossi"], titolo="Assetti di governance",
+        sintesi="Il relatore illustra gli assetti di governance.",
+        punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
+    )]
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+
+    payload = client.get(f"/jobs/{job.id}/report.json").json()
+
+    assert payload["video"]["titolo_bunny"] == "Titolo Bunny originale"
+    assert payload["interventi"] == [{
+        "id": "i001", "inizio": "0:02:05", "fine": "0:15:05",
+        "tipo": "intervento", "relatori": ["Marco Rossi"],
+        "titolo": "Assetti di governance",
+        "sintesi": "Il relatore illustra gli assetti di governance.",
+        "punti_chiave": ["Organi", "Deleghe", "Controlli"], "confidenza": .92,
+    }]
 
 
 def test_completed_report_can_be_deleted_without_calling_bunny(client):
@@ -741,7 +795,7 @@ def academy_result():
     })
 
 
-def test_inventory_page_groups_workflow_states_in_sheet_order(client):
+def test_inventory_page_no_longer_exposes_course_matching(client):
     client.app.state.course_store.sync_inventory([
         inventory_course(),
         InventoryCourse(
@@ -754,13 +808,10 @@ def test_inventory_page_groups_workflow_states_in_sheet_order(client):
     response = client.get("/inventory")
 
     assert response.status_code == 200
-    assert "Inventario corsi" in response.text
-    assert "Da verificare" in response.text
-    assert "Pronti per l'Academy" in response.text
-    assert response.text.index("Corso di prova") < response.text.index("Secondo corso")
-    assert 'action="/inventory/sync"' in response.text
-    assert 'href="/"' in response.text and "Catalogo Bunny" in response.text
-    assert "inventory.js" in response.text
+    assert "Catalogo video" in response.text
+    assert "Inventario corsi" not in response.text
+    assert 'action="/inventory/sync"' not in response.text
+    assert "inventory.js" not in response.text
 
 
 def test_inventory_sync_saves_rows_and_proposals_without_writing_sheet(client):

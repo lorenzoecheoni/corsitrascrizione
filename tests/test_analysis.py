@@ -17,6 +17,7 @@ from app.analysis_chunks import ConsolidatedTextReport, WindowAnalysis
 from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
 from app.models import AcademyContent, ProviderUsage
+from app.prompts import REPAIR_PROMPT, WINDOW_PROMPT
 from app.transcription import TranscriptionResult, TranscriptSegment
 
 
@@ -661,10 +662,10 @@ def test_window_repairs_count_serialized_envelope_against_cap(size, should_repai
 def test_nonfinite_schema_failure_is_safe_and_not_semantically_repaired(inputs, content):
     inputs["frames"] = []
     content["duration_seconds"] = float("nan")
-    client = FakeClient(window_result(), content)
+    client = FakeClient(window_result(), content, content, content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
-    assert caught.value.code == "response" and len(client.calls) == 2
+    assert caught.value.code == "response" and len(client.calls) == 4
 
 
 def test_second_invalid_response_has_fixed_safe_error(inputs, content):
@@ -675,7 +676,7 @@ def test_second_invalid_response_has_fixed_safe_error(inputs, content):
         OpenAIAnalyzer(client).analyze(**inputs)
     assert caught.value.code == "response"
     assert "Giulia" not in str(caught.value)
-    assert len(client.calls) == 3
+    assert len(client.calls) == 4
 
 
 @pytest.mark.parametrize("status,attempts", [(429, 3), (503, 3), (401, 1), (400, 1), (409, 1)])
@@ -769,11 +770,11 @@ def test_actual_sdk_structured_parsing_contract(inputs, content, invalid_name, c
 @pytest.mark.parametrize("bad", [None, [], {}, {"speakers": [None]}])
 def test_malformed_outputs_are_sanitized(inputs, bad):
     inputs["frames"] = []
-    client = FakeClient(bad)
+    client = FakeClient(bad, bad, bad)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
     assert caught.value.code == "response"
-    assert len(client.calls) == 1
+    assert len(client.calls) == 3
 
 
 def test_missing_image_never_exposes_path_or_sends_partial_batch(inputs):
@@ -819,3 +820,31 @@ def test_output_limit_incomplete_window_retries_once_with_double_budget(inputs, 
     assert result.title == "Pubblicazione Academy"
     assert [call["max_output_tokens"] for call in client.calls] == [2000, 4000, 4000]
     assert result.usage.requests == 3
+
+
+def test_completed_response_without_parsed_json_retries_only_the_window(inputs, content):
+    inputs["frames"] = []
+    missing = lambda kwargs: SimpleNamespace(
+        status="completed", output_parsed=None,
+        usage=SimpleNamespace(input_tokens=20, output_tokens=10),
+    )
+    client = FakeClient(missing, window_result(), content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert result.title == "Pubblicazione Academy"
+    assert [call["max_output_tokens"] for call in client.calls] == [2000, 4000, 4000]
+
+
+def test_failed_window_repair_gets_one_fresh_final_attempt(inputs, content):
+    inputs["frames"] = []
+    invalid = window_result(segment_indexes=[0, 0])
+    client = FakeClient(invalid, invalid, window_result(), content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert result.title == "Pubblicazione Academy"
+    assert client.calls[0]["instructions"] == WINDOW_PROMPT
+    assert client.calls[1]["instructions"] == REPAIR_PROMPT
+    assert client.calls[2]["instructions"] == WINDOW_PROMPT
+    assert [call["max_output_tokens"] for call in client.calls[:3]] == [2000, 2000, 4000]

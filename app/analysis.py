@@ -295,6 +295,8 @@ class OpenAIAnalyzer:
         model: str = "gpt-5.6-luna",
         max_output_tokens: int = 4000,
     ) -> T:
+        original_payload = payload
+        original_instructions = instructions
         attempts = 0
         repair_used = False
         output_limit_retry_used = False
@@ -343,7 +345,9 @@ class OpenAIAnalyzer:
                 return response
 
             response = retry_remote(
-                request, retryable=lambda exc: isinstance(exc, AnalysisError) and exc.retryable,
+                request,
+                retryable=lambda exc: isinstance(exc, AnalysisError)
+                and (exc.retryable or exc.code == "response"),
                 attempts=3 - attempts, delay_for=_analysis_retry_delay,
                 cancellation_event=cancellation_event,
             )
@@ -378,11 +382,25 @@ class OpenAIAnalyzer:
                 result = text_format.model_validate(data)
                 errors = validate(result)
             except (ValueError, TypeError, AttributeError, KeyError):
+                if attempts < 3:
+                    payload = original_payload
+                    instructions = original_instructions
+                    current_max_output_tokens = max_output_tokens * 2
+                    output_limit_retry_used = True
+                    continue
                 raise AnalysisError("response", stage=stage) from None
             if not errors:
                 check_cancelled(cancellation_event)
                 return result
-            if repair_used or attempts >= 3:
+            if repair_used:
+                if attempts < 3:
+                    payload = original_payload
+                    instructions = original_instructions
+                    current_max_output_tokens = max_output_tokens * 2
+                    output_limit_retry_used = True
+                    continue
+                raise AnalysisError("response", stage=stage)
+            if attempts >= 3:
                 raise AnalysisError("response", stage=stage)
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)

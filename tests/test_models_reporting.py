@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
 from app.costs import estimate_cost
-from app.models import AcademyReport, SpeakerProfile
-from app.reporting import format_timestamp, render_markdown, render_text
+from app.models import AcademyReport, Intervention, SpeakerProfile
+from app.reporting import build_video_report_payload, format_timestamp, render_markdown, render_text
 
 
 def load_report() -> AcademyReport:
@@ -51,8 +52,6 @@ def test_markdown_and_text_are_exportable() -> None:
 
 
 def test_interventions_are_rendered_without_transcript_text() -> None:
-    from app.models import Intervention
-
     report = load_report()
     report.interventions = [Intervention(
         id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
@@ -67,6 +66,41 @@ def test_interventions_are_rendered_without_transcript_text() -> None:
     assert "00:00–10:00" in rendered
     assert "Assetti di governance" in rendered
     assert "TRASCRIZIONE" not in rendered
+
+
+def test_exports_merge_duplicate_speakers_and_correct_near_name_mentions() -> None:
+    report = load_report()
+    report.speakers = [
+        SpeakerProfile(
+            id="furio-1", display_name="Furio d'Andrea", role="Relatore",
+            confidence="alta", evidence=[{
+                "kind": "introduzione", "timestamp_seconds": 10,
+                "note": "Intervento di Fulvio D'Andrea sulla governance.",
+            }],
+        ),
+        SpeakerProfile(
+            id="furio-2", display_name="Furio d'Andrea", role="Relatore",
+            confidence="alta", evidence=[{
+                "kind": "slide", "timestamp_seconds": 20,
+                "note": "Titolo mostrato durante l'intervento.",
+            }],
+        ),
+    ]
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Furio d'Andrea"], titolo="Clausole antistallo",
+        sintesi="Fulvio D'Andrea illustra gli assetti di governance.",
+        punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
+    )]
+
+    payload = build_video_report_payload(report, UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438"))
+    markdown = render_markdown(report)
+
+    assert [speaker["nome"] for speaker in payload["relatori"]] == ["Furio d'Andrea"]
+    assert len(payload["relatori"][0]["evidenze"]) == 2
+    assert "Fulvio" not in json.dumps(payload, ensure_ascii=False)
+    assert "Fulvio" not in markdown
+    assert "Furio d'Andrea illustra" in payload["interventi"][0]["sintesi"]
 
 
 def test_speaker_rejects_personal_name_with_inference_only() -> None:

@@ -1,12 +1,84 @@
 """Structured and human-readable renderers for per-video reports."""
 
+from difflib import SequenceMatcher
 from uuid import UUID
 import re
+import unicodedata
 
-from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
+from app.models import AcademyReport, GENERIC_SPEAKER_LABEL, SpeakerProfile
 
 
 _CONFIDENCE_SCORE = {"alta": .95, "media": .65, "bassa": .35}
+_CONFIDENCE_RANK = {"bassa": 0, "media": 1, "alta": 2}
+
+
+def _name_key(value: str) -> str:
+    folded = "".join(
+        character for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[a-z]+", folded))
+
+
+def _name_pattern(value: str) -> re.Pattern[str] | None:
+    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)?", value)
+    if len(tokens) < 2:
+        return None
+    def token_pattern(token: str) -> str:
+        return r"['’]".join(re.escape(part) for part in re.split(r"['’]", token))
+
+    surname = r"\s+".join(
+        token_pattern(token) for token in tokens[1:]
+    )
+    return re.compile(rf"\b[A-Za-zÀ-ÖØ-öø-ÿ]+\s+{surname}\b", re.IGNORECASE)
+
+
+def _correct_near_name_mentions(value: str, canonical_names: list[str]) -> str:
+    """Correct only near-identical full names sharing the canonical surname."""
+    corrected = value
+    for canonical in canonical_names:
+        pattern = _name_pattern(canonical)
+        if pattern is None:
+            continue
+
+        def replace(match: re.Match[str]) -> str:
+            score = SequenceMatcher(None, _name_key(match.group()), _name_key(canonical)).ratio()
+            return canonical if score >= .82 else match.group()
+
+        corrected = pattern.sub(replace, corrected)
+    return corrected
+
+
+def _unique_speakers(report: AcademyReport) -> list[SpeakerProfile]:
+    canonical_names = list(dict.fromkeys(
+        speaker.display_name for speaker in report.speakers
+        if not GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name)
+    ))
+    merged: dict[str, SpeakerProfile] = {}
+    evidence_keys: dict[str, set[tuple[str, float | None, str]]] = {}
+    for source in report.speakers:
+        speaker = source.model_copy(deep=True)
+        for evidence in speaker.evidence:
+            evidence.note = _correct_near_name_mentions(evidence.note, canonical_names)
+        key = _name_key(speaker.display_name)
+        if key not in merged:
+            merged[key] = speaker
+            evidence_keys[key] = {
+                (evidence.kind, evidence.timestamp_seconds, evidence.note)
+                for evidence in speaker.evidence
+            }
+            continue
+        current = merged[key]
+        if _CONFIDENCE_RANK[speaker.confidence] > _CONFIDENCE_RANK[current.confidence]:
+            current.confidence = speaker.confidence
+        if speaker.role and (not current.role or current.role.casefold() == "relatore"):
+            current.role = speaker.role
+        for evidence in speaker.evidence:
+            evidence_key = (evidence.kind, evidence.timestamp_seconds, evidence.note)
+            if evidence_key not in evidence_keys[key]:
+                current.evidence.append(evidence)
+                evidence_keys[key].add(evidence_key)
+    return list(merged.values())
 
 
 def format_hms_timestamp(seconds: float) -> str:
@@ -19,8 +91,10 @@ def format_hms_timestamp(seconds: float) -> str:
 
 def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
     """Build the factual, one-video JSON interchange document."""
+    unique_speakers = _unique_speakers(report)
+    canonical_names = [speaker.display_name for speaker in unique_speakers]
     speakers = []
-    for speaker in report.speakers:
+    for speaker in unique_speakers:
         if GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name):
             continue
         item = {
@@ -33,7 +107,7 @@ def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
                         {"inizio": format_hms_timestamp(evidence.timestamp_seconds)}
                         if evidence.timestamp_seconds is not None else {}
                     ),
-                    "nota": evidence.note,
+                    "nota": _correct_near_name_mentions(evidence.note, canonical_names),
                 }
                 for evidence in speaker.evidence
             ],
@@ -44,35 +118,50 @@ def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
 
     video = {
         "guid": str(guid),
-        "titolo_suggerito": report.title,
+        "titolo_suggerito": _correct_near_name_mentions(report.title, canonical_names),
         "durata_secondi": int(report.duration_seconds + .5),
         "lingua": report.detected_language,
-        "sinossi": report.synopsis,
+        "sinossi": _correct_near_name_mentions(report.synopsis, canonical_names),
     }
     if report.bunny_title:
-        video["titolo_bunny"] = report.bunny_title
+        video["titolo_bunny"] = _correct_near_name_mentions(report.bunny_title, canonical_names)
 
     slides = []
     for slide in report.slides:
         item = {
             "inizio": format_hms_timestamp(slide.timestamp_seconds),
-            "testo_principale": " · ".join(slide.visible_content)[:500],
+            "testo_principale": _correct_near_name_mentions(
+                " · ".join(slide.visible_content), canonical_names
+            )[:500],
             "confidenza": _CONFIDENCE_SCORE[slide.confidence],
         }
         if slide.title:
-            item["titolo"] = slide.title
+            item["titolo"] = _correct_near_name_mentions(slide.title, canonical_names)
         slides.append(item)
+
+    interventions = []
+    for intervention in report.interventions:
+        item = intervention.model_dump(mode="json", by_alias=True, exclude_none=True)
+        item["relatori"] = [
+            _correct_near_name_mentions(name, canonical_names) for name in item["relatori"]
+        ]
+        for field in ("titolo", "sintesi"):
+            item[field] = _correct_near_name_mentions(item[field], canonical_names)
+        item["punti_chiave"] = [
+            _correct_near_name_mentions(point, canonical_names)
+            for point in item["punti_chiave"]
+        ]
+        interventions.append(item)
 
     return {
         "versione": 1,
         "video": video,
         "relatori": speakers,
-        "interventi": [
-            intervention.model_dump(mode="json", by_alias=True, exclude_none=True)
-            for intervention in report.interventions
-        ],
+        "interventi": interventions,
         "slide": slides,
-        "incertezze": report.uncertainties,
+        "incertezze": [
+            _correct_near_name_mentions(item, canonical_names) for item in report.uncertainties
+        ],
     }
 
 
@@ -92,19 +181,22 @@ def _csv(items: list[str]) -> str:
 
 def render_markdown(report: AcademyReport) -> str:
     """Render a stable, human-readable Markdown representation of a report."""
+    speakers = _unique_speakers(report)
+    canonical_names = [speaker.display_name for speaker in speakers]
+    corrected = lambda value: _correct_near_name_mentions(value, canonical_names)
     lines = [
-        f"# {report.title}",
+        f"# {corrected(report.title)}",
         "",
-        f"Titolo originale Bunny: {report.bunny_title or 'Non disponibile'}",
+        f"Titolo originale Bunny: {corrected(report.bunny_title) if report.bunny_title else 'Non disponibile'}",
         f"Durata: {format_timestamp(report.duration_seconds)}",
         f"Lingua rilevata: {report.detected_language}",
         "",
         "## Sinossi",
-        report.synopsis,
+        corrected(report.synopsis),
         "",
         "## Relatori",
     ]
-    for speaker in report.speakers:
+    for speaker in speakers:
         role = f" — {speaker.role}" if speaker.role else ""
         lines.append(f"- {speaker.display_name}{role} (confidenza: {speaker.confidence})")
         for evidence in speaker.evidence:
@@ -113,33 +205,38 @@ def render_markdown(report: AcademyReport) -> str:
                 if evidence.timestamp_seconds is not None
                 else ""
             )
-            lines.append(f"  - Evidenza{timestamp}: {evidence.note}")
+            lines.append(f"  - Evidenza{timestamp}: {corrected(evidence.note)}")
 
     if report.interventions:
         lines.extend(["", "## Interventi"])
         for intervention in report.interventions:
-            speakers = _csv(intervention.relatori) if intervention.relatori else "Da verificare"
+            intervention_speakers = (
+                _csv(intervention.relatori) if intervention.relatori else "Da verificare"
+            )
             lines.append(
                 f"- {format_timestamp(intervention.start_seconds)}–"
                 f"{format_timestamp(intervention.end_seconds)} · {intervention.tipo}: "
-                f"{intervention.titolo}"
+                f"{corrected(intervention.titolo)}"
             )
-            lines.append(f"  Relatori: {speakers}; confidenza: {intervention.confidenza:.2f}")
-            lines.append(f"  {intervention.sintesi}")
+            lines.append(
+                f"  Relatori: {intervention_speakers}; "
+                f"confidenza: {intervention.confidenza:.2f}"
+            )
+            lines.append(f"  {corrected(intervention.sintesi)}")
             for point in intervention.punti_chiave:
-                lines.append(f"  - {point}")
+                lines.append(f"  - {corrected(point)}")
 
     lines.extend(["", "## Slide"])
     for slide in report.slides:
-        title = slide.title or "Senza titolo"
-        content = f" — {_csv(slide.visible_content)}" if slide.visible_content else ""
+        title = corrected(slide.title) if slide.title else "Senza titolo"
+        content = f" — {corrected(_csv(slide.visible_content))}" if slide.visible_content else ""
         lines.append(
             f"- {format_timestamp(slide.timestamp_seconds)}: {title}{content} "
             f"(confidenza: {slide.confidence})"
         )
 
     lines.extend(["", "## Incertezze"])
-    lines.extend(f"- {uncertainty}" for uncertainty in report.uncertainties)
+    lines.extend(f"- {corrected(uncertainty)}" for uncertainty in report.uncertainties)
     lines.extend(
         [
             "",

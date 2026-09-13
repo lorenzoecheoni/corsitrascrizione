@@ -89,9 +89,22 @@ class FakeClient:
         return SimpleNamespace(output_parsed=outcome)
 
 
-def window_result():
-    return {"detected_language": "it", "synopsis_notes": ["Pubblicazione Academy"],
-            "speakers": [], "uncertainties": []}
+def window_result(segment_indexes=None, diarization_labels=None):
+    return {
+        "detected_language": "it",
+        "synopsis_notes": ["Pubblicazione Academy"],
+        "speakers": [],
+        "uncertainties": [],
+        "interventions": [{
+            "segment_indexes": [0] if segment_indexes is None else segment_indexes,
+            "tipo": "intervento",
+            "diarization_labels": ["chunk-0:A"] if diarization_labels is None else diarization_labels,
+            "titolo": "Pubblicazione Academy",
+            "sintesi": "Il relatore illustra il processo di pubblicazione.",
+            "punti_chiave": ["Preparazione", "Pubblicazione", "Controllo"],
+            "confidenza": 0.9,
+        }],
+    }
 
 
 def test_unnamed_moderator_role_reaches_consolidation_and_generic_report(inputs, content):
@@ -114,6 +127,27 @@ def test_unnamed_moderator_role_reaches_consolidation_and_generic_report(inputs,
     assert result.speakers[0].role == "Moderatrice"
 
 
+def test_supported_window_identity_is_attached_to_intervention(inputs, content):
+    inputs["frames"] = []
+    mapped = window_result()
+    mapped["speakers"] = [{
+        "diarization_labels": ["chunk-0:A"],
+        "display_name": "Giulia Bianchi",
+        "role": "Presentatrice",
+        "confidence": "alta",
+        "evidence": [{
+            "kind": "introduzione", "timestamp_seconds": 0,
+            "note": "Sono Giulia Bianchi e presento la sessione.",
+        }],
+    }]
+
+    result = OpenAIAnalyzer(FakeClient(mapped, content)).analyze(**inputs)
+
+    assert result.interventions[0].relatori == ["Giulia Bianchi"]
+    assert result.interventions[0].start_seconds == 0
+    assert result.interventions[-1].end_seconds == 90
+
+
 def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):
     inputs["metadata"].duration_seconds = 5760
     inputs["transcription"] = TranscriptionResult(
@@ -126,7 +160,14 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     inputs["frames"] = []
     content["duration_seconds"] = 5760
     def respond(call):
-        data = window_result() if call["text_format"] is WindowAnalysis else content
+        if call["text_format"] is WindowAnalysis:
+            segments = json.loads(call["input"])["segments"]
+            data = window_result(
+                [segment["segment_index"] for segment in segments],
+                list(dict.fromkeys(segment["diarization_label"] for segment in segments)),
+            )
+        else:
+            data = content
         if call["text_format"] is ConsolidatedTextReport:
             data = {key: value for key, value in data.items() if key != "slides"}
         return SimpleNamespace(output_parsed=data, usage=SimpleNamespace(input_tokens=10, output_tokens=2))
@@ -233,6 +274,7 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     payload = json.loads(client.calls[-1]["input"])
     assert "transcription" not in payload
     assert json.loads(client.calls[1]["input"])["segments"] == [{
+        "segment_index": 0,
         "start_seconds": 0.0,
         "end_seconds": 10.0,
         "diarization_label": "chunk-0:A",
@@ -249,24 +291,32 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
                for part in images)
 
 
-def test_fast_analysis_uses_one_visual_batch_and_one_final_text_request(inputs, content):
-    client = FakeClient(visual("slide", "camera_change", "uncertain"), content)
+def test_fast_analysis_uses_complete_window_path_for_globally_diarized_transcript(inputs, content):
+    client = FakeClient(
+        visual("slide", "camera_change", "uncertain"), window_result(), content
+    )
     progress = []
 
     result = OpenAIAnalyzer(client).analyze_fast(
         **inputs, progress_callback=lambda *event: progress.append(event),
     )
 
-    assert [call["text_format"] for call in client.calls] == [SlideBatchResult, ConsolidatedTextReport]
-    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini"]
+    assert [call["text_format"] for call in client.calls] == [
+        SlideBatchResult, WindowAnalysis, ConsolidatedTextReport,
+    ]
+    assert [call["model"] for call in client.calls] == [
+        "gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini",
+    ]
     assert all(call["store"] is False for call in client.calls)
-    payload = json.loads(client.calls[-1]["input"])
-    assert payload["detected_language"] == "und"
-    assert payload["segments"][0]["diarization_label"] == "chunk-0:A"
-    assert "transcription" not in payload
+    window_payload = json.loads(client.calls[1]["input"])
+    assert window_payload["segments"][0]["diarization_label"] == "chunk-0:A"
+    assert window_payload["segments"][0]["segment_index"] == 0
+    assert "transcription" not in json.loads(client.calls[-1]["input"])
     assert "data:image" not in client.calls[-1]["input"]
     assert [slide.timestamp_seconds for slide in result.slides] == [2]
-    assert result.usage.requests == 2
+    assert result.interventions[0].start_seconds == 0
+    assert result.interventions[-1].end_seconds == 90
+    assert result.usage.requests == 3
     assert progress == [("slides", 1, 1), ("transcript", 1, 1), ("consolidation", 0, 1)]
 
 
@@ -281,9 +331,12 @@ def test_fast_analysis_normalizes_unsupported_name_after_sdk_wire_validation(inp
     }]
 
     def sdk_validates_before_returning(call):
-        return SimpleNamespace(output_parsed=call["text_format"].model_validate(content))
+        data = window_result() if call["text_format"] is WindowAnalysis else content
+        return SimpleNamespace(output_parsed=call["text_format"].model_validate(data))
 
-    result = OpenAIAnalyzer(FakeClient(sdk_validates_before_returning)).analyze_fast(**inputs)
+    result = OpenAIAnalyzer(
+        FakeClient(sdk_validates_before_returning, sdk_validates_before_returning)
+    ).analyze_fast(**inputs)
 
     assert result.speakers[0].display_name == "Relatore 1"
     assert result.speakers[0].role is None
@@ -539,7 +592,7 @@ def test_oversized_final_repair_is_rejected_before_second_remote_call(inputs, co
     assert "PRIVATE_REPAIR_CONTENT" not in str(caught.value) + caplog.text + captured.out + captured.err
 
 
-@pytest.mark.parametrize("size, should_repair", [(11_800, True), (12_000, False)])
+@pytest.mark.parametrize("size, should_repair", [(11_400, True), (12_000, False)])
 def test_window_repairs_count_serialized_envelope_against_cap(size, should_repair):
     bad = window_result()
     # WindowAnalysis leaves language unbounded; token limits cannot bound its JSON.

@@ -6,18 +6,22 @@ transcript text.
 
 from collections.abc import Sequence
 import json
-from typing import Annotated
+from typing import Annotated, Mapping
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.bunny import BunnyVideoMetadata
 from app.models import (
     Confidence,
     Evidence,
     IDENTITY_EVIDENCE_KINDS,
+    GENERIC_INTERVENTION_SPEAKER,
+    Intervention,
+    InterventionKind,
     Nonnegative,
     ReportModel,
     SlideChange,
+    UnitConfidence,
 )
 from app.transcription import TranscriptionResult, TranscriptSegment
 
@@ -39,7 +43,17 @@ class TranscriptWindow(ReportModel):
     segments: list[TranscriptSegment]
 
     def to_payload(self) -> str:
-        return json.dumps(self.model_dump(mode="json"), ensure_ascii=False)
+        return json.dumps(
+            {
+                "start_seconds": self.start_seconds,
+                "end_seconds": self.end_seconds,
+                "segments": [
+                    {"segment_index": index, **segment.model_dump(mode="json")}
+                    for index, segment in enumerate(self.segments)
+                ],
+            },
+            ensure_ascii=False,
+        )
 
 
 class WindowEvidence(Evidence):
@@ -64,11 +78,32 @@ class WindowSpeaker(ReportModel):
         return [item.model_dump() if isinstance(item, Evidence) else item for item in value]
 
 
+class WindowInterventionDraft(ReportModel):
+    """AI-proposed grouping of complete, local transcript segment indexes."""
+
+    segment_indexes: list[Annotated[int, Field(ge=0, strict=True)]] = Field(min_length=1)
+    tipo: InterventionKind
+    diarization_labels: list[str] = Field(default_factory=list)
+    titolo: Annotated[str, Field(min_length=1, max_length=180)]
+    sintesi: Annotated[str, Field(min_length=1, max_length=600)]
+    punti_chiave: list[Annotated[str, Field(min_length=1, max_length=240)]] = Field(
+        default_factory=list, max_length=7
+    )
+    confidenza: UnitConfidence
+
+    @model_validator(mode="after")
+    def validate_key_points(self) -> "WindowInterventionDraft":
+        if self.tipo == "intervento" and not 3 <= len(self.punti_chiave) <= 7:
+            raise ValueError("un intervento richiede da 3 a 7 punti_chiave")
+        return self
+
+
 class WindowAnalysis(ReportModel):
     detected_language: str
     synopsis_notes: list[BoundedText] = Field(max_length=4)
     speakers: list[WindowSpeaker] = Field(max_length=8)
     uncertainties: list[BoundedText] = Field(default_factory=list, max_length=6)
+    interventions: list[WindowInterventionDraft] = Field(default_factory=list, max_length=80)
 
 
 class ConsolidatedSpeaker(ReportModel):
@@ -151,6 +186,133 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
     if current:
         windows.append(_window_for(current))
     return windows
+
+
+def _rounded_second(value: float) -> int:
+    return int(value + 0.5)
+
+
+def _speaker_names(labels: Sequence[str], mapping: Mapping[str, str]) -> list[str]:
+    names: list[str] = []
+    for label in labels:
+        name = mapping.get(label, "").strip()
+        if not name or GENERIC_INTERVENTION_SPEAKER.fullmatch(name) or name in names:
+            continue
+        names.append(name)
+    return names
+
+
+def materialize_interventions(
+    duration_seconds: float,
+    windows: Sequence[TranscriptWindow],
+    analyses: Sequence[WindowAnalysis],
+    speaker_names: Mapping[str, str],
+) -> list[Intervention]:
+    """Create a gap-free, one-second timeline from validated local partitions."""
+    duration = _rounded_second(duration_seconds)
+    if duration <= 0 or len(windows) != len(analyses):
+        raise ValueError("La partizione degli interventi non è valida")
+
+    groups: list[dict] = []
+    for window, analysis in zip(windows, analyses):
+        if not window.segments or not analysis.interventions:
+            raise ValueError("La partizione degli interventi deve includere ogni segmento")
+        flattened = [
+            segment_index
+            for draft in analysis.interventions
+            for segment_index in draft.segment_indexes
+        ]
+        if flattened != list(range(len(window.segments))):
+            raise ValueError("La partizione degli interventi deve essere ordinata, completa e univoca")
+        for draft in analysis.interventions:
+            selected = [window.segments[index] for index in draft.segment_indexes]
+            selected_labels = {segment.diarization_label for segment in selected}
+            if any(label not in selected_labels for label in draft.diarization_labels):
+                raise ValueError("La partizione contiene etichette vocali non appartenenti ai segmenti")
+            labels = draft.diarization_labels or list(
+                dict.fromkeys(segment.diarization_label for segment in selected)
+            )
+            groups.append(
+                {
+                    "start": max(0, _rounded_second(min(item.start_seconds for item in selected))),
+                    "end": min(duration, _rounded_second(max(item.end_seconds for item in selected))),
+                    "tipo": draft.tipo,
+                    "relatori": _speaker_names(labels, speaker_names),
+                    "titolo": draft.titolo,
+                    "sintesi": draft.sintesi,
+                    "punti_chiave": draft.punti_chiave,
+                    "confidenza": draft.confidenza,
+                }
+            )
+
+    groups.sort(key=lambda item: (item["start"], item["end"]))
+    for group in groups:
+        if group["end"] <= group["start"]:
+            group["end"] = min(duration, group["start"] + 1)
+        if group["end"] <= group["start"]:
+            raise ValueError("La partizione produce un intervallo vuoto")
+
+    # Diarization providers can overlap turns. Split the overlap at a stable
+    # second so the final course contract remains strictly adjacent.
+    for previous, current in zip(groups, groups[1:]):
+        if current["start"] < previous["end"]:
+            boundary = _rounded_second((previous["end"] + current["start"]) / 2)
+            lower = previous["start"] + 1
+            upper = current["end"] - 1
+            if lower > upper:
+                raise ValueError("La partizione contiene interventi sovrapposti non separabili")
+            boundary = max(lower, min(upper, boundary))
+            previous["end"] = boundary
+            current["start"] = boundary
+
+    materialized: list[dict] = []
+    cursor = 0
+    for group in groups:
+        if group["start"] > cursor:
+            materialized.append(
+                {
+                    "start": cursor,
+                    "end": group["start"],
+                    "tipo": "pausa",
+                    "relatori": [],
+                    "titolo": "Pausa o silenzio",
+                    "sintesi": "Intervallo senza parlato rilevato nella trascrizione.",
+                    "punti_chiave": [],
+                    "confidenza": 0.6,
+                }
+            )
+        if group["start"] < cursor:
+            raise ValueError("La partizione degli interventi non è cronologica")
+        materialized.append(group)
+        cursor = group["end"]
+    if cursor < duration:
+        materialized.append(
+            {
+                "start": cursor,
+                "end": duration,
+                "tipo": "pausa",
+                "relatori": [],
+                "titolo": "Pausa o silenzio",
+                "sintesi": "Intervallo senza parlato rilevato nella trascrizione.",
+                "punti_chiave": [],
+                "confidenza": 0.6,
+            }
+        )
+
+    return [
+        Intervention(
+            id=f"i{index:03d}",
+            start_seconds=item["start"],
+            end_seconds=item["end"],
+            tipo=item["tipo"],
+            relatori=item["relatori"],
+            titolo=item["titolo"],
+            sintesi=item["sintesi"],
+            punti_chiave=item["punti_chiave"],
+            confidenza=item["confidenza"],
+        )
+        for index, item in enumerate(materialized, start=1)
+    ]
 
 
 def _bounded_text(value: str | None) -> str | None:

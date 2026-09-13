@@ -14,17 +14,18 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
-    MAX_CONSOLIDATION_CHARS, MAX_FAST_REPORT_CHARS, MAX_WINDOW_CHARS,
+    MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS,
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
-    build_fast_report_payload, split_transcript_windows,
+    materialize_interventions, split_transcript_windows,
 )
 from app.media import FrameCandidate
 from app.models import (
     Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
-    ReportModel, SlideChange, AnalysisResult, ProviderUsage, Nonnegative,
+    GENERIC_INTERVENTION_SPEAKER, Intervention, ReportModel, SlideChange,
+    AnalysisResult, ProviderUsage, Nonnegative,
 )
 from app.prompts import (
-    CONSOLIDATION_PROMPT, FAST_REPORT_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT,
+    CONSOLIDATION_PROMPT, REPAIR_PROMPT, VISUAL_PROMPT, WINDOW_PROMPT,
 )
 from app.openai_limits import ProviderRateGate, parse_reset_seconds
 from app.retry import check_cancelled, retry_remote
@@ -175,6 +176,46 @@ def _content_errors(content: ConsolidatedTextReport, duration: float) -> list[st
     return errors
 
 
+def _window_errors(window, result: WindowAnalysis) -> list[str]:
+    indexes = [
+        segment_index
+        for intervention in result.interventions
+        for segment_index in intervention.segment_indexes
+    ]
+    expected = list(range(len(window.segments)))
+    errors: list[str] = []
+    if indexes != expected:
+        errors.append(
+            f"interventions deve partizionare in ordine ogni segment_index una volta: {expected}."
+        )
+    labels = {segment.diarization_label for segment in window.segments}
+    if any(
+        label not in labels
+        for intervention in result.interventions
+        for label in intervention.diarization_labels
+    ):
+        errors.append("diarization_labels deve usare soltanto etichette presenti nella finestra.")
+    return errors
+
+
+def _supported_window_speaker_names(
+    analyses: Sequence[WindowAnalysis],
+) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for analysis in analyses:
+        for speaker in analysis.speakers:
+            name = (speaker.display_name or "").strip()
+            supported = any(
+                item.kind in IDENTITY_EVIDENCE_KINDS and item.note.strip()
+                for item in speaker.evidence
+            )
+            if not name or not supported or GENERIC_INTERVENTION_SPEAKER.fullmatch(name):
+                continue
+            for label in speaker.diarization_labels:
+                mapping.setdefault(label, name)
+    return mapping
+
+
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -288,7 +329,8 @@ class OpenAIAnalyzer:
             analyses.append(self._structured(
                 text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
                 payload=window.to_payload(), prepare=lambda data: None,
-                validate=lambda result: [], cancellation_event=cancellation_event,
+                validate=lambda result, current=window: _window_errors(current, result),
+                cancellation_event=cancellation_event,
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
                 stage="window",
@@ -296,6 +338,15 @@ class OpenAIAnalyzer:
             if progress_callback is not None:
                 progress_callback("transcript", index, len(windows))
         check_cancelled(cancellation_event)
+        try:
+            interventions = materialize_interventions(
+                metadata.duration_seconds,
+                windows,
+                analyses,
+                _supported_window_speaker_names(analyses),
+            )
+        except ValueError:
+            raise AnalysisError("response", stage="window") from None
         try:
             payload = build_consolidation_payload(metadata, analyses, slides)
         except ValueError:
@@ -311,7 +362,9 @@ class OpenAIAnalyzer:
             max_repair_chars=MAX_CONSOLIDATION_CHARS,
             stage="consolidation",
         )
-        return self._result_with_slides(result, slide_data, uncertain_count, usage, cancellation_event)
+        return self._result_with_slides(
+            result, slide_data, interventions, uncertain_count, usage, cancellation_event
+        )
 
     def _classify_slides(
         self, metadata: BunnyVideoMetadata, frames: Sequence[FrameCandidate], *,
@@ -367,37 +420,19 @@ class OpenAIAnalyzer:
         frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
     ) -> AnalysisResult:
-        """Analyze a globally diarized transcript with one final text request."""
-        check_cancelled(cancellation_event)
-        usage = ProviderUsage()
-        slides, uncertain_count = self._classify_slides(
-            metadata, frames, cancellation_event=cancellation_event,
-            progress_callback=progress_callback, usage=usage,
+        """Analyze every globally diarized segment through the bounded window path."""
+        return self.analyze(
+            metadata,
+            transcription,
+            frames,
+            cancellation_event=cancellation_event,
+            progress_callback=progress_callback,
         )
-        try:
-            payload = build_fast_report_payload(metadata, transcription, slides)
-        except ValueError:
-            raise AnalysisError("response", stage="consolidation") from None
-        if progress_callback is not None:
-            progress_callback("transcript", 1, 1)
-        check_cancelled(cancellation_event)
-        if progress_callback is not None:
-            progress_callback("consolidation", 0, 1)
-
-        result = self._structured(
-            text_format=ConsolidatedTextReport, instructions=FAST_REPORT_PROMPT, payload=payload,
-            prepare=_normalize_speakers, validate=lambda content: _content_errors(content, metadata.duration_seconds),
-            cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
-            max_output_tokens=4000,
-            max_repair_chars=MAX_FAST_REPORT_CHARS,
-            stage="consolidation",
-        )
-        slide_data = [slide.model_dump(mode="json") for slide in slides]
-        return self._result_with_slides(result, slide_data, uncertain_count, usage, cancellation_event)
 
     @staticmethod
     def _result_with_slides(
-        result: ConsolidatedTextReport, slide_data: list[dict], uncertain_count: int,
+        result: ConsolidatedTextReport, slide_data: list[dict], interventions: list[Intervention],
+        uncertain_count: int,
         usage: ProviderUsage, cancellation_event: Event | None,
     ) -> AnalysisResult:
         check_cancelled(cancellation_event)
@@ -406,4 +441,6 @@ class OpenAIAnalyzer:
             note = f"{uncertain_count} frame con classificazione incerta esclusi dalle slide."
             if note not in data["uncertainties"]:
                 data["uncertainties"].append(note)
-        return AnalysisResult(**data, slides=slide_data, usage=usage)
+        return AnalysisResult(
+            **data, slides=slide_data, interventions=interventions, usage=usage
+        )

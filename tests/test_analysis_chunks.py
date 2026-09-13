@@ -9,6 +9,138 @@ from app.models import SlideChange
 from app.transcription import TranscriptionResult, TranscriptSegment
 
 
+def _draft(indexes, **changes):
+    data = {
+        "segment_indexes": indexes,
+        "tipo": "intervento",
+        "diarization_labels": ["assembly:A"],
+        "titolo": "Assetti di governance",
+        "sintesi": "Il relatore illustra gli assetti di governance.",
+        "punti_chiave": ["Assetti", "Deleghe", "Controlli"],
+        "confidenza": 0.9,
+    }
+    data.update(changes)
+    return data
+
+
+def test_window_payload_has_stable_local_segment_indexes():
+    from app.analysis_chunks import split_transcript_windows
+
+    segments = [
+        TranscriptSegment(start_seconds=0, end_seconds=5, diarization_label="A", text="uno"),
+        TranscriptSegment(start_seconds=5, end_seconds=10, diarization_label="B", text="due"),
+    ]
+
+    payload = json.loads(split_transcript_windows(segments)[0].to_payload())
+
+    assert [item["segment_index"] for item in payload["segments"]] == [0, 1]
+
+
+def test_materialize_interventions_covers_preroll_gaps_and_postroll_exactly():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    segments = [
+        TranscriptSegment(start_seconds=2.2, end_seconds=8.4, diarization_label="assembly:A", text="uno"),
+        TranscriptSegment(start_seconds=12.2, end_seconds=20.2, diarization_label="assembly:B", text="due"),
+    ]
+    windows = split_transcript_windows(segments)
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=["Governance"], speakers=[], uncertainties=[],
+        interventions=[
+            _draft([0]),
+            _draft([1], diarization_labels=["assembly:B"], titolo="Controlli"),
+        ],
+    )]
+
+    result = materialize_interventions(
+        25, windows, analyses,
+        {"assembly:A": "Mario Rossi", "assembly:B": "Anna Bianchi"},
+    )
+
+    assert [(item.start_seconds, item.end_seconds, item.tipo) for item in result] == [
+        (0, 2, "pausa"),
+        (2, 8, "intervento"),
+        (8, 12, "pausa"),
+        (12, 20, "intervento"),
+        (20, 25, "pausa"),
+    ]
+    assert result[1].relatori == ["Mario Rossi"]
+    assert result[3].relatori == ["Anna Bianchi"]
+    assert [item.id for item in result] == [f"i{number:03d}" for number in range(1, 6)]
+
+
+def test_materialize_interventions_supports_joint_speakers_and_omits_generic_names():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    segments = [
+        TranscriptSegment(start_seconds=0, end_seconds=60, diarization_label="assembly:A", text="uno"),
+        TranscriptSegment(start_seconds=60, end_seconds=120, diarization_label="assembly:B", text="due"),
+    ]
+    windows = split_transcript_windows(segments)
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[], uncertainties=[],
+        interventions=[_draft([0, 1], diarization_labels=["assembly:A", "assembly:B"])],
+    )]
+
+    result = materialize_interventions(
+        120, windows, analyses,
+        {"assembly:A": "Mario Rossi", "assembly:B": "Relatore 2"},
+    )
+
+    assert len(result) == 1
+    assert result[0].relatori == ["Mario Rossi"]
+    assert (result[0].start_seconds, result[0].end_seconds) == (0, 120)
+
+
+@pytest.mark.parametrize(
+    "drafts",
+    [
+        [_draft([0])],
+        [_draft([0, 1]), _draft([1, 2])],
+        [_draft([0, 2]), _draft([1])],
+        [_draft([2]), _draft([0, 1])],
+    ],
+)
+def test_materialize_interventions_rejects_missing_duplicate_noncontiguous_or_unordered_indexes(drafts):
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    segments = [
+        TranscriptSegment(start_seconds=index * 10, end_seconds=(index + 1) * 10,
+                          diarization_label="A", text=str(index))
+        for index in range(3)
+    ]
+    windows = split_transcript_windows(segments)
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[], uncertainties=[],
+        interventions=drafts,
+    )]
+
+    with pytest.raises(ValueError, match="partizione"):
+        materialize_interventions(30, windows, analyses, {})
+
+
+def test_materialize_interventions_resolves_overlapping_turns_with_adjacent_seconds():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    segments = [
+        TranscriptSegment(start_seconds=0, end_seconds=10.6, diarization_label="A", text="uno"),
+        TranscriptSegment(start_seconds=9.4, end_seconds=20, diarization_label="B", text="due"),
+    ]
+    windows = split_transcript_windows(segments)
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[], uncertainties=[],
+        interventions=[
+            _draft([0], diarization_labels=["A"]),
+            _draft([1], diarization_labels=["B"], tipo="domande", punti_chiave=[]),
+        ],
+    )]
+
+    result = materialize_interventions(20, windows, analyses, {})
+
+    assert [(item.start_seconds, item.end_seconds) for item in result] == [(0, 10), (10, 20)]
+    assert result[1].tipo == "domande"
+
+
 def test_prompts_preserve_every_announced_presenter_moderator_and_speaker_without_voice_mapping():
     from app.prompts import CONSOLIDATION_PROMPT, WINDOW_PROMPT
 

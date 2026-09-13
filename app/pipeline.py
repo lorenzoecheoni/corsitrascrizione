@@ -222,7 +222,7 @@ class AnalysisPipeline:
                     if stage == "slides":
                         progress(75 + int(7 * fraction), f"Slide {completed}/{total}")
                     elif stage == "transcript":
-                        progress(82 + int(7 * fraction), f"Relatori {completed}/{total}")
+                        progress(82 + int(7 * fraction), f"Interventi {completed}/{total}")
                     elif stage == "consolidation":
                         progress(90, "Consolidamento del report")
 

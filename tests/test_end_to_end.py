@@ -63,6 +63,13 @@ class OfflineOpenAI:
                 "speakers": [{"diarization_labels": ["chunk-0:A"], "display_name": None,
                               "role": None, "confidence": "bassa", "evidence": []}],
                 "uncertainties": [],
+                "interventions": [{
+                    "segment_indexes": [0], "tipo": "intervento",
+                    "diarization_labels": ["chunk-0:A"], "titolo": "Introduzione",
+                    "sintesi": "Introduzione al corso.",
+                    "punti_chiave": ["Corso", "Obiettivi", "Programma"],
+                    "confidenza": 0.9,
+                }],
             }
         else:
             payload = json.loads(input)

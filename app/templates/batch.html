@@ -1,5 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Coda lavori · Bunny Video Report{% endblock %}
+{% block head %}<script src="{{ url_for('static', path='batch.js') }}" defer></script>{% endblock %}
+{% block main_attributes %}id="batch" data-batch-id="{{ batch.id }}"{% endblock %}
 {% block header_actions %}<nav aria-label="Navigazione"><a class="button secondary" href="/">Torna al catalogo</a></nav>{% endblock %}
 {% block content %}
   <section class="page-intro" aria-labelledby="batch-title">
@@ -7,16 +9,17 @@
     <p class="catalog-total">Il gruppo contiene {{ jobs|length }} lavori.</p>
   </section>
   <section class="panel" aria-label="Avanzamento dei lavori">
-    <p>Per vedere i progressi più recenti, aggiorna lo stato.</p>
-    <p><a id="refresh-batch" class="button secondary" href="/batches/{{ batch.id }}">Aggiorna stato</a></p>
+    <p>Lo stato si aggiorna automaticamente ogni tre secondi.</p>
+    <p id="batch-poll-status" role="status" hidden></p>
+    <p><a id="refresh-batch" class="button secondary" href="/batches/{{ batch.id }}">Aggiorna ora</a></p>
     <ul class="job-list">
     {% for job in jobs %}
-    <li>
+    <li data-batch-job data-job-id="{{ job.id }}" data-job-state="{{ job.state.value }}">
       <a href="/jobs/{{ job.id }}">{{ job.source_title or 'Report video' }}</a>
       <div class="batch-job-progress">
-        <p>{{ job.message }}</p>
-        <label for="batch-progress-{{ job.id }}">Avanzamento: {{ job.progress }}%<span class="sr-only"> · {{ job.source_title or 'Report video' }}</span></label>
-        <progress id="batch-progress-{{ job.id }}" value="{{ job.progress }}" max="100">{{ job.progress }}%</progress>
+        <p data-job-message>{{ job.message }}</p>
+        <label for="batch-progress-{{ job.id }}">Avanzamento: <span data-job-label>{{ job.progress }}%</span><span class="sr-only"> · {{ job.source_title or 'Report video' }}</span></label>
+        <progress id="batch-progress-{{ job.id }}" data-job-progress value="{{ job.progress }}" max="100">{{ job.progress }}%</progress>
       </div>
     </li>
     {% endfor %}

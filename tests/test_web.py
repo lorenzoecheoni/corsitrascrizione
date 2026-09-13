@@ -475,6 +475,11 @@ def test_batch_refresh_shows_progress_and_terminal_transitions(client, state, me
     location = f"/batches/{batch.id}"
     page = client.get(location).text
     assert re.search(rf'<a id="refresh-batch"[^>]+href="{location}"', page)
+    assert 'batch.js' in page
+    assert f'data-batch-id="{batch.id}"' in page
+    assert f'data-job-id="{jobs[0].id}"' in page
+    assert 'data-job-message' in page and 'data-job-label' in page and 'data-job-progress' in page
+    assert 'id="batch-poll-status"' in page
     assert f'for="batch-progress-{jobs[0].id}"' in page
     assert re.search(r'<progress[^>]+value="0"[^>]+max="100"', page)
     client.app.state.store.update(jobs[0].id, state=JobState.PROCESSING, progress=37, message="Analisi in corso")

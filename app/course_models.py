@@ -259,6 +259,11 @@ class AcademyLesson(ReportModel):
         if self.tipo == "video":
             if not self.video or self.inizio is None or self.fine is None:
                 raise ValueError("Una lezione video richiede video, inizio e fine")
+            description_lines = [
+                line.strip() for line in (self.descrizione or "").splitlines() if line.strip()
+            ]
+            if len(description_lines) != 2:
+                raise ValueError("Una lezione video richiede una descrizione di due righe")
             if parse_hms(self.fine) <= parse_hms(self.inizio):
                 raise ValueError("La fine della lezione deve seguire l'inizio")
             if self.domande or self.corpo is not None:
@@ -346,10 +351,22 @@ def validate_academy_import(
         if video.durata_secondi != source_video.durata_secondi:
             errors.append(f"La durata del video {key} non corrisponde alla fonte.")
 
-    allowed_speakers = {speaker.nome for speaker in source.relatori}
+    source_speakers = {speaker.nome: speaker for speaker in source.relatori}
+    allowed_speakers = set(source_speakers)
     declared_speakers = {speaker.nome for speaker in report.relatori}
     if not declared_speakers.issubset(allowed_speakers):
         errors.append("Il JSON Academy dichiara un relatore non presente nella fonte.")
+    for speaker in report.relatori:
+        source_speaker = source_speakers.get(speaker.nome)
+        if source_speaker is None:
+            continue
+        if speaker.ruolo is not None and speaker.ruolo != source_speaker.ruolo:
+            errors.append(f"Il ruolo di {speaker.nome} non corrisponde alla fonte.")
+        if (
+            speaker.organizzazione is not None
+            and speaker.organizzazione != source_speaker.organizzazione
+        ):
+            errors.append(f"L'organizzazione di {speaker.nome} non corrisponde alla fonte.")
 
     intervals: dict[str, list[tuple[int, int, str]]] = {}
     hero_lessons: list[AcademyLesson] = []

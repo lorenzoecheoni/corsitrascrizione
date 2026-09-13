@@ -15,9 +15,12 @@ from openai.types.audio import TranscriptionDiarized
 import app.main as main
 from app.analysis import SlideBatchResult
 from app.analysis_chunks import WindowAnalysis
-from app.bunny import BunnyCatalog, BunnyVideoMetadata
+from app.bunny import BunnyCatalog, BunnyCatalogVideo, BunnyVideoMetadata
 from app.config import Settings
-from app.models import AcademyReport
+from app.course_models import AcademyImport
+from app.inventory import InventoryCourse
+from app.jobs import JobState
+from app.models import AcademyReport, Evidence, Intervention, SpeakerProfile
 
 
 VIDEO_ID = "00000000-0000-0000-0000-000000000001"
@@ -201,3 +204,148 @@ with pytest.MonkeyPatch.context() as patch:
 """
     run_bounded_smoke([sys.executable, "-c", script], tmp_path, timeout=12)
     assert not list(tmp_path.iterdir())
+
+
+def _course_video_report(title):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.title = title
+    report.bunny_title = title
+    report.duration_seconds = 600
+    report.synopsis = f"Sintesi di {title}."
+    report.speakers = [SpeakerProfile(
+        id="mario-rossi", display_name="Mario Rossi", role="Relatore",
+        confidence="alta", evidence=[Evidence(
+            kind="introduzione", timestamp_seconds=0, note="Il relatore si presenta.",
+        )],
+    )]
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Mario Rossi"], titolo=title, sintesi=f"Contenuti di {title}.",
+        punti_chiave=["Principio", "Applicazione", "Verifica"], confidenza=.95,
+    )]
+    report.slides = []
+    return report
+
+
+def _academy_from_source(source):
+    question = {
+        "testo": "Quale principio è illustrato nel corso?",
+        "risposte": [
+            {"testo": "Il principio documentato", "corretta": True},
+            {"testo": "Un dato assente"}, {"testo": "Un tema estraneo"},
+            {"testo": "Nessuno dei precedenti"},
+        ],
+        "spiegazione": "Il principio è presente nel report verificato.",
+    }
+    return AcademyImport.model_validate({
+        "versione": 1,
+        "corso": {
+            "titolo": source.corso.titolo,
+            "sottotitolo": "Percorso operativo per le holding",
+            "area": "Governance", "prezzo": 97,
+            "presentazione": "Primo paragrafo.\n\nSecondo paragrafo.\n\nTerzo paragrafo.",
+            "competenze": ["Comprendere", "Valutare", "Distinguere", "Applicare", "Riconoscere"],
+            "profili": ["Commercialisti | Che assistono gruppi societari."],
+        },
+        "relatori": [{"nome": "Mario Rossi", "ruolo": "Relatore"}],
+        "video": [{
+            "chiave": video.chiave, "sorgente": "bunny", "guid": video.guid,
+            "durata_secondi": video.durata_secondi, "titolo": video.titolo_bunny,
+        } for video in source.video],
+        "moduli": [{
+            "titolo": "Modulo 1 · Fondamenti", "lezioni": [
+                {"titolo": source.video[0].interventi[0].titolo, "video": "v1",
+                 "inizio": "0:00:00", "fine": "0:10:00", "relatori": ["Mario Rossi"],
+                 "descrizione": "Principi iniziali.\nApplicazioni operative.",
+                 "hero": True, "anteprima": True},
+                {"titolo": source.video[1].interventi[0].titolo, "video": "v2",
+                 "inizio": "0:00:00", "fine": "0:10:00", "relatori": ["Mario Rossi"],
+                 "descrizione": "Sviluppo del tema.\nVerifica dei contenuti."},
+                {"titolo": "Verifica", "tipo": "quiz", "domande": [question] * 3},
+            ],
+        }],
+    })
+
+
+def test_complete_multi_video_course_workflow_persists_both_json_files(tmp_path):
+    database = tmp_path / "course-reports.sqlite3"
+    settings = Settings(
+        bunny_library_id=123, bunny_stream_api_key="TEST_ONLY_BUNNY",
+        bunny_cdn_hostname="cdn.example.invalid", openai_api_key="TEST_ONLY_OPENAI",
+        app_password="TEST_ONLY_PASSWORD", database_path=str(database), _env_file=None,
+    )
+    first_id = "00000000-0000-0000-0000-000000000011"
+    second_id = "00000000-0000-0000-0000-000000000012"
+    inventory_course = InventoryCourse(
+        id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+        titolo="Percorso completo", relatori_attesi=["Mario Rossi"], materiali=[],
+        link=None, colonna_link="D", guid_esplicito=None,
+    )
+    catalog = BunnyCatalog(videos=[
+        BunnyCatalogVideo(video_id=first_id, title="Prima parte", duration_seconds=600, status=3),
+        BunnyCatalogVideo(video_id=second_id, title="Seconda parte", duration_seconds=600, status=3),
+    ], total_items=2)
+
+    app = main.create_app(settings)
+    app.state.inventory.fetch = lambda: [inventory_course]
+    app.state.bunny.list_videos = lambda: catalog
+    app.state.bunny.get_metadata = lambda video_id: BunnyVideoMetadata(
+        video_id=video_id,
+        title="Prima parte" if str(video_id) == first_id else "Seconda parte",
+        duration_seconds=600, status=3, available_resolutions=[240],
+    )
+    app.state.runner.submit = lambda _job_id: None
+    app.state.academy_generator = type("OfflineAcademy", (), {
+        "generate": lambda self, source: _academy_from_source(source),
+    })()
+
+    with TestClient(app) as client:
+        assert client.post("/login", data={
+            "username": "team", "password": settings.app_password,
+        }, follow_redirects=False).status_code == 303
+        client.headers["X-CSRF-Token"] = app.state.csrf_token
+        assert client.post("/inventory/sync", follow_redirects=False).status_code == 303
+        assert client.post("/courses/0:2/videos", data={
+            "video_ids": [first_id, second_id],
+        }, follow_redirects=False).status_code == 303
+        preview = client.get("/courses/0:2/analysis-preview")
+        confirmation = re.search(r'name="confirmation" value="([^"]+)"', preview.text)[1]
+        assert client.post("/courses/0:2/analyze", data={
+            "confirmation": confirmation,
+        }, follow_redirects=False).status_code == 303
+
+        run = app.state.course_store.get_course("0:2")
+        for job_id, title in zip(run.job_ids, ["Prima parte", "Seconda parte"], strict=True):
+            app.state.store.update(job_id, state=JobState.PROCESSING)
+            app.state.store.update(
+                job_id, state=JobState.COMPLETED, report=_course_video_report(title),
+            )
+        assert client.get("/api/courses/0:2").json()["intermedio_disponibile"] is True
+        source = app.state.course_store.get_course("0:2").intermediate
+        assert client.put(
+            "/api/courses/0:2/report",
+            json=source.model_dump(mode="json", by_alias=True, exclude_none=True),
+        ).status_code == 200
+        assert client.post("/courses/0:2/confirm", follow_redirects=False).status_code == 303
+        assert client.post(
+            "/courses/0:2/generate-academy", follow_redirects=False,
+        ).status_code == 303
+        intermediate = client.get("/courses/0:2/report-intermedio.json")
+        academy = client.get("/courses/0:2/import-academy.json")
+        assert intermediate.status_code == academy.status_code == 200
+        assert [video["chiave"] for video in intermediate.json()["video"]] == ["v1", "v2"]
+        assert academy.json()["corso"]["prezzo"] == 97
+        assert app.state.course_store.get_course("0:2").stato == "pronto_academy"
+
+    stored = database.read_bytes()
+    assert b"transcript" not in stored.lower()
+    assert b".m4a" not in stored and b".mp4" not in stored
+
+    restarted_app = main.create_app(settings)
+    with TestClient(restarted_app) as client:
+        assert client.post("/login", data={
+            "username": "team", "password": settings.app_password,
+        }, follow_redirects=False).status_code == 303
+        assert client.get("/courses/0:2/report-intermedio.json").status_code == 200
+        assert client.get("/courses/0:2/import-academy.json").status_code == 200
+        assert restarted_app.state.course_store.get_course("0:2").stato == "pronto_academy"

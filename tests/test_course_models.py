@@ -277,6 +277,24 @@ def test_academy_quiz_requires_three_questions_four_answers_and_one_correct():
         AcademyImport.model_validate(data)
 
 
+def test_academy_video_lesson_requires_an_exact_two_line_description():
+    data = academy_import().model_dump(mode="json", by_alias=True)
+    data["moduli"][0]["lezioni"][0]["descrizione"] = "Una riga soltanto."
+
+    with pytest.raises(ValidationError, match="due righe"):
+        AcademyImport.model_validate(data)
+
+
+def test_academy_validation_rejects_invented_speaker_role():
+    final = academy_import()
+    data = final.model_dump(mode="json", by_alias=True)
+    data["relatori"][0]["ruolo"] = "Ruolo non presente nella fonte"
+
+    errors = validate_academy_import(AcademyImport.model_validate(data), source_report())
+
+    assert any("ruolo" in error for error in errors)
+
+
 def test_academy_validation_checks_refs_bounds_overlap_speakers_price_and_hero():
     source = source_report()
     final = academy_import()

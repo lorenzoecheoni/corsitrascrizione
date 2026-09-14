@@ -45,9 +45,23 @@ def _name_pattern(value: str) -> re.Pattern[str] | None:
     return re.compile(rf"\b[A-Za-zÀ-ÖØ-öø-ÿ]+\s+{surname}\b", re.IGNORECASE)
 
 
+def canonical_speaker_name_map(names: Sequence[str]) -> dict[str, str]:
+    """Map exact normalized identities to their first spelling, plus the known alias."""
+    canonical = {}
+    for name in names:
+        key = _name_key(name)
+        if key in _FURIO_D_ANDREA_KEYS:
+            for alias in _FURIO_D_ANDREA_KEYS:
+                canonical[alias] = "Furio d'Andrea"
+        else:
+            canonical.setdefault(key, name)
+    return canonical
+
+
 def correct_speaker_name_mentions(value: str, canonical_names: Sequence[str]) -> str:
-    """Correct only near-identical full names sharing the canonical surname."""
+    """Correct narrative near-names without changing any other explicit identity."""
     corrected = value
+    canonical_by_key = canonical_speaker_name_map(canonical_names)
     replacements: dict[str, str] = {}
     for canonical in canonical_names:
         target = (
@@ -59,11 +73,12 @@ def correct_speaker_name_mentions(value: str, canonical_names: Sequence[str]) ->
             continue
 
         def replace(match: re.Match[str]) -> str:
-            score = SequenceMatcher(None, _name_key(match.group()), _name_key(target)).ratio()
+            key = _name_key(match.group())
+            score = SequenceMatcher(None, key, _name_key(target)).ratio()
             if score < .82:
                 return match.group()
             placeholder = f"\x00speaker-{len(replacements)}\x00"
-            replacements[placeholder] = target
+            replacements[placeholder] = canonical_by_key.get(key, target)
             return placeholder
 
         corrected = pattern.sub(replace, corrected)
@@ -94,11 +109,12 @@ def reconcile_speakers(report: AcademyReport) -> list[ReconciledSpeaker]:
         name for intervention in report.interventions for name in intervention.relatori
         if not GENERIC_SPEAKER_LABEL.fullmatch(name)
     ]))
+    canonical_by_key = canonical_speaker_name_map(canonical_names)
     merged: dict[str, ReconciledSpeaker] = {}
     evidence_keys: dict[str, set[tuple[str, float | None, str]]] = {}
     for source in report.speakers:
         speaker = ReconciledSpeaker(
-            display_name=correct_speaker_name_mentions(source.display_name, canonical_names),
+            display_name=canonical_by_key.get(_name_key(source.display_name), source.display_name),
             role=source.role,
             confidence=source.confidence,
             evidence=[evidence.model_copy(deep=True) for evidence in source.evidence],
@@ -130,7 +146,7 @@ def reconcile_speakers(report: AcademyReport) -> list[ReconciledSpeaker]:
                 current.origins.append(origin)
     for intervention in report.interventions:
         for name in intervention.relatori:
-            name = correct_speaker_name_mentions(name, canonical_names)
+            name = canonical_by_key.get(_name_key(name), name)
             key = _name_key(name)
             if not key or key in merged or GENERIC_SPEAKER_LABEL.fullmatch(name):
                 continue
@@ -157,6 +173,7 @@ def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
     """Build the factual, one-video JSON interchange document."""
     unique_speakers = reconcile_speakers(report)
     canonical_names = [speaker.display_name for speaker in unique_speakers]
+    canonical_by_key = canonical_speaker_name_map(canonical_names)
     speakers = []
     for speaker in unique_speakers:
         if GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name):
@@ -207,7 +224,7 @@ def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
     for intervention in report.interventions:
         item = intervention.model_dump(mode="json", by_alias=True, exclude_none=True)
         item["relatori"] = [
-            correct_speaker_name_mentions(name, canonical_names) for name in item["relatori"]
+            canonical_by_key.get(_name_key(name), name) for name in item["relatori"]
         ]
         for field in ("titolo", "sintesi"):
             item[field] = correct_speaker_name_mentions(item[field], canonical_names)
@@ -247,6 +264,7 @@ def render_markdown(report: AcademyReport) -> str:
     """Render a stable, human-readable Markdown representation of a report."""
     speakers = reconcile_speakers(report)
     canonical_names = [speaker.display_name for speaker in speakers]
+    canonical_by_key = canonical_speaker_name_map(canonical_names)
     corrected = lambda value: correct_speaker_name_mentions(value, canonical_names)
     lines = [
         f"# {corrected(report.title)}",
@@ -275,7 +293,8 @@ def render_markdown(report: AcademyReport) -> str:
         lines.extend(["", "## Interventi"])
         for intervention in report.interventions:
             intervention_speakers = (
-                _csv(intervention.relatori) if intervention.relatori else "Da verificare"
+                _csv([canonical_by_key.get(_name_key(name), name) for name in intervention.relatori])
+                if intervention.relatori else "Da verificare"
             )
             lines.append(
                 f"- {format_timestamp(intervention.start_seconds)}–"

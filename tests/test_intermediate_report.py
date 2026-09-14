@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import socket
+import threading
+import time
 from uuid import UUID
 
 import httpx
@@ -19,10 +21,208 @@ from app.intermediate_report import (
     split_role_organization,
 )
 from app.models import AcademyReport, Intervention, SpeakerProfile
-from app.reporting import correct_speaker_name_mentions
+from app.reporting import correct_speaker_name_mentions, render_markdown, render_text
 
 
 TARGET_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+
+
+@pytest.mark.parametrize("formal_names", [
+    ["Marco Rossi", "Mario Rossi"], ["Marco Rossi"], [],
+])
+def test_explicit_similar_speaker_identities_remain_distinct_in_all_exports(formal_names):
+    report = make_report([
+        make_intervention(0, 120, relatori=["Marco Rossi"], sintesi="Marco Rossi tratta la governance."),
+        make_intervention(120, 240, relatori=["Mario Rossi"], sintesi="Mario Rossi tratta i controlli."),
+    ])
+    report.speakers = [SpeakerProfile(
+        id=name, display_name=name, confidence="alta",
+        evidence=[{"kind": "introduzione", "note": f"Presentazione di {name}."}],
+    ) for name in formal_names]
+    saved = report.model_dump()
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [speaker.nome for speaker in result.relatori] == ["Marco Rossi", "Mario Rossi"]
+    assert [item.relatori for item in result.video[0].interventi] == [["Marco Rossi"], ["Mario Rossi"]]
+    for render in (render_markdown, render_text):
+        text = render(report)
+        assert "Mario Rossi (confidenza:" in text
+        assert "Marco Rossi (confidenza:" in text
+        assert "Relatori: Marco Rossi;" in text
+        assert "Relatori: Mario Rossi;" in text
+        assert "Marco Rossi tratta la governance." in text
+        assert "Mario Rossi tratta i controlli." in text
+    assert report.model_dump() == saved
+
+
+def test_accent_insensitive_intervention_references_reuse_first_canonical_profile():
+    report = make_report([
+        make_intervention(0, 120, relatori=["Jose Nunez"]),
+        make_intervention(120, 240, relatori=["JOSÉ NÚÑEZ"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="jose", display_name="José Núñez", confidence="alta",
+        evidence=[{"kind": "slide", "note": "Nome in slide: José Núñez."}],
+    )]
+    saved = report.model_dump()
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [speaker.nome for speaker in result.relatori] == ["José Núñez"]
+    assert [item.relatori for item in result.video[0].interventi] == [["José Núñez"], ["José Núñez"]]
+    assert report.model_dump() == saved
+
+
+@pytest.mark.parametrize("summary", [
+    "Relatore Gaetano De Vito approfondisce il realizzo controllato.",
+    "Relatore Marco Rossi: illustra gli assetti.",
+    "Relatore José Núñez presenta i controlli.",
+])
+def test_provider_summary_normalization_preserves_explicit_personal_names(summary):
+    report = make_report([make_intervention(0, 120, sintesi=summary)])
+
+    assert intermediate_report.normalize_interventions(report)[0].sintesi == summary
+
+
+def test_malformed_optional_material_url_is_retained_with_nonblocking_warning():
+    source = "https://[::1/dispensa.pdf"
+    report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+
+    result = build_intermediate_report(report, TARGET_GUID, material_sources=[source])
+
+    assert result.video[0].materiali[0].url == source
+    assert result.video[0].materiali[0].titolo == source
+    assert result.stato == "verificato"
+    assert [check.codice for check in result.verifiche_richieste if check.campo == f"materiali:{source}"] == [
+        "MATERIALE_NON_RAGGIUNGIBILE",
+    ]
+
+
+@pytest.mark.parametrize("phase", ["headers", "redirects", "tls_handshake"])
+def test_material_probe_cancels_slow_headers_within_five_seconds_and_closes_socket(monkeypatch, phase):
+    # Route this public literal to a local deterministic server at the socket
+    # boundary; the production URL validator and real HTTP transport still run.
+    stopped = threading.Event()
+    peer_closed = threading.Event()
+    existing_threads = set(threading.enumerate())
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(.1)
+    original_connect = socket.socket.connect
+    original_getaddrinfo = socket.getaddrinfo
+
+    def literal_address(host, port, *args, **kwargs):
+        if host == "93.184.216.34":
+            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port))]
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    def local_connect(sock, address):
+        if address[0] == "93.184.216.34":
+            address = listener.getsockname()
+        return original_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", local_connect)
+    monkeypatch.setattr(socket, "getaddrinfo", literal_address)
+
+    def accept_connection():
+        while not stopped.is_set():
+            try:
+                connection, _ = listener.accept()
+                connection.settimeout(.1)
+                return connection
+            except TimeoutError:
+                continue
+        return None
+
+    def read_request(connection):
+        request = b""
+        while b"\r\n\r\n" not in request and not stopped.is_set():
+            try:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                request += chunk
+            except TimeoutError:
+                continue
+
+    def serve_slow_headers():
+        if phase == "redirects":
+            first = accept_connection()
+            if first is None:
+                return
+            with first:
+                read_request(first)
+                if stopped.wait(2.5):
+                    return
+                first.sendall(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        connection = accept_connection()
+        if connection is None:
+            return
+        with connection:
+            if phase != "tls_handshake":
+                read_request(connection)
+                connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            finish = time.monotonic() + 6
+            while not stopped.is_set():
+                try:
+                    if connection.recv(1) == b"":
+                        peer_closed.set()
+                        return
+                except TimeoutError:
+                    if phase == "tls_handshake":
+                        continue
+                    try:
+                        connection.sendall(b"x" if time.monotonic() < finish else b"\r\nContent-Length: 0\r\n\r\n")
+                    except OSError:
+                        peer_closed.set()
+                        return
+                except OSError:
+                    peer_closed.set()
+                    return
+
+    server = threading.Thread(target=serve_slow_headers, daemon=True)
+    server.start()
+    try:
+        started = time.monotonic()
+        scheme = "https" if phase == "tls_handshake" else "http"
+        reachable = intermediate_report._material_url_is_reachable(f"{scheme}://93.184.216.34/slow.pdf")
+        elapsed = time.monotonic() - started
+        assert elapsed <= 5.0, f"caller blocked for {elapsed:.3f}s"
+        assert reachable is False
+        assert peer_closed.wait(.5), "cancelled probe left its socket connected"
+    finally:
+        stopped.set()
+        server.join(1)
+        listener.close()
+    assert not server.is_alive()
+    assert set(threading.enumerate()) <= existing_threads
+
+
+@pytest.mark.parametrize("label", ["Relatore A", "Relatore 12", "Speaker_01", "provider-F", "voce C2"])
+def test_supported_provider_label_formats_still_normalize_to_content(label):
+    report = make_report([make_intervention(0, 120, sintesi=f"{label}: approfondisce i controlli.")])
+
+    assert intermediate_report.normalize_interventions(report)[0].sintesi == "Tema trattato: i controlli."
+
+
+def test_timeline_only_normalized_names_preserve_the_first_spelling_and_known_alias():
+    report = make_report([
+        make_intervention(0, 120, relatori=["Jose Nunez"]),
+        make_intervention(120, 240, relatori=["José Núñez", "Fulvio D’Andrea"]),
+        make_intervention(240, 360, relatori=["Furio d'Andrea"]),
+    ])
+    report.speakers = []
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio d'Andrea"]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Jose Nunez"], ["Jose Nunez", "Furio d'Andrea"], ["Furio d'Andrea"],
+    ]
+    assert "Fulvio" not in render_markdown(report)
+    assert "Fulvio" not in render_text(report)
 
 
 def make_intervention(
@@ -609,7 +809,7 @@ def test_parse_material_source_strips_mixed_title_url_separators() -> None:
 def test_material_url_checker_rejects_private_direct_targets_before_any_request(monkeypatch) -> None:
     monkeypatch.setattr(
         intermediate_report.httpx,
-        "Client",
+        "AsyncClient",
         lambda **kwargs: pytest.fail("private URL must not create an HTTP client"),
     )
 
@@ -626,7 +826,7 @@ def test_material_url_checker_rejects_private_dns_answers_before_any_request(mon
     )
     monkeypatch.setattr(
         intermediate_report.httpx,
-        "Client",
+        "AsyncClient",
         lambda **kwargs: pytest.fail("private DNS answer must not create an HTTP client"),
     )
 
@@ -636,7 +836,7 @@ def test_material_url_checker_rejects_private_dns_answers_before_any_request(mon
 def test_material_url_checker_rejects_credentials_before_any_request(monkeypatch) -> None:
     monkeypatch.setattr(
         intermediate_report.httpx,
-        "Client",
+        "AsyncClient",
         lambda **kwargs: pytest.fail("credential URL must not create an HTTP client"),
     )
 
@@ -656,8 +856,8 @@ def test_material_url_checker_rejects_private_redirect_without_fetching_it(monke
             request=request,
     )
 
-    client = httpx.Client(transport=httpx.MockTransport(handle))
-    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
 
     assert intermediate_report._material_url_is_reachable("http://93.184.216.34/doc.pdf") is False
     assert requests == ["http://93.184.216.34/doc.pdf"]
@@ -674,9 +874,9 @@ def test_material_url_checker_enforces_one_wall_clock_deadline_across_redirects(
             return httpx.Response(302, headers={"location": "/next"}, request=request)
         return httpx.Response(200, request=request)
 
-    client = httpx.Client(transport=httpx.MockTransport(handle))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
 
     assert intermediate_report._material_url_is_reachable("http://93.184.216.34/start") is False
     assert requests == [
@@ -696,7 +896,7 @@ def test_material_url_checker_fails_closed_for_rebinding_hostname_without_reques
     monkeypatch.setattr(socket, "getaddrinfo", rebinding_resolver)
     monkeypatch.setattr(
         intermediate_report.httpx,
-        "Client",
+        "AsyncClient",
         lambda **kwargs: pytest.fail("hostname must not be resolved or requested"),
     )
 
@@ -719,7 +919,7 @@ def test_material_url_checker_does_not_wait_for_a_blocking_hostname_resolver(mon
     monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(
         intermediate_report.httpx,
-        "Client",
+        "AsyncClient",
         lambda **kwargs: pytest.fail("hostname must not start an HTTP request"),
     )
 
@@ -737,8 +937,8 @@ def test_material_url_checker_uses_the_validated_public_literal_ip(monkeypatch) 
         requests.append(str(request.url))
         return httpx.Response(200, request=request)
 
-    client = httpx.Client(transport=httpx.MockTransport(handle))
-    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
 
     assert intermediate_report._material_url_is_reachable(
         "http://93.184.216.34/document.pdf"

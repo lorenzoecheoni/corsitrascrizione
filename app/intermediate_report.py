@@ -1,5 +1,6 @@
 """Build the one-video Academy intermediate report v1.1 envelope."""
 
+import asyncio
 import ipaddress
 import re
 import time
@@ -20,7 +21,7 @@ from app.intermediate_models import (
     VerificationRequestV11,
 )
 from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
-from app.reporting import correct_speaker_name_mentions, reconcile_speakers
+from app.reporting import canonical_speaker_name_map, correct_speaker_name_mentions, reconcile_speakers
 
 
 _REGISTERED_SPEAKERS = {
@@ -42,7 +43,7 @@ _SHORT_SEGMENT_KEYWORDS = {
     "domande": ("domanda", "domande", "risposta", "risposte", "chiarimento", "quesito"),
 }
 _PROVIDER_SUMMARY_PREFIX = re.compile(
-    r"^\s*(?:(?:speaker|relatore|provider|voce)\s*[-_:]?\s*[a-z0-9]+"
+    r"^\s*(?:(?:speaker|relatore|provider|voce)\s*[-_:]?\s*(?:[a-z]?\d+|[a-z])"
     r"(?:\s*[:\-–]\s*|\s+)|[a-z]\s*(?::|\.|-|–)\s*|"
     r"[b-df-hj-km-np-tv-z]\s+)"
     r"(?P<body>.+?)\s*$",
@@ -200,7 +201,10 @@ def parse_material_source(value: str) -> IntermediateMaterialV11 | None:
         url = match.group().rstrip(").,|")
         title = re.sub(r"[\s|\-]+$", "", source[:match.start()])
         if not title:
-            title = Path(urlparse(url).path).name or url
+            try:
+                title = Path(urlparse(url).path).name or url
+            except ValueError:
+                title = url
         return IntermediateMaterialV11(titolo=title, url=url)
     path = Path(source)
     return IntermediateMaterialV11(titolo=path.stem, file=path.name)
@@ -231,34 +235,58 @@ def _is_safe_material_url(url: str) -> bool:
 
 
 def _material_url_is_reachable(url: str) -> bool:
-    """Safely probe a public URL without buffering its body or trusting proxies."""
-    deadline = time.monotonic() + 5.0
-    current_url = url
-    try:
-        if not _is_safe_material_url(current_url):
-            return False
-        with httpx.Client(
-            timeout=httpx.Timeout(5.0), follow_redirects=False, trust_env=False,
-        ) as client:
-            for _ in range(20):
-                if not _is_safe_material_url(current_url):
-                    return False
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                with client.stream("GET", current_url, timeout=httpx.Timeout(remaining)) as response:
-                    if time.monotonic() > deadline:
-                        return False
-                    if 200 <= response.status_code < 300:
-                        return True
-                    if not 300 <= response.status_code < 400:
-                        return False
-                    location = response.headers.get("location")
-                    if location is None:
-                        return True
-                    current_url = urljoin(current_url, location)
-    except (httpx.HTTPError, OSError, ValueError):
+    """Probe in a private event loop, cancelling network I/O before five seconds.
+
+    The 0.5-second reserve covers socket/client and event-loop cleanup. Public
+    literal addresses avoid DNS executor work; no worker threads are created.
+    """
+    deadline = time.monotonic() + 4.5
+    if not _is_safe_material_url(url):
         return False
+    return asyncio.run(_probe_material_url(url, deadline))
+
+
+async def _probe_material_url(url: str, deadline: float) -> bool:
+    """Cancel connect, response headers and all redirects under one deadline."""
+    current_url = url
+    opened_streams = []
+
+    async def remember_stream(event: str, info: dict) -> None:
+        # A cancelled TLS handshake may precede HTTPX's ownership of the TCP
+        # stream. Retain it via the trace extension so that path is closed too.
+        if event == "connection.connect_tcp.complete":
+            opened_streams.append(info["return_value"])
+
+    try:
+        async with asyncio.timeout(max(0, deadline - time.monotonic())):
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(4.5), follow_redirects=False, trust_env=False,
+            ) as client:
+                for _ in range(20):
+                    if not _is_safe_material_url(current_url):
+                        return False
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    async with client.stream(
+                        "GET", current_url, timeout=httpx.Timeout(remaining),
+                        extensions={"trace": remember_stream},
+                    ) as response:
+                        if time.monotonic() > deadline:
+                            return False
+                        if 200 <= response.status_code < 300:
+                            return True
+                        if not 300 <= response.status_code < 400:
+                            return False
+                        location = response.headers.get("location")
+                        if location is None:
+                            return True
+                        current_url = urljoin(current_url, location)
+    except (httpx.HTTPError, OSError, ValueError, TimeoutError):
+        return False
+    finally:
+        for stream in opened_streams:
+            await stream.aclose()
     return False
 
 
@@ -366,6 +394,7 @@ def build_intermediate_report(
         if not GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name)
     ]
     canonical_names = [speaker.display_name for speaker in speakers]
+    canonical_by_key = canonical_speaker_name_map(canonical_names)
     corrected = lambda value: correct_speaker_name_mentions(value, canonical_names)
 
     intermediate_speakers: list[IntermediateSpeakerV11] = []
@@ -383,7 +412,7 @@ def build_intermediate_report(
 
     normalized = normalize_interventions(report)
     corrected_interventions = [item.model_copy(update={
-        "relatori": [corrected(name) for name in item.relatori],
+        "relatori": [canonical_by_key[_name_key(name)] for name in item.relatori],
         "titolo": corrected(item.titolo),
         "sintesi": corrected(item.sintesi),
         "punti_chiave": [corrected(point) for point in item.punti_chiave],

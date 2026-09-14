@@ -660,6 +660,41 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
     assert "incertezze" not in payload
 
 
+@pytest.mark.parametrize("materials", [[], ["https://[::1/dispensa.pdf"]])
+def test_json_export_preserves_accented_identity_and_survives_malformed_material(client, materials):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.speakers = [report.speakers[0].model_copy(update={"display_name": "José Núñez"})]
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=120, tipo="intervento",
+        relatori=["Jose Nunez"], titolo="Governance", sintesi="Assetti e controlli.",
+        punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
+    )]
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    stored = store.get(job.id).model_dump()
+    client.app.state.inventory.fetch = lambda: [InventoryCourse(
+        id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+        titolo="Corso", relatori_attesi=[], materiali=materials,
+        link="bunny", colonna_link="D", guid_esplicito=UUID(VIDEO_ID),
+    )]
+    client.app.state.bunny = _ForbiddenProvider()
+    client.app.state.assemblyai = _ForbiddenProvider()
+    client.app.state.openai = _ForbiddenProvider()
+
+    response = client.get(f"/jobs/{job.id}/report.json")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [speaker["nome"] for speaker in payload["relatori"]] == ["José Núñez"]
+    assert payload["video"][0]["interventi"][0]["relatori"] == ["José Núñez"]
+    assert [item["url"] for item in payload["video"][0]["materiali"]] == materials
+    if materials:
+        assert any(check["codice"] == "MATERIALE_NON_RAGGIUNGIBILE" for check in payload["verifiche_richieste"])
+    assert store.get(job.id).model_dump() == stored
+
+
 def test_json_export_survives_inventory_failure_without_leaking_cell_data(client):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
     store = client.app.state.store

@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import csv
 from dataclasses import dataclass, field
+from decimal import Decimal
 import json
 import math
 import os
@@ -85,6 +86,13 @@ class MediaProtectedError(MediaError):
     """FFmpeg encountered an authorization or unsupported protection failure."""
 
 
+class SilenceEvidenceError(MediaError):
+    """Malformed or unavailable audio silence evidence with fixed safe text."""
+
+    def __init__(self) -> None:
+        super().__init__("Impossibile verificare le pause audio")
+
+
 _SILENCE_NUMBER = r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"
 _SILENCE_START = re.compile(
     rf"^\[silencedetect @ [^\]]+\] silence_start: (?P<seconds>{_SILENCE_NUMBER})\s*$"
@@ -99,68 +107,85 @@ _SILENCE_PREFIX = re.compile(r"^\[silencedetect @ [^\]]+\] silence_(?:start|end)
 class _SilenceEvents:
     """Validate the small, transient subset of silencedetect diagnostics we need."""
 
-    _error = "Impossibile verificare le pause audio"
-
     def __init__(self) -> None:
         self._intervals: list[SilenceInterval] = []
         self._open_start: float | None = None
+        self._open_rounding_error = 0.0
 
-    @classmethod
-    def _seconds(cls, value: str) -> float:
+    @staticmethod
+    def _rounding_error(value: str) -> float:
+        # FFmpeg 6.x av_ts2timestr uses %.6g (trailing zeros are omitted).
+        # Honor additional printed digits from newer versions. Summing half
+        # units in the last significant place bounds serialization error only.
+        number = Decimal(value)
+        if not number:
+            return 0.0
+        digits = max(6, len(number.as_tuple().digits))
+        return .5 * 10.0 ** (number.adjusted() - digits + 1)
+
+    @staticmethod
+    def _seconds(value: str) -> float:
         try:
             seconds = float(value)
         except ValueError:
-            raise MediaError(cls._error) from None
+            raise SilenceEvidenceError() from None
         if not math.isfinite(seconds) or seconds < 0:
-            raise MediaError(cls._error)
+            raise SilenceEvidenceError()
         return seconds
 
     def consume(self, line: str) -> None:
+        if (re.search(r"\bNo such filter:\s*['\"]silencedetect['\"]", line)
+                or re.search(r"\bStream map ['\"]0:a:0['\"] matches no streams\.", line)):
+            raise SilenceEvidenceError()
         start = _SILENCE_START.fullmatch(line)
         if start:
             if self._open_start is not None:
-                raise MediaError(self._error)
+                raise SilenceEvidenceError()
             value = self._seconds(start["seconds"])
             if self._intervals and value < self._intervals[-1].end_seconds:
-                raise MediaError(self._error)
+                raise SilenceEvidenceError()
             self._open_start = value
+            self._open_rounding_error = self._rounding_error(start["seconds"])
             return
 
         end = _SILENCE_END.fullmatch(line)
         if end:
             if self._open_start is None:
-                raise MediaError(self._error)
+                raise SilenceEvidenceError()
             end_seconds = self._seconds(end["seconds"])
             reported_duration = self._seconds(end["duration"])
             try:
                 interval = SilenceInterval(self._open_start, end_seconds)
             except ValueError:
-                raise MediaError(self._error) from None
+                raise SilenceEvidenceError() from None
             if not math.isclose(
                 interval.end_seconds - interval.start_seconds, reported_duration,
-                rel_tol=0, abs_tol=1e-6,
+                rel_tol=0,
+                abs_tol=(self._open_rounding_error + self._rounding_error(end["seconds"])
+                         + self._rounding_error(end["duration"])
+                         + 4 * max(math.ulp(self._open_start), math.ulp(end_seconds),
+                                   math.ulp(reported_duration))),
             ):
-                raise MediaError(self._error)
+                raise SilenceEvidenceError()
             self._intervals.append(interval)
             self._open_start = None
             return
 
         if _SILENCE_PREFIX.match(line):
-            raise MediaError(self._error)
+            raise SilenceEvidenceError()
 
     def finish(self, duration_seconds: float) -> list[SilenceInterval]:
-        try:
-            duration = self._seconds(str(duration_seconds))
-        except MediaError:
-            raise
+        duration = self._seconds(str(duration_seconds))
+        if duration <= 0:
+            raise SilenceEvidenceError()
         if self._open_start is not None:
             try:
                 self._intervals.append(SilenceInterval(self._open_start, duration))
             except ValueError:
-                raise MediaError(self._error) from None
+                raise SilenceEvidenceError() from None
             self._open_start = None
         if any(interval.end_seconds > duration for interval in self._intervals):
-            raise MediaError(self._error)
+            raise SilenceEvidenceError()
         return list(self._intervals)
 
 

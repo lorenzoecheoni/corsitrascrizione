@@ -100,7 +100,8 @@ requires a valid, ordered, non-empty word list for every non-empty utterance.
 The word text concatenation need not reproduce punctuation byte-for-byte, but
 all words must fall within their utterance interval and use the utterance's
 speaker label. Invalid or missing word timing raises the existing fixed
-transcription-response error.
+transcription-response text in the dedicated `WordEvidenceError` subtype; the
+pipeline maps that subtype to the fixed boundary-verification failure.
 
 `TranscriptionResult` retains words only in memory. They are never included in
 AI requests or repair prompts and never written to logs or SQLite directly.
@@ -121,7 +122,12 @@ FFmpeg command uses one audio decode with `silencedetect=n=-45dB:d=0.15` and a
 null output. The parser accepts only finite, ordered pairs inside the media
 duration; an open silence at end-of-file is closed at the verified duration.
 Malformed, incomplete, or contradictory filter events cause a fixed media
-error. Raw FFmpeg lines are never stored or logged.
+error. Raw FFmpeg lines are never stored or logged. Silence parser failures and
+missing audio/filter evidence use `SilenceEvidenceError`, mapped to the same
+boundary failure by the pipeline. The duration-consistency tolerance is the
+sum of half-rounding units of the three printed numbers (at least six
+significant digits, plus float ULPs), not an arbitrary time allowance. Missing
+positive scan progress is invalid.
 
 The thresholds are deterministic application constants, not model choices. A
 150 ms minimum detects brief speech pauses while the boundary rules decide
@@ -153,6 +159,13 @@ allowed to deserialize with `boundaries=[]`.
 No transcript, full sentence, waveform, silence list, or audio reference is
 persisted.
 
+`AcademyContent` also carries application-owned `audio_boundary_version`, an
+optional strict integer whose only verified value is `1`. It is assigned only
+to successfully aligned analysis content, validated again by the pipeline,
+and persisted with the completed report. Historical JSON defaults to `None`;
+the version is required even when one segment has zero internal boundaries.
+It is not an AI output field or a new field in the intermediate v1 envelope.
+
 ## Semantic grouping
 
 The AI remains responsible only for editorial meaning, not the final time:
@@ -165,6 +178,21 @@ The AI remains responsible only for editorial meaning, not the final time:
   intervention. They form a granular segment typed from the existing enum.
 - The existing local partition validator continues to require every transcript
   segment exactly once and in chronological order.
+- Each window call after the first includes up to 3,000 serialized characters
+  of `previous_context`: the preceding local group's type, title, summary and
+  final utterances, excluding word arrays. Any omitted prefix is explicit.
+  Payload splitting reserves that space inside the unchanged 12,000-character
+  request cap; the 600-second cap remains on the current window.
+- `WindowAnalysis.previous_continuity` must say `continue` or `separate` for
+  distinct-source margins. Only `continue` joins the neighboring groups before
+  alignment; speaker equality alone never does. `None` or `unresolved` fails
+  closed without a repair that lacks transcript context. Copies of the same
+  source utterance remain deterministically indivisible; a merge involving
+  additional sources requires an explicit continuity decision. Incompatible
+  group types fail closed, preserving a separately classified moderator.
+- AI drafts contain spoken types only. A `pausa` draft is invalid, and the
+  aligner also rejects supplied pause groups. Only its measured-silence rule
+  may generate final pause segments; an AI label never discards spoken words.
 - If payload bounding divides one unusually long provider utterance into pieces,
   all pieces keep the same `source_utterance_id`. Adjacent drafts containing
   pieces of that same utterance are merged locally before alignment, including
@@ -273,6 +301,7 @@ retains all previously approved v1.1 fields and rules.
 Historical `AcademyReport` JSON remains readable because `boundaries` defaults
 to an empty list. However, a completed report is boundary-conformant only when:
 
+- it has `audio_boundary_version == 1`, including a one-segment report;
 - it has exactly one evidence item per internal intervention pair;
 - every evidence item names the exact consecutive stored IDs;
 - its second equals both the previous end and next start; and
@@ -316,6 +345,12 @@ Reanalyzing a historical video, including Governance, consumes one normal
 AssemblyAI transcription and the existing OpenAI analysis calls. Merely
 downloading an already conforming JSON performs no provider analysis and spends
 no transcription or AI credit.
+
+Continuity is decided in the existing window call, with the same usage, cost
+and cancellation tracking; there is no additional request per window margin.
+The reserved previous-context budget can increase the number of windows for
+dense transcripts. Bounded context can also require a safe failure when a
+model cannot establish completion at a margin.
 
 ## Testing and acceptance
 

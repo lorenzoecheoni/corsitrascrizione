@@ -32,6 +32,8 @@ def nearest_second(value: float) -> int:
 
 
 def _group_words(group: SemanticIntervention) -> tuple[TranscriptWord, ...]:
+    if group.tipo == "pausa":
+        raise ValueError("La partizione parlata non può dichiarare una pausa")
     # Payload bounding copies the original word list into each utterance piece.
     # Keep each original word once, without changing its punctuation or spelling.
     unique: dict[tuple, TranscriptWord] = {}
@@ -45,14 +47,12 @@ def _group_words(group: SemanticIntervention) -> tuple[TranscriptWord, ...]:
             key = (identity, word.start_seconds, word.end_seconds, word.diarization_label, word.text)
             unique.setdefault(key, word)
     words = tuple(sorted(unique.values(), key=lambda word: (word.start_seconds, word.end_seconds)))
-    if not group.segments or (group.tipo != "pausa" and not words):
+    if not group.segments or not words:
         raise ValueError("La partizione parlata richiede evidenze parola per parola")
     return words
 
 
-def _speech_extent(group: SemanticIntervention, words: Sequence[TranscriptWord]) -> tuple[float, float]:
-    if group.tipo == "pausa":
-        return min(item.start_seconds for item in group.segments), max(item.end_seconds for item in group.segments)
+def _speech_extent(words: Sequence[TranscriptWord]) -> tuple[float, float]:
     return words[0].start_seconds, max(word.end_seconds for word in words)
 
 
@@ -98,8 +98,8 @@ def _intervention(index: int, group: SemanticIntervention, start: int, end: int)
 def _evidence(previous: Intervention, following: Intervention, before: Sequence[TranscriptWord],
               after: Sequence[TranscriptWord], rule: str) -> BoundaryEvidence:
     boundary = int(previous.end_seconds)
-    before = () if previous.tipo == "pausa" else before[-5:]
-    after = () if following.tipo == "pausa" else after[:5]
+    before = before[-5:]
+    after = after[:5]
     return BoundaryEvidence(
         previous_intervention_id=previous.id, next_intervention_id=following.id,
         boundary_seconds=boundary, words_before=[word.text for word in before],
@@ -143,6 +143,8 @@ def _complete(interventions: Sequence[Intervention], boundaries: Sequence[Bounda
 
 def has_complete_boundary_evidence(report: AcademyContent) -> bool:
     """Historical content may deserialize without being eligible for export."""
+    if type(report.audio_boundary_version) is not int or report.audio_boundary_version != 1:
+        return False
     if not math.isfinite(report.duration_seconds) or report.duration_seconds <= 0:
         return False
     return _complete(report.interventions, report.boundaries, nearest_second(report.duration_seconds))
@@ -160,7 +162,7 @@ def align_intervention_boundaries(
         raise ValueError("La partizione richiede almeno un secondo")
 
     words = [_group_words(group) for group in semantic_groups]
-    extents = [_speech_extent(group, group_words) for group, group_words in zip(semantic_groups, words)]
+    extents = [_speech_extent(group_words) for group_words in words]
     source_owners: dict[str, int] = {}
     for index, group in enumerate(semantic_groups):
         for segment in group.segments:

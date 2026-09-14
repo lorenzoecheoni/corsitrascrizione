@@ -22,10 +22,11 @@ def test_report_fixture_covers_requested_text_report() -> None:
     assert report.slides[0].timestamp_seconds == 95
     assert set(report.model_dump()) == {
         "title", "duration_seconds", "detected_language", "synopsis",
-        "speakers", "slides", "uncertainties", "interventions", "boundaries", "cost", "bunny_title", "usage",
+        "speakers", "slides", "uncertainties", "interventions", "boundaries", "audio_boundary_version", "cost", "bunny_title", "usage",
     }
     assert report.interventions == []
     assert report.boundaries == []
+    assert report.audio_boundary_version is None
 
 
 def _boundary_data():

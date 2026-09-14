@@ -228,6 +228,8 @@ class AcademyContent(ReportModel):
     uncertainties: list[str]
     interventions: list[Intervention] = Field(default_factory=list)
     boundaries: list[BoundaryEvidence] = Field(default_factory=list)
+    # Application-owned provenance; old stored JSON has no audio verification.
+    audio_boundary_version: Annotated[int, Field(strict=True, ge=1, le=1)] | None = None
 
 
 class AcademyReport(AcademyContent):

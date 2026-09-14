@@ -19,7 +19,8 @@ from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
     MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS,
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
-    materialize_interventions, split_transcript_windows,
+    materialize_interventions, previous_window_context, shares_seam_utterance,
+    split_transcript_windows,
 )
 from app.boundaries import BoundaryAlignment, has_complete_boundary_evidence
 from app.media import FrameCandidate, SilenceInterval
@@ -165,8 +166,13 @@ def _normalize_window_speakers(data: dict, hints: Sequence[str]) -> None:
             speaker["display_name"] = _canonical_name(name.strip(), hints)
 
 
-def _window_payload(window, hints: Sequence[str]) -> str:
+def _window_payload(window, hints: Sequence[str], previous_context: dict | None = None) -> str:
     payload = json.loads(window.to_payload())
+    if previous_context is not None:
+        payload["previous_context"] = previous_context
+    base_payload = json.dumps(payload, ensure_ascii=False)
+    if len(base_payload) > MAX_WINDOW_CHARS:
+        raise AnalysisError("boundaries", stage="boundary")
     cleaned = list(dict.fromkeys(
         name.strip()[:120] for name in hints[:20]
         if isinstance(name, str) and name.strip()
@@ -174,7 +180,7 @@ def _window_payload(window, hints: Sequence[str]) -> str:
     if cleaned:
         payload["speaker_name_hints"] = cleaned
     serialized = json.dumps(payload, ensure_ascii=False)
-    return serialized if len(serialized) <= MAX_WINDOW_CHARS else window.to_payload()
+    return serialized if len(serialized) <= MAX_WINDOW_CHARS else base_payload
 
 
 def _normalize_speakers(data: dict, hints: Sequence[str] = ()) -> None:
@@ -240,7 +246,7 @@ def _content_errors(content: ConsolidatedTextReport, duration: float) -> list[st
     return errors
 
 
-def _window_errors(window, result: WindowAnalysis) -> list[str]:
+def _window_errors(window, result: WindowAnalysis, previous_window=None) -> list[str]:
     indexes = [
         segment_index
         for intervention in result.interventions
@@ -259,6 +265,10 @@ def _window_errors(window, result: WindowAnalysis) -> list[str]:
         for label in intervention.diarization_labels
     ):
         errors.append("diarization_labels deve usare soltanto etichette presenti nella finestra.")
+    if (previous_window is not None and result.previous_continuity not in {"continue", "separate"}
+            and not shares_seam_utterance(previous_window, window)):
+        # A repair omits transcript context and cannot resolve editorial meaning.
+        raise AnalysisError("boundaries", stage="boundary")
     return errors
 
 
@@ -393,7 +403,7 @@ class OpenAIAnalyzer:
                     output_limit_retry_used = True
                     continue
                 partition_error = any(
-                    error.get("loc") and error["loc"][0] == "interventions"
+                    error.get("loc") and error["loc"][0] in {"interventions", "previous_continuity"}
                     for error in exc.errors(
                         include_url=False, include_context=False, include_input=False,
                     )
@@ -466,11 +476,16 @@ class OpenAIAnalyzer:
         analyses: list[WindowAnalysis] = []
         for index, window in enumerate(windows, start=1):
             check_cancelled(cancellation_event)
+            previous_window = windows[index - 2] if index > 1 else None
+            try:
+                context = previous_window_context(previous_window, analyses[-1]) if previous_window else None
+            except (AttributeError, IndexError, TypeError, ValueError):
+                raise AnalysisError("boundaries", stage="boundary") from None
             analyses.append(self._structured(
                 text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
-                payload=_window_payload(window, speaker_name_hints),
+                payload=_window_payload(window, speaker_name_hints, context),
                 prepare=lambda data: _normalize_window_speakers(data, speaker_name_hints),
-                validate=lambda result, current=window: _window_errors(current, result),
+                validate=lambda result, current=window, previous=previous_window: _window_errors(current, result, previous),
                 cancellation_event=cancellation_event,
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
@@ -593,7 +608,7 @@ class OpenAIAnalyzer:
         try:
             content = AnalysisResult(
                 **data, slides=slide_data, interventions=alignment.interventions,
-                boundaries=alignment.boundaries, usage=usage,
+                boundaries=alignment.boundaries, audio_boundary_version=1, usage=usage,
             )
         except (AttributeError, TypeError, ValidationError, ValueError):
             raise AnalysisError("boundaries", stage="boundary") from None

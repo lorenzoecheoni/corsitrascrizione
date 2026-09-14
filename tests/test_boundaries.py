@@ -31,8 +31,15 @@ def report_for(alignment, duration=40):
     return AcademyContent(
         title="Corso", duration_seconds=duration, detected_language="it", synopsis="",
         speakers=[], slides=[], uncertainties=[], interventions=alignment.interventions,
-        boundaries=alignment.boundaries,
+        boundaries=alignment.boundaries, audio_boundary_version=1,
     )
+
+
+def test_single_historical_intervention_without_provenance_is_not_verified():
+    report = report_for(align_intervention_boundaries(40, [group(0, 39)], []))
+    report = AcademyContent.model_validate(report.model_dump(exclude={"audio_boundary_version"}))
+    assert report.boundaries == []
+    assert not has_complete_boundary_evidence(report)
 
 
 @pytest.mark.parametrize("end,start,silences,expected,rule", [
@@ -124,6 +131,20 @@ def test_continued_example_is_not_split_at_internal_utterances_or_silences():
     result = align_intervention_boundaries(16, [continued], [SilenceInterval(5, 7), SilenceInterval(10, 12)])
     assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, 16)]
     assert result.boundaries == []
+
+
+@pytest.mark.parametrize("silences", [[], [SilenceInterval(9, 10)]])
+def test_ai_pause_cannot_discard_word_bearing_utterance(silences):
+    with pytest.raises(ValueError, match="partizione"):
+        align_intervention_boundaries(20, [
+            group(0, 9, ("Spiegazione", "effettivamente", "trascritta."), kind="pausa"),
+            group(10, 19, ("Grazie",), kind="saluti"),
+        ], silences)
+
+
+def test_ai_wordless_pause_requires_measured_generation():
+    with pytest.raises(ValueError, match="partizione"):
+        align_intervention_boundaries(20, [group(0, 9, (), kind="pausa"), group(10, 19)], [])
 
 
 def test_moderator_is_preserved_between_speakers():

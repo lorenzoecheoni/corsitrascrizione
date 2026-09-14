@@ -97,6 +97,35 @@ def test_sqlite_round_trip_persists_compact_boundaries(
     assert loaded.boundaries == report.boundaries
 
 
+@pytest.mark.parametrize("verified", [False, True])
+def test_sqlite_restart_retains_single_segment_audio_provenance(tmp_path, report, verified):
+    from app.boundaries import has_complete_boundary_evidence
+
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=3720, tipo="intervento",
+        relatori=[], titolo="Intervento unico", sintesi="Spiegazione completa.",
+        punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+    )]
+    data = report.model_dump()
+    data.pop("boundaries", None)
+    data.pop("audio_boundary_version", None)
+    if verified:
+        data["audio_boundary_version"] = 1
+    report = AcademyReport.model_validate(data)
+    path = tmp_path / "single-boundary-report.sqlite3"
+    store = JobStore(path)
+    job = store.create("source")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+
+    loaded = JobStore(path).get(job.id).report
+
+    assert loaded.boundaries == []
+    assert has_complete_boundary_evidence(loaded) is verified
+    assert has_complete_boundary_evidence(AcademyReport.model_validate_json(loaded.model_dump_json())) is verified
+    assert getattr(loaded, "audio_boundary_version", None) == (1 if verified else None)
+
+
 def test_sqlite_store_marks_interrupted_jobs_failed_on_reopen(tmp_path) -> None:
     path = tmp_path / "reports.sqlite3"
     store = JobStore(path)

@@ -129,6 +129,89 @@ localmente dall'audio; non usare i cambi di slide per dividere gli interventi.""
     assert "timestamp del silenzio" not in WINDOW_PROMPT.lower()
 
 
+@pytest.mark.parametrize("limit", ["seconds", "characters"])
+@pytest.mark.parametrize("continuation", [
+    ("Quindi per completare la frase dobbiamo", "aggiungere il secondo termine."),
+    ("Consideriamo questo esempio. Primo passaggio concluso.", "Ora il secondo passaggio dello stesso esempio."),
+    ("Per rispondere alla domanda, partiamo dalle deleghe.", "La risposta si completa valutando i controlli."),
+])
+def test_window_seam_continuation_is_decided_with_previous_context(
+    inputs, content, limit, continuation, caplog,
+):
+    before, after = continuation
+    end, start, duration = (599, 600, 620) if limit == "seconds" else (9, 10, 30)
+    texts = [before, after] if limit == "seconds" else ["Premessa. " * 700 + before, after + " Spiegazione." * 580]
+    inputs["metadata"].duration_seconds = content["duration_seconds"] = duration
+    inputs["frames"] = []
+    inputs["transcription"].segments = [TranscriptSegment(
+        start_seconds=left, end_seconds=right, diarization_label="assembly:A",
+        text=text, source_utterance_id=f"distinct-{index}",
+        words=[TranscriptWord(text="PRIVATE-WORD-EVIDENCE", start_seconds=left,
+                              end_seconds=right, diarization_label="assembly:A", confidence=.9)],
+    ) for index, (left, right, text) in enumerate([(0, end, texts[0]), (start, duration - 1, texts[1])])]
+
+    def respond(call):
+        if call["text_format"] is ConsolidatedTextReport:
+            return SimpleNamespace(output_parsed=content)
+        payload = json.loads(call["input"])
+        data = window_result([item["segment_index"] for item in payload["segments"]], ["assembly:A"])
+        if payload["start_seconds"]:
+            context = payload.get("previous_context")
+            assert context is not None
+            assert context["segments"][-1]["text"].endswith(before)
+            data["previous_continuity"] = "continue"
+        return SimpleNamespace(output_parsed=data, usage=SimpleNamespace(input_tokens=11, output_tokens=3))
+
+    client = FakeClient(*([respond] * 6))
+    result = OpenAIAnalyzer(client).analyze_fast(**inputs)
+
+    assert len(result.interventions) == 1
+    assert (result.interventions[0].start_seconds, result.interventions[0].end_seconds) == (0, duration)
+    assert result.boundaries == []
+    assert getattr(result, "audio_boundary_version", None) == 1
+    assert len(client.calls) == 3  # Two windows and consolidation; no seam request.
+    assert result.usage.requests == 3
+    assert result.usage.input_tokens == 22
+    assert all(len(call["input"]) <= 12_000 for call in client.calls[:-1])
+    assert all("PRIVATE-WORD-EVIDENCE" not in call["input"] for call in client.calls)
+    assert before not in caplog.text and "PRIVATE-WORD-EVIDENCE" not in caplog.text
+
+
+@pytest.mark.parametrize("decision", [None, "unresolved"])
+def test_window_seam_unresolved_fails_before_context_free_repair(inputs, content, decision):
+    inputs["frames"] = []
+    inputs["metadata"].duration_seconds = 620
+    first = inputs["transcription"].segments[0]
+    inputs["transcription"].segments.append(first.model_copy(update={
+        "start_seconds": 600, "end_seconds": 610, "source_utterance_id": "distinct-u2",
+        "words": [first.words[0].model_copy(update={"start_seconds": 600, "end_seconds": 610})],
+    }))
+    second = window_result()
+    second["previous_continuity"] = decision
+    client = FakeClient(window_result(), second, second, second)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.code == "boundaries"
+    assert caught.value.stage == "boundary"
+    assert len(client.calls) == 2
+
+
+def test_window_seam_cancellation_drops_context_without_extra_call(inputs, content):
+    inputs["frames"] = []
+    inputs["metadata"].duration_seconds = 620
+    first = inputs["transcription"].segments[0]
+    inputs["transcription"].segments.append(first.model_copy(update={
+        "start_seconds": 600, "end_seconds": 610, "source_utterance_id": "distinct-u2",
+        "words": [first.words[0].model_copy(update={"start_seconds": 600, "end_seconds": 610})],
+    }))
+    event = Event()
+    client = FakeClient(window_result())
+    with pytest.raises(CancelledError):
+        OpenAIAnalyzer(client).analyze(**inputs, cancellation_event=event,
+                                      progress_callback=lambda *_: event.set())
+    assert len(client.calls) == 1
+
+
 def test_analyzer_aligns_semantic_groups_to_measured_silence_and_returns_compact_evidence(
     inputs, content,
 ):
@@ -187,6 +270,18 @@ def test_analyzer_fails_closed_when_word_boundary_evidence_is_missing(inputs, co
     assert caught.value.code == "boundaries"
     assert caught.value.stage == "boundary"
     assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+
+
+def test_ai_pause_on_words_is_rejected_after_bounded_schema_retries(inputs, content):
+    inputs["frames"] = []
+    invalid = window_result()
+    invalid["interventions"][0].update(tipo="pausa", punti_chiave=[])
+    client = FakeClient(invalid, invalid, invalid, content)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.code == "boundaries"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+    assert len(client.calls) == 3
 
 
 def test_analyzer_fails_closed_when_silence_collection_is_unavailable(inputs, content):
@@ -345,11 +440,14 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     content["duration_seconds"] = 5760
     def respond(call):
         if call["text_format"] is WindowAnalysis:
-            segments = json.loads(call["input"])["segments"]
+            payload = json.loads(call["input"])
+            segments = payload["segments"]
             data = window_result(
                 [segment["segment_index"] for segment in segments],
                 list(dict.fromkeys(segment["diarization_label"] for segment in segments)),
             )
+            if payload.get("previous_context"):
+                data["previous_continuity"] = "separate"
         else:
             data = content
         if call["text_format"] is ConsolidatedTextReport:

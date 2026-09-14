@@ -7,7 +7,7 @@ transcript text.
 from collections.abc import Sequence
 import json
 import math
-from typing import Annotated, Mapping
+from typing import Annotated, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
@@ -19,7 +19,6 @@ from app.models import (
     Evidence,
     IDENTITY_EVIDENCE_KINDS,
     GENERIC_INTERVENTION_SPEAKER,
-    InterventionKind,
     Nonnegative,
     ReportModel,
     SlideChange,
@@ -30,6 +29,7 @@ from app.transcription import TranscriptionResult, TranscriptSegment
 
 MAX_WINDOW_SECONDS = 600
 MAX_WINDOW_CHARS = 12_000
+MAX_PREVIOUS_CONTEXT_CHARS = 3_000
 MAX_CONSOLIDATION_CHARS = 30_000
 MAX_VISUAL_CONTEXT_CHARS = 18_000
 MAX_FAST_REPORT_CHARS = 30_000
@@ -84,7 +84,8 @@ class WindowInterventionDraft(ReportModel):
     """AI-proposed grouping of complete, local transcript segment indexes."""
 
     segment_indexes: list[Annotated[int, Field(ge=0, strict=True)]] = Field(min_length=1)
-    tipo: InterventionKind
+    # Transcript utterances carry speech; only the audio aligner creates pauses.
+    tipo: Literal["intervento", "saluti", "logistica", "domande", "cambio_relatore"]
     diarization_labels: list[str] = Field(default_factory=list)
     titolo: Annotated[str, Field(min_length=1, max_length=180)]
     sintesi: Annotated[str, Field(min_length=1, max_length=600)]
@@ -106,6 +107,7 @@ class WindowAnalysis(ReportModel):
     speakers: list[WindowSpeaker] = Field(max_length=8)
     uncertainties: list[BoundedText] = Field(default_factory=list, max_length=6)
     interventions: list[WindowInterventionDraft] = Field(default_factory=list, max_length=80)
+    previous_continuity: Literal["continue", "separate", "unresolved"] | None = None
 
 
 class ConsolidatedSpeaker(ReportModel):
@@ -139,7 +141,8 @@ def _fits_window(segments: list[TranscriptSegment]) -> bool:
     window = _window_for(segments)
     return (
         window.end_seconds - window.start_seconds <= MAX_WINDOW_SECONDS
-        and len(window.to_payload()) <= MAX_WINDOW_CHARS
+        # Reserve room for the preceding group's context in the same request.
+        and len(window.to_payload()) <= MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS - 32
     )
 
 
@@ -234,6 +237,42 @@ def _speaker_names(labels: Sequence[str], mapping: Mapping[str, str]) -> list[st
     return names
 
 
+def previous_window_context(window: TranscriptWindow, analysis: WindowAnalysis) -> dict:
+    """Bounded tail of the preceding semantic group, without word evidence."""
+    draft = analysis.interventions[-1]
+    context = {
+        "tipo": draft.tipo, "titolo": draft.titolo, "sintesi": draft.sintesi,
+        "prefix_omitted": False, "segments": [],
+    }
+    for index in reversed(draft.segment_indexes):
+        item = window.segments[index].model_dump(mode="json", exclude={"words"})
+        original = item["text"]
+        context["segments"].insert(0, item)
+        if len(json.dumps(context, ensure_ascii=False)) > MAX_PREVIOUS_CONTEXT_CHARS:
+            if len(context["segments"]) > 1:
+                context["segments"].pop(0)
+            else:
+                # The final source utterance may itself exceed the context cap.
+                # Explicitly label the omitted prefix; uncertainty must fail closed.
+                item["text"] = ""
+                room = MAX_PREVIOUS_CONTEXT_CHARS - len(json.dumps(context, ensure_ascii=False))
+                if room <= 0:
+                    raise ValueError("La partizione non ha contesto sufficiente al margine")
+                item["text"] = original[-room:]
+                while len(json.dumps(context, ensure_ascii=False)) > MAX_PREVIOUS_CONTEXT_CHARS:
+                    item["text"] = item["text"][1:]
+                if not item["text"]:
+                    raise ValueError("La partizione non ha contesto sufficiente al margine")
+            context["prefix_omitted"] = True
+            break
+    return context
+
+
+def shares_seam_utterance(previous: TranscriptWindow, current: TranscriptWindow) -> bool:
+    source = previous.segments[-1].source_utterance_id
+    return bool(source and source == current.segments[0].source_utterance_id)
+
+
 def materialize_interventions(
     duration_seconds: float,
     windows: Sequence[TranscriptWindow],
@@ -246,7 +285,7 @@ def materialize_interventions(
         raise ValueError("La partizione degli interventi non è valida")
 
     groups: list[SemanticIntervention] = []
-    for window, analysis in zip(windows, analyses):
+    for window_index, (window, analysis) in enumerate(zip(windows, analyses)):
         if not window.segments or not analysis.interventions:
             raise ValueError("La partizione degli interventi deve includere ogni segmento")
         flattened = [
@@ -256,7 +295,10 @@ def materialize_interventions(
         ]
         if flattened != list(range(len(window.segments))):
             raise ValueError("La partizione degli interventi deve essere ordinata, completa e univoca")
-        for draft in analysis.interventions:
+        if window_index and analysis.previous_continuity not in {"continue", "separate"}:
+            if not shares_seam_utterance(windows[window_index - 1], window):
+                raise ValueError("La partizione ha un margine di finestra irrisolto")
+        for draft_index, draft in enumerate(analysis.interventions):
             selected = [window.segments[index] for index in draft.segment_indexes]
             selected_labels = {segment.diarization_label for segment in selected}
             if any(label not in selected_labels for label in draft.diarization_labels):
@@ -283,11 +325,14 @@ def materialize_interventions(
                 if segment.source_utterance_id
             }
             shared_sources = previous_sources & current_sources
-            if groups and shared_sources:
+            continues = bool(window_index and draft_index == 0 and analysis.previous_continuity == "continue")
+            if groups and (shared_sources or continues):
                 previous = groups[-1]
                 if (previous.tipo != current.tipo
-                        or any(segment.source_utterance_id not in shared_sources
-                               for segment in current.segments)):
+                        or (shared_sources and not continues and any(
+                            segment.source_utterance_id not in shared_sources
+                            for segment in current.segments
+                        ))):
                     raise ValueError(
                         "La partizione divide una utterance sorgente in gruppi incompatibili"
                     )

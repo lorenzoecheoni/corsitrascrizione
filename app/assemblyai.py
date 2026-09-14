@@ -22,6 +22,13 @@ _ALLOWED_BASE_URLS = {
 }
 
 
+class WordEvidenceError(TranscriptionError):
+    """A completed transcript lacks valid audio word evidence, not availability."""
+
+    def __init__(self) -> None:
+        super().__init__("response")
+
+
 def _error_for_status(status: int) -> TranscriptionError:
     code = (
         "rate_limit" if status == 429
@@ -151,7 +158,7 @@ class AssemblyAITranscriber:
             label = f"assembly:{speaker.strip()}"
             raw_words = utterance.get("words") if isinstance(utterance, dict) else None
             if not isinstance(raw_words, list) or not raw_words:
-                raise TranscriptionError("response")
+                raise WordEvidenceError()
             words: list[TranscriptWord] = []
             previous_end = start
             for raw_word in raw_words:
@@ -162,7 +169,7 @@ class AssemblyAITranscriber:
                     word_end = float(raw_word["end"]) / 1000
                     confidence = float(raw_word["confidence"])
                 except (KeyError, TypeError, ValueError, OverflowError):
-                    raise TranscriptionError("response") from None
+                    raise WordEvidenceError() from None
                 if (
                     not isinstance(word_text, str) or not word_text.strip()
                     or not isinstance(word_speaker, str) or word_speaker.strip() != speaker.strip()
@@ -170,14 +177,14 @@ class AssemblyAITranscriber:
                     or not math.isfinite(confidence)
                     or word_start < start or word_end > end or word_start < previous_end
                 ):
-                    raise TranscriptionError("response")
+                    raise WordEvidenceError()
                 try:
                     parsed_word = TranscriptWord(
                         text=word_text.strip(), start_seconds=word_start, end_seconds=word_end,
                         diarization_label=label, confidence=confidence,
                     )
                 except (TypeError, ValueError):
-                    raise TranscriptionError("response") from None
+                    raise WordEvidenceError() from None
                 words.append(parsed_word)
                 previous_end = word_end
             originals.append(TranscriptSegment(

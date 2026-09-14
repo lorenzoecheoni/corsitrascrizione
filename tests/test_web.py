@@ -35,6 +35,7 @@ OTHER_VIDEO_TITLE = "Secondo corso"
 
 
 def add_complete_boundary_evidence(report: AcademyReport) -> AcademyReport:
+    report.audio_boundary_version = 1
     if not report.interventions:
         report.interventions = [Intervention(
             id="i001", start_seconds=0, end_seconds=report.duration_seconds,
@@ -599,12 +600,20 @@ def test_exports_require_completion_and_queued_job_can_be_cancelled(client):
     assert client.get(f"/api/jobs/{job.id}").json()["state"] == "cancelled"
 
 
-def test_historical_json_requires_reanalysis_before_any_external_work(client, monkeypatch):
+@pytest.mark.parametrize("single_segment", [False, True])
+def test_historical_json_requires_reanalysis_before_any_external_work(client, monkeypatch, single_segment):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    if single_segment:
+        report.interventions = [Intervention(
+            id="i001", start_seconds=0, end_seconds=report.duration_seconds, tipo="intervento",
+            relatori=[], titolo="Intervento unico", sintesi="Spiegazione completa.",
+            punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+        )]
     store = client.app.state.store
     job = store.create("not-even-a-bunny-url", source_title="Report storico")
     store.update(job.id, state=JobState.PROCESSING)
     store.update(job.id, state=JobState.COMPLETED, report=report)
+    original_inventory, original_bunny = client.app.state.inventory, client.app.state.bunny
     client.app.state.inventory = _ForbiddenProvider()
     client.app.state.bunny = _ForbiddenProvider()
     client.app.state.assemblyai = _ForbiddenProvider()
@@ -630,6 +639,10 @@ def test_historical_json_requires_reanalysis_before_any_external_work(client, mo
     assert "Rianalisi necessaria" in page
     assert f'href="/#catalog-title"' in page
     assert "Download JSON v1.1" not in page
+    client.app.state.inventory, client.app.state.bunny = original_inventory, original_bunny
+    home = client.get("/").text
+    assert "Rianalisi necessaria" in home
+    assert f'href="/jobs/{job.id}/report.json"' not in home
 
 
 def test_completed_job_downloads_and_page_escape_untrusted_content(client):

@@ -396,6 +396,7 @@ def make_intervention(
 
 def make_report(items: list[Intervention], *, duration: int | None = None) -> AcademyReport:
     report = report_with_reconciled_speakers()
+    report.audio_boundary_version = 1
     report.interventions = items
     report.duration_seconds = duration if duration is not None else int(items[-1].end_seconds)
     report.boundaries = [
@@ -445,6 +446,7 @@ def make_video(
 def report_with_reconciled_speakers() -> AcademyReport:
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     report = AcademyReport.model_validate(data)
+    report.audio_boundary_version = 1
     report.speakers = [
         SpeakerProfile(
             id="vincenzo",

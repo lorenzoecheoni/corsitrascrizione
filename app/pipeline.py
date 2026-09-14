@@ -9,14 +9,14 @@ from time import monotonic
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
 from app.boundaries import has_complete_boundary_evidence
-from app.assemblyai import AssemblyAITranscriber
+from app.assemblyai import AssemblyAITranscriber, WordEvidenceError
 from app.bunny import (BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError,
                        BunnyPlaybackError, BunnyReadinessError, parse_bunny_url, read_metadata)
 from app.config import Settings
 from app.costs import estimate_cost
 from app.jobs import JobCancelled
 from app.logging_config import log_event
-from app.media import FFmpegProcessor, MediaError, MediaProtectedError, temporary_workspace
+from app.media import FFmpegProcessor, MediaError, MediaProtectedError, SilenceEvidenceError, temporary_workspace
 from app.models import AcademyReport, APIUsage, ProviderUsage
 from app.transcription import OpenAITranscriber, TranscriptionError
 
@@ -289,6 +289,9 @@ class AnalysisPipeline:
                 code = "not_found"
             elif isinstance(exc, MediaProtectedError):
                 code = "protected_video"
+            elif isinstance(exc, (WordEvidenceError, SilenceEvidenceError)):
+                code = "boundaries"
+                phase = "boundary"
             elif isinstance(exc, MediaError):
                 code = "media_decode"
             elif isinstance(exc, TranscriptionError):

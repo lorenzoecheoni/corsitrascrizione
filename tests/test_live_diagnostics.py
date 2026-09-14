@@ -17,6 +17,7 @@ from app.analysis import OpenAIAnalyzer
 from app.analysis_chunks import (
     MAX_CONSOLIDATION_CHARS,
     MAX_WINDOW_CHARS,
+    MAX_PREVIOUS_CONTEXT_CHARS,
     ConsolidatedTextReport,
     WindowAnalysis,
     split_transcript_windows,
@@ -102,8 +103,12 @@ def test_synthetic_workload_has_representative_varied_text_volume():
     assert len({segment.text for segment in transcription.segments}) == 96
     assert len(set(" ".join(segment.text for segment in transcription.segments).split())) >= 250
     assert len(windows) >= 10
-    assert all(10_800 <= size <= 12_000 for size in sizes[:-1])
-    assert max(sizes) >= 11_000
+    # Keep the same 100k-character workload dense within the transcript budget;
+    # the rest of each request is reserved for previous semantic context.
+    transcript_budget = MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS
+    assert all(.9 * transcript_budget <= size <= transcript_budget for size in sizes[:-1])
+    assert max(sizes) >= .95 * transcript_budget
+    assert [segment for window in windows for segment in window.segments] == transcription.segments
     assert all(window.end_seconds - window.start_seconds <= 600 for window in windows)
 
 
@@ -249,7 +254,8 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     assert metadata.duration_seconds == 5760
     assert sum(len(segment.text) for segment in transcription.segments) >= 100_000
     assert len(windows) >= 10
-    assert all(len(window.to_payload()) >= 10_800 for window in windows[:-1])
+    assert all(len(window.to_payload()) >= .9 * (MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS)
+               for window in windows[:-1])
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
     client = OpenAI(api_key=api_key, max_retries=0)

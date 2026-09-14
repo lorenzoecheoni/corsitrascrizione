@@ -30,6 +30,29 @@ def test_silence_events_pair_and_close_end_of_file():
     ]
 
 
+@pytest.mark.parametrize("start,end", [
+    (4800123 / 48000, 4812456 / 48000),
+    (48000123 / 48000, 48012456 / 48000),
+    (528001123 / 48000, 528013456 / 48000),
+])
+def test_silence_events_accept_six_significant_digit_serialization(start, end):
+    events = media._SilenceEvents()
+    events.consume(f"[silencedetect @ 0x1] silence_start: {start:.6g}")
+    events.consume(f"[silencedetect @ 0x1] silence_end: {end:.6g} | silence_duration: {end-start:.6g}")
+    intervals = events.finish(14_400)
+    assert len(intervals) == 1
+    assert intervals[0].start_seconds == float(f"{start:.6g}")
+    assert intervals[0].end_seconds == float(f"{end:.6g}")
+
+
+@pytest.mark.parametrize("duration", ["2.0001", "999"])
+def test_silence_events_reject_contradictions_beyond_printed_precision(duration):
+    events = media._SilenceEvents()
+    events.consume("[silencedetect @ 0x1] silence_start: 2")
+    with pytest.raises(MediaError):
+        events.consume(f"[silencedetect @ 0x1] silence_end: 4 | silence_duration: {duration}")
+
+
 @pytest.mark.parametrize("diagnostics, duration", [
     (["[silencedetect @ 0x1] silence_end: 4.75 | silence_duration: 2.5"], 10),
     (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_start: 3"], 10),
@@ -343,6 +366,29 @@ def test_visual_only_extraction_returns_no_intervals_when_silencedetect_reports_
     assert result.silence_measured is True
 
 
+def _assert_synthetic_speech_pauses(intervals):
+    expected = [(1, 3.4), (4.4, 5.2)]
+    assert len(intervals) == len(expected)
+    for interval, pair in zip(intervals, expected, strict=True):
+        assert (interval.start_seconds, interval.end_seconds) == pytest.approx(pair, abs=.15)
+
+
+def test_synthetic_speech_pause_gate_accepts_codec_rounding():
+    _assert_synthetic_speech_pauses([
+        media.SilenceInterval(1.00002, 3.39998), media.SilenceInterval(4.40001, 5.20003),
+    ])
+
+
+@pytest.mark.parametrize("intervals", [
+    [media.SilenceInterval(1, 3.4)],
+    [media.SilenceInterval(1, 3.4), media.SilenceInterval(4.4, 5.2), media.SilenceInterval(6, 7)],
+    [media.SilenceInterval(1.2, 3.4), media.SilenceInterval(4.4, 5.2)],
+])
+def test_synthetic_speech_pause_gate_rejects_wrong_count_or_timing(intervals):
+    with pytest.raises(AssertionError):
+        _assert_synthetic_speech_pauses(intervals)
+
+
 def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_files(tmp_path, media_tools) -> None:
     ffmpeg, _ = media_tools
     source = tmp_path / "speech-pauses.mp4"
@@ -363,9 +409,7 @@ def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_fi
         result = FFmpegProcessor(*media_tools).extract_visual(
             str(source), workspace, lambda _: None, Event(),
         )
-        assert [(item.start_seconds, item.end_seconds) for item in result.silence_intervals] == pytest.approx([
-            (1, 3.4), (4.4, 5.2),
-        ], abs=.15)
+        _assert_synthetic_speech_pauses(result.silence_intervals)
         assert result.audio_chunks == []
         assert not list(workspace.rglob("*.m4a"))
         assert not list(workspace.rglob("audio.csv"))

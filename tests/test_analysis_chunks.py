@@ -242,6 +242,100 @@ def test_materialize_preserves_one_example_grouped_over_three_utterances():
     assert result.boundaries == []
 
 
+@pytest.mark.parametrize("decision", [None, "unresolved"])
+def test_materialize_rejects_unresolved_window_seam_with_distinct_source_ids(decision):
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "Per completare l'esempio dobbiamo", "u1"),
+        _spoken(600, 610, "assembly:A", "aggiungere il secondo termine.", "u2"),
+    ])
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               interventions=[_draft([0])]) for _ in windows]
+    if decision is not None:
+        analyses[1] = analyses[1].model_copy(update={"previous_continuity": decision})
+    with pytest.raises(ValueError, match="partizione"):
+        materialize_interventions(610, windows, analyses, {}, [])
+
+
+@pytest.mark.parametrize("kind,label", [("intervento", "assembly:A"), ("cambio_relatore", "assembly:M")])
+def test_materialize_preserves_explicitly_complete_seam_and_moderator(kind, label):
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "Esempio concluso.", "u1"),
+        _spoken(600, 610, label, "Passiamo al nuovo tema.", "u2"),
+    ])
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               interventions=[_draft([0])]),
+                WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               interventions=[_draft([0], tipo=kind, diarization_labels=[label],
+                                                     punti_chiave=["a", "b", "c"] if kind == "intervento" else [])])]
+    analyses[1] = analyses[1].model_copy(update={"previous_continuity": "separate"})
+    result = materialize_interventions(610, windows, analyses, {}, [])
+    assert [item.tipo for item in result.interventions] == ["intervento", kind]
+    assert len(result.boundaries) == 1
+    assert result.boundaries[0].boundary_seconds == 599
+
+
+def test_explicit_seam_continuation_can_extend_split_source_with_next_utterance():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "Premessa lunga", "u1"),
+        _spoken(600, 700, "assembly:A", "completa la frase", "u1"),
+        _spoken(701, 710, "assembly:A", "e conclude lo stesso esempio.", "u2"),
+    ])
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               interventions=[_draft([0])]),
+                WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               previous_continuity="continue", interventions=[_draft([0, 1])])]
+    result = materialize_interventions(710, windows, analyses, {}, [])
+    assert len(result.interventions) == 1
+    assert result.boundaries == []
+
+
+def test_previous_context_escaping_is_bounded_and_hints_cannot_drop_it():
+    from app.analysis import _window_payload
+    from app.analysis_chunks import WindowAnalysis, previous_window_context, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "\"\\\n" * 5000 + "Conclusione della premessa", "u1"),
+        _spoken(600, 610, "assembly:A", "Si conclude lo stesso esempio.", "u2"),
+    ])
+    previous = windows[-2]
+    analysis = WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                              interventions=[_draft(list(range(len(previous.segments))))])
+    context = previous_window_context(previous, analysis)
+    payload = _window_payload(windows[-1], ["Nome " * 30] * 20, context)
+    assert len(payload) <= 12_000
+    assert json.loads(payload)["previous_context"] == context
+    assert context["prefix_omitted"] is True
+    assert context["segments"][-1]["text"].endswith("Conclusione della premessa")
+
+
+def test_previous_context_oversized_required_metadata_fails_without_hanging():
+    import subprocess
+    import sys
+
+    code = """
+from app.analysis_chunks import WindowAnalysis, previous_window_context, split_transcript_windows
+from app.transcription import TranscriptSegment
+segment = TranscriptSegment(start_seconds=0, end_seconds=10, text='parola',
+                            diarization_label='A', source_utterance_id='x' * 4000)
+window = split_transcript_windows([segment])[0]
+analysis = WindowAnalysis(detected_language='it', synopsis_notes=[], speakers=[], interventions=[
+    dict(segment_indexes=[0], tipo='saluti', titolo='Saluti', sintesi='Saluti.', confidenza=.9)])
+try:
+    previous_window_context(window, analysis)
+except ValueError:
+    pass
+else:
+    raise AssertionError('Oversized required context must fail closed')
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, timeout=2)
+
+
 def test_prompts_preserve_every_announced_presenter_moderator_and_speaker_without_voice_mapping():
     from app.prompts import CONSOLIDATION_PROMPT, WINDOW_PROMPT
 

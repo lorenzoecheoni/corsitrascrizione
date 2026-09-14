@@ -32,6 +32,7 @@ def components(tmp_path):
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     data.pop("cost")
     content = AcademyContent.model_validate(data)
+    content.audio_boundary_version = 1
     metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600,
                                   status=3, available_resolutions=[240, 720])
     content.duration_seconds = 3600
@@ -114,6 +115,7 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert components.calls == ["metadata", "hls", "media", "transcription", "analysis"]
     assert report.title == components.content.title
     assert report.bunny_title == "Corso di prova"
+    assert report.audio_boundary_version == 1
     assert report.usage.transcription.requests == 0
     assert report.cost.estimated_low_usd == .41
     assert report.cost.estimated_high_usd == .69
@@ -350,6 +352,7 @@ def test_pipeline_passes_measured_silence_and_persists_only_compact_boundary_evi
     report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
 
     assert report.boundaries[0].boundary_seconds == 101
+    assert report.audio_boundary_version == 1
     serialized = report.model_dump_json()
     assert "private raw transcript" not in serialized
     assert "audio.m4a" not in serialized
@@ -391,12 +394,121 @@ def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
     assert sentinel not in str(caught.value) + caplog.text
 
 
-def test_pipeline_rejects_report_without_complete_boundary_evidence(components, caplog):
+@pytest.mark.parametrize("failure", ["missing_words", "invalid_words", "silence_end", "no_filter", "no_audio", "no_progress"])
+def test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript(
+    components, tmp_path, monkeypatch, caplog, failure,
+):
+    import logging
+    import sys
+    import traceback
+    import httpx
+    from app import media as media_module
+    from app.assemblyai import AssemblyAITranscriber
+
+    caplog.set_level(logging.INFO, logger="app.events")
+    submitted = Event()
+    requests = []
+    word_failure = failure in {"missing_words", "invalid_words"}
+
+    def handle(request):
+        requests.append(request.method)
+        if request.method == "POST":
+            submitted.set()
+            return httpx.Response(200, json={"id": "ephemeral-transcript"})
+        if request.method == "DELETE":
+            return httpx.Response(200, json={"status": "deleted"})
+        if not word_failure:
+            return httpx.Response(200, json={"status": "processing"})
+        utterance = {"speaker": "A", "start": 0, "end": 1000, "text": "PRIVATE-TRANSCRIPT"}
+        if failure == "invalid_words":
+            utterance["words"] = [{"text": "PRIVATE-WORD", "start": 900, "end": 100,
+                                    "speaker": "A", "confidence": .9}]
+        return httpx.Response(200, json={"status": "completed", "audio_duration": 3600,
+                                        "utterances": [utterance]})
+
+    real_run = media_module._run_process
+    media_cancelled = Event()
+
+    def run_media(args, event, consume):
+        assert args.count("-i") == 1
+        assert submitted.wait(2)
+        if word_failure:
+            assert event.wait(2), "The malformed transcript must cancel the media worker"
+            media_cancelled.set()
+            raise CancelledError()
+        if failure == "no_progress":
+            from PIL import Image
+            template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+            Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        diagnostic = {
+            "silence_end": "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 2",
+            "no_filter": "[AVFilterGraph @ 0x1] No such filter: 'silencedetect'",
+            "no_audio": "Stream map '0:a:0' matches no streams.",
+            "no_progress": "[Parsed_showinfo_0] n: 0 pts_time:0\nInput stream #0:0 1 packets read (100 bytes)",
+        }[failure]
+        # Real pipe draining, silencedetect parser, termination and reap.
+        return_code = 0 if failure == "no_progress" else 1
+        script = f"import sys; print({diagnostic!r}, file=sys.stderr, flush=True); sys.exit({return_code})"
+        real_run([sys.executable, "-c", script], event, consume)
+
+    monkeypatch.setattr(media_module, "_run_process", run_media)
+    components.pipeline.media = media_module.FFmpegProcessor()
+    components.pipeline.bunny.build_mp4_url = lambda _: "https://cdn.example.com/play.mp4"
+    transcriber = AssemblyAITranscriber("test-key", transport=httpx.MockTransport(handle),
+                                       poll_interval_seconds=.01, timeout_seconds=1)
+    components.pipeline.fast_transcriber = transcriber
+    try:
+        with pytest.raises(PipelineError) as caught:
+            components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    finally:
+        transcriber.close()
+
+    assert caught.value.code == "boundaries"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+    assert requests.count("POST") == 1 and requests.count("DELETE") == 1
+    assert requests[-1] == "DELETE"
+    assert media_cancelled.is_set() is word_failure
+    assert list(tmp_path.iterdir()) == []
+    assert "'phase': 'boundary'" in caplog.text
+    exposed = caplog.text + "".join(traceback.format_exception(caught.value))
+    assert all(value not in exposed for value in ("PRIVATE-WORD", "PRIVATE-TRANSCRIPT", "silence_end:", "No such filter:"))
+
+
+@pytest.mark.parametrize("status", [401, 429, 503])
+def test_real_transcription_provider_status_is_not_mapped_to_boundaries(components, status):
+    import httpx
+    from app.assemblyai import AssemblyAITranscriber
+
+    started = Event()
+
+    def handle(request):
+        started.set()
+        return httpx.Response(status, json={"error": "PRIVATE-PROVIDER-BODY"})
+
+    def extract_visual(url, workspace, progress, event):
+        assert started.wait(2)
+        assert event.wait(2)
+        raise CancelledError()
+
+    components.pipeline.media.extract_visual = extract_visual
+    components.pipeline.bunny.build_mp4_url = lambda _: "https://cdn.example.com/play.mp4"
+    transcriber = AssemblyAITranscriber("test-key", transport=httpx.MockTransport(handle))
+    components.pipeline.fast_transcriber = transcriber
+    try:
+        with pytest.raises(PipelineError) as caught:
+            components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    finally:
+        transcriber.close()
+    assert caught.value.code == "transcription"
+
+
+@pytest.mark.parametrize("missing", ["interventions", "audio_boundary_version"])
+def test_pipeline_rejects_report_without_complete_boundary_evidence(components, caplog, missing):
     import logging
     sentinel = "FULL-TRANSCRIPT-SENTINEL provider body /private/audio-file.m4a ffmpeg diagnostic"
     caplog.set_level(logging.INFO, logger="app.events")
     components.content.synopsis = sentinel
-    components.content.interventions = []
+    setattr(components.content, missing, [] if missing == "interventions" else None)
 
     with pytest.raises(PipelineError) as caught:
         components.pipeline.run(SOURCE, lambda *_: None, components.event)

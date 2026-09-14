@@ -57,12 +57,15 @@ def _speech_extent(group: SemanticIntervention, words: Sequence[TranscriptWord])
 
 
 def _matching_silence(start: float, end: float, intervals: Sequence[SilenceInterval]) -> SilenceInterval | None:
-    matches = [
-        SilenceInterval(max(start, interval.start_seconds), min(end, interval.end_seconds))
-        for interval in intervals
-        if min(end, interval.end_seconds) > max(start, interval.start_seconds)
-    ]
-    return min(matches, key=lambda item: (-(item.end_seconds - item.start_seconds), item.start_seconds)) if matches else None
+    matches = [interval for interval in intervals
+               if min(end, interval.end_seconds) > max(start, interval.start_seconds)]
+    return min(
+        matches,
+        key=lambda item: (
+            -(min(end, item.end_seconds) - max(start, item.start_seconds)),
+            item.start_seconds,
+        ),
+    ) if matches else None
 
 
 def _whole_second(candidate: float, lower: int, upper: int, silence: SilenceInterval | None) -> int:
@@ -125,6 +128,12 @@ def _complete(interventions: Sequence[Intervention], boundaries: Sequence[Bounda
                 or evidence.previous_intervention_id != previous.id
                 or evidence.next_intervention_id != following.id):
             return False
+        if (previous.tipo == "pausa"
+                and (evidence.words_before or not evidence.pause_before)):
+            return False
+        if (following.tipo == "pausa"
+                and (evidence.words_after or not evidence.pause_after)):
+            return False
         try:
             BoundaryEvidence.model_validate(evidence.model_dump())
         except ValueError:
@@ -173,6 +182,8 @@ def align_intervention_boundaries(
         # candidate beyond the quantized speech gap or collapse a final segment.
         lower = max((cuts[-1] if cuts else 0) + 1, _nearest_second(previous_end))
         upper = min(duration - 1, _nearest_second(extents[index + 1][1]) - 1, _nearest_second(next_start))
+        if semantic_groups[index + 1].tipo in {"saluti", "domande", "cambio_relatore"}:
+            upper = min(upper, math.ceil(next_start) - 1)
         silence = _matching_silence(previous_end, next_start, silence_intervals)
         rule = "no_pause" if silence is None else "short_pause"
         candidate = previous_end if silence is None else (silence.start_seconds + silence.end_seconds) / 2

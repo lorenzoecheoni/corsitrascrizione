@@ -70,6 +70,24 @@ def test_boundary_evidence_allows_zero_to_five_verbatim_words(count):
     assert evidence.words_before == ["Così,"] * count
 
 
+@pytest.mark.parametrize(
+    "words_field,flag_field",
+    [("words_before", "pause_before"), ("words_after", "pause_after")],
+)
+@pytest.mark.parametrize("count", [0, 1, 4])
+def test_boundary_evidence_requires_pause_flag_for_fewer_than_five_words(
+    words_field, flag_field, count,
+):
+    from app.models import BoundaryEvidence
+
+    with pytest.raises(ValidationError):
+        BoundaryEvidence(**{
+            **_boundary_data(),
+            words_field: ["x"] * count,
+            flag_field: False,
+        })
+
+
 def test_one_hour_cost_is_in_approved_range() -> None:
     cost = estimate_cost(duration_seconds=3600, downloaded_bytes=450_000_000)
     assert 0.40 <= cost.estimated_low_usd <= cost.estimated_high_usd <= 0.70

@@ -66,6 +66,21 @@ def test_prefers_integer_inside_measured_silence():
     assert result.boundaries[0].boundary_seconds == 11
 
 
+def test_partial_overlap_preserves_original_silence_duration_for_long_pause():
+    result = align_intervention_boundaries(
+        20,
+        [group(0, 10.2), group(13, 19)],
+        [SilenceInterval(9.5, 12)],
+    )
+
+    assert [(item.start_seconds, item.end_seconds, item.tipo) for item in result.interventions] == [
+        (0, 11, "intervento"),
+        (11, 12, "pausa"),
+        (12, 20, "intervento"),
+    ]
+    assert [item.rule for item in result.boundaries] == ["long_pause", "long_pause"]
+
+
 @pytest.mark.parametrize("texts,before,after", [
     (("uno,",), ["uno,"], ["uno,"]),
     (("uno,", "due", "tre", "quattro!"), ["uno,", "due", "tre", "quattro!"], ["uno,", "due", "tre", "quattro!"]),
@@ -118,6 +133,15 @@ def test_moderator_is_preserved_between_speakers():
     assert result.boundaries[0].boundary_seconds < 11
 
 
+def test_fractional_moderator_start_fails_when_no_prior_valid_second():
+    with pytest.raises(ValueError, match="confine intero"):
+        align_intervention_boundaries(
+            20,
+            [group(0, 10.6), group(10.7, 13, kind="cambio_relatore"), group(14, 19)],
+            [],
+        )
+
+
 @pytest.mark.parametrize("groups,duration", [
     ([], 10),
     ([group(0, 10, ())], 10),
@@ -150,4 +174,26 @@ def test_completeness_rejects_invalid_evidence_or_timeline(change):
         report.interventions[1].start_seconds += 1
     else:
         report.interventions[2].id = "i001"
+    assert not has_complete_boundary_evidence(report)
+
+
+def test_completeness_rejects_false_pause_flag_for_short_evidence():
+    report = report_for(align_intervention_boundaries(20, [group(0, 10), group(12, 19)], []), 20)
+    report.boundaries[0].pause_before = False
+
+    assert not has_complete_boundary_evidence(report)
+
+
+@pytest.mark.parametrize(
+    "boundary_index,words_field",
+    [(0, "words_after"), (1, "words_before")],
+)
+def test_completeness_rejects_words_on_a_generated_pause_side(boundary_index, words_field):
+    report = report_for(align_intervention_boundaries(
+        20,
+        [group(0, 10.2), group(13, 19)],
+        [SilenceInterval(10.3, 12.9)],
+    ), 20)
+    setattr(report.boundaries[boundary_index], words_field, ["inventata"] * 5)
+
     assert not has_complete_boundary_evidence(report)

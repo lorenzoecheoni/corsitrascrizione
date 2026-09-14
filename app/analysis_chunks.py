@@ -282,9 +282,16 @@ def materialize_interventions(
                 segment.source_utterance_id for segment in current.segments
                 if segment.source_utterance_id
             }
-            if groups and previous_sources & current_sources:
-                previous = groups.pop()
-                groups.append(SemanticIntervention(
+            shared_sources = previous_sources & current_sources
+            if groups and shared_sources:
+                previous = groups[-1]
+                if (previous.tipo != current.tipo
+                        or any(segment.source_utterance_id not in shared_sources
+                               for segment in current.segments)):
+                    raise ValueError(
+                        "La partizione divide una utterance sorgente in gruppi incompatibili"
+                    )
+                groups[-1] = SemanticIntervention(
                     tipo=previous.tipo,
                     relatori=tuple(dict.fromkeys((*previous.relatori, *current.relatori))),
                     titolo=previous.titolo,
@@ -292,7 +299,7 @@ def materialize_interventions(
                     punti_chiave=previous.punti_chiave,
                     confidenza=previous.confidenza,
                     segments=(*previous.segments, *current.segments),
-                ))
+                )
             else:
                 groups.append(current)
 

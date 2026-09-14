@@ -147,9 +147,13 @@ class BoundaryEvidence(ReportModel):
         return words
 
     @model_validator(mode="after")
-    def distinct_interventions(self) -> "BoundaryEvidence":
+    def validate_relationships(self) -> "BoundaryEvidence":
         if self.previous_intervention_id == self.next_intervention_id:
             raise ValueError("Un confine richiede due interventi distinti")
+        if len(self.words_before) < 5 and not self.pause_before:
+            raise ValueError("Meno di cinque parole prima richiedono il flag pausa")
+        if len(self.words_after) < 5 and not self.pause_after:
+            raise ValueError("Meno di cinque parole dopo richiedono il flag pausa")
         return self
 
 

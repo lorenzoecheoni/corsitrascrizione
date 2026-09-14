@@ -190,6 +190,42 @@ def test_materialize_merges_shared_source_utterance_across_adjacent_windows():
     assert result.boundaries == []
 
 
+def test_materialize_rejects_shared_source_utterance_with_incompatible_types():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 5, "assembly:A", "Prima parte", "u1"),
+        _spoken(5, 10, "assembly:A", "Seconda parte", "u1"),
+    ])
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[],
+        interventions=[
+            _draft([0]),
+            _draft([1], tipo="cambio_relatore", punti_chiave=[]),
+        ],
+    )]
+
+    with pytest.raises(ValueError, match="partizione"):
+        materialize_interventions(10, windows, analyses, {}, [])
+
+
+def test_materialize_rejects_merge_that_would_absorb_a_distinct_utterance():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 5, "assembly:A", "Prima parte", "u1"),
+        _spoken(5, 10, "assembly:A", "Seconda parte", "u1"),
+        _spoken(10, 12, "assembly:M", "Passiamo oltre", "u2"),
+    ])
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[],
+        interventions=[_draft([0]), _draft([1, 2], diarization_labels=[])],
+    )]
+
+    with pytest.raises(ValueError, match="partizione"):
+        materialize_interventions(12, windows, analyses, {}, [])
+
+
 def test_materialize_preserves_one_example_grouped_over_three_utterances():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval

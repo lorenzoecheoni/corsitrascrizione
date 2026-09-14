@@ -99,19 +99,19 @@ the terminal callback); restoring `d=.8` fails fixture construction on FFmpeg
 All commands used the prescribed FFmpeg 7 PATH and pinned uv environment.
 
 ```text
-pytest -q <three previously failing node IDs>
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_media.py::test_extract_single_input_audio_scene_timestamps_and_byte_estimate tests/test_media.py::test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_files tests/test_end_to_end.py::test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup
 3 passed, 2 warnings in 1.47s
 
-pytest -q tests/test_media.py tests/test_end_to_end.py::test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_media.py tests/test_end_to_end.py::test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup
 57 passed, 2 warnings in 9.26s
 
-pytest -q tests/test_pipeline.py tests/test_analysis.py tests/test_analysis_chunks.py tests/test_models_reporting.py
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_pipeline.py tests/test_analysis.py tests/test_analysis_chunks.py tests/test_models_reporting.py
 218 passed in 1.90s
 
-env -u RUN_LIVE_BUNNY -u RUN_LIVE_SYNTHETIC_ANALYSIS ... pytest -q --tb=short
+env -u RUN_LIVE_BUNNY -u RUN_LIVE_SYNTHETIC_ANALYSIS PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q --tb=short
 972 passed, 3 skipped, 2 warnings in 31.59s
 
-python -m compileall -q app tests
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync python -m compileall -q app tests
 exit 0
 
 git diff --check
@@ -143,3 +143,80 @@ calls, network access, installs, push, deploy, or reanalysis were performed.
 - **Portability/fail-closed behavior:** FFmpeg 7 real integration and stereo
   `astats` diagnostics were checked. Missing, non-positive, fractional, or
   contradictory duration sample evidence cannot authorize silence boundaries.
+
+## Fix round 1
+
+### Root cause and RED (recorded before the production fix)
+
+The duration meter introduced by commit `15b277b` requires both `aresample`
+and `astats`, but `_SilenceEvents.consume()` classified only a missing
+`silencedetect` filter as missing boundary evidence. Diagnostics for either new
+required filter passed through to `_run_process`, which raised generic
+`MediaError`; `AnalysisPipeline.run()` therefore exposed the safe but incorrect
+`media_decode` category instead of `boundaries`.
+
+The pipeline integration harness was extended with exact `astats` and
+`aresample` missing-filter diagnostics. It keeps the real pipe drain,
+termination/reap, fast-worker cancellation, remote transcript deletion,
+workspace cleanup, safe logging, and traceback checks. Before the production
+change, this exact command failed as intended with both cases reporting
+`media_decode != boundaries`:
+
+```text
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q 'tests/test_pipeline.py::test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript[no_astats]' 'tests/test_pipeline.py::test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript[no_aresample]'
+2 failed in 0.56s
+```
+
+`aresample` is included narrowly because the fixed 1000 Hz rate is required to
+interpret the `astats` sample count as duration. The intended implementation
+will enumerate only the three known boundary-evidence filters rather than map
+arbitrary missing filters to `boundaries`.
+
+### Implementation and GREEN
+
+- `_SilenceEvents.consume()` now recognizes exactly the three filters required
+  to produce boundary evidence: `silencedetect`, `aresample`, and `astats`.
+  Their missing-filter diagnostics raise `SilenceEvidenceError`; the existing
+  pipeline mapper turns that subtype into the fixed `boundaries` response.
+- Arbitrary missing filters are intentionally excluded from the alternation.
+  The separate generic `MediaError -> media_decode` coverage in
+  `test_fast_parallel_failure_cancels_the_other_stage_and_preserves_root_error`
+  and `test_pipeline_sanitizes_failures_and_cleans_files` remains green.
+- The two new pipeline cases now pass and continue to prove one source input,
+  subprocess drain/termination/reap, sibling cancellation, remote deletion,
+  cleanup, fixed user text, and non-disclosure of raw diagnostics.
+
+### Verification commands and output
+
+```text
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q 'tests/test_pipeline.py::test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript[no_astats]' 'tests/test_pipeline.py::test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript[no_aresample]'
+2 passed in 0.43s
+
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_media.py -k 'silence_events or visual_only_extraction_rejects_malformed_silence_diagnostics_safely'
+16 passed, 40 deselected in 0.06s
+
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_pipeline.py
+59 passed in 0.80s
+
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync pytest -q tests/test_media.py tests/test_end_to_end.py::test_form_to_report_with_real_ffmpeg_and_ephemeral_cleanup
+57 passed, 2 warnings in 9.36s
+
+PATH=/tmp/bunny-ffmpeg.SEeIoX/bin:/usr/local/bin:/usr/bin:/bin PYTHONPATH=. UV_PROJECT_ENVIRONMENT='/Users/lorenzo/Documents/Software gestione piattaforme/BunnyVideoReport/.venv' /Users/lorenzo/.local/bin/uv run --no-sync python -m compileall -q app tests
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Self-review
+
+- The regex is bounded to quoted exact filter names and cannot classify an
+  arbitrary `No such filter` line as boundary evidence failure.
+- `SilenceEvidenceError` still carries only the application-authored fixed
+  message. The traceback/log sentinel assertions remain green.
+- The change does not alter process control: exceptions still leave
+  `_run_process` through its `finally`, which stops, waits for, and closes the
+  child pipes; the parallel runner still cancels the transcription sibling and
+  deletes the remote transcript.
+- No source reads, filter graph behavior, progress, byte accounting, report
+  usage, frontend, or persistence behavior changed in this round.

@@ -394,7 +394,10 @@ def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
     assert sentinel not in str(caught.value) + caplog.text
 
 
-@pytest.mark.parametrize("failure", ["missing_words", "invalid_words", "silence_end", "no_filter", "no_audio", "no_progress"])
+@pytest.mark.parametrize("failure", [
+    "missing_words", "invalid_words", "silence_end", "no_filter", "no_astats",
+    "no_aresample", "no_audio", "no_progress",
+])
 def test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript(
     components, tmp_path, monkeypatch, caplog, failure,
 ):
@@ -443,6 +446,8 @@ def test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript(
         diagnostic = {
             "silence_end": "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 2",
             "no_filter": "[AVFilterGraph @ 0x1] No such filter: 'silencedetect'",
+            "no_astats": "[AVFilterGraph @ 0x1] No such filter: 'astats'",
+            "no_aresample": "[AVFilterGraph @ 0x1] No such filter: 'aresample'",
             "no_audio": "Stream map '0:a:0' matches no streams.",
             "no_progress": "[Parsed_showinfo_0] n: 0 pts_time:0\nInput stream #0:0 1 packets read (100 bytes)",
         }[failure]

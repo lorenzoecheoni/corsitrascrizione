@@ -135,7 +135,9 @@ class _SilenceEvents:
         return seconds
 
     def consume(self, line: str) -> None:
-        if (re.search(r"\bNo such filter:\s*['\"]silencedetect['\"]", line)
+        if (re.search(
+                r"\bNo such filter:\s*['\"](?:silencedetect|aresample|astats)['\"]", line,
+            )
                 or re.search(r"\bStream map ['\"]0:a:0['\"] matches no streams\.", line)):
             raise SilenceEvidenceError()
         start = _SILENCE_START.fullmatch(line)

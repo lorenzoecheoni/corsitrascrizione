@@ -335,6 +335,34 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
     assert not any(value.endswith((".m4a", "audio.csv")) for value in commands[0])
 
 
+def test_visual_only_extraction_uses_bunny_duration_without_astats_diagnostics(tmp_path, monkeypatch) -> None:
+    commands = []
+
+    def fake_run(args, event, consume):
+        commands.append(args)
+        template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+        Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
+        consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stderr", "[silencedetect @ 0x1] silence_start: 12.5")
+        consume("stderr", "[silencedetect @ 0x1] silence_end: 14.25 | silence_duration: 1.75")
+        consume("stdout", "out_time_us=8000000")
+
+    monkeypatch.setattr(media, "_run_process", fake_run)
+    progress = []
+    with temporary_workspace(tmp_path) as workspace:
+        result = FFmpegProcessor().extract_visual(
+            "https://cdn.example/video/play_240p.mp4", workspace, progress.append, Event(),
+            duration_seconds=60,
+        )
+
+    assert result.silence_measured is True
+    assert result.silence_intervals == [media.SilenceInterval(12.5, 14.25)]
+    assert progress == [8, 60]
+    assert "silencedetect=noise=-45dB:d=0.15" in commands[0]
+    assert not any("astats=" in value for value in commands[0])
+
+
 def test_audio_extraction_finishes_progress_from_verified_local_chunk_duration(tmp_path, monkeypatch) -> None:
     commands = []
     processor = FFmpegProcessor()
@@ -438,6 +466,7 @@ def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_fi
     with temporary_workspace(tmp_path) as workspace:
         result = FFmpegProcessor(*media_tools).extract_visual(
             str(source), workspace, progress.append, Event(),
+            duration_seconds=6.2,
         )
         _assert_synthetic_speech_pauses(result.silence_intervals)
         assert progress == sorted(progress) and progress[-1] >= 6.1

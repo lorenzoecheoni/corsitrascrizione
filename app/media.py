@@ -391,17 +391,26 @@ class FFmpegProcessor:
     def extract_visual(
         self, source_url: str, workspace: Path,
         progress_callback: Callable[[float], None], cancellation_event: Event,
+        *, duration_seconds: float | None = None,
     ) -> MediaArtifacts:
         """Extract slide candidates without writing temporary audio files."""
+        if duration_seconds is not None and (
+            not math.isfinite(duration_seconds) or duration_seconds <= 0
+        ):
+            raise SilenceEvidenceError()
         token = _active_limits.set(MediaLimits(workspace, monotonic() + self.runtime_seconds,
                                               self.inactivity_seconds, self.max_workspace_bytes))
         try:
-            return self._extract(source_url, workspace, progress_callback, cancellation_event, include_audio=False)
+            return self._extract(
+                source_url, workspace, progress_callback, cancellation_event,
+                include_audio=False, duration_seconds=duration_seconds,
+            )
         finally:
             _active_limits.reset(token)
 
     def _extract(
         self, source_url, workspace, progress_callback, cancellation_event, *, include_audio: bool,
+        duration_seconds: float | None = None,
     ) -> MediaArtifacts:
         _check_cancelled(cancellation_event)
         output = Path(tempfile.mkdtemp(prefix="media-", dir=workspace))
@@ -461,15 +470,15 @@ class FFmpegProcessor:
             str(output / "frame-%06d.jpg"),
         ])
         if not include_audio:
-            # Decode through silencedetect in the existing source pass. FFmpeg's
-            # progress clock follows the sparse JPEG output, so a fixed-rate
-            # end-of-stream sample count supplies the verified audio duration.
+            # Decode through silencedetect in the existing source pass. Bunny's
+            # validated metadata is the canonical export timeline in production;
+            # the astats fallback remains only for direct callers without it.
+            audio_filter = "silencedetect=noise=-45dB:d=0.15"
+            if duration_seconds is None:
+                audio_filter += f",aresample={_DURATION_SAMPLE_RATE},astats=metadata=0:reset=0"
             command.extend([
                 "-map", "0:a:0", "-vn",
-                "-af", (
-                    "silencedetect=noise=-45dB:d=0.15,"
-                    f"aresample={_DURATION_SAMPLE_RATE},astats=metadata=0:reset=0"
-                ),
+                "-af", audio_filter,
                 "-f", "null", os.devnull,
             ])
         _run_process(command, cancellation_event, consume)
@@ -489,9 +498,12 @@ class FFmpegProcessor:
             )
             silence_intervals = []
         else:
-            if audio_samples is None:
-                raise SilenceEvidenceError()
-            terminal_seconds = audio_samples / _DURATION_SAMPLE_RATE
+            if duration_seconds is not None:
+                terminal_seconds = duration_seconds
+            else:
+                if audio_samples is None:
+                    raise SilenceEvidenceError()
+                terminal_seconds = audio_samples / _DURATION_SAMPLE_RATE
             silence_intervals = silence_events.finish(terminal_seconds)
         frame_candidates = deduplicate_frames([
             FrameCandidate(path, timestamps[i]) for i, path in enumerate(frames)

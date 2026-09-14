@@ -113,6 +113,7 @@ class AnalysisPipeline:
                     return self.media.extract_visual(
                         self.bunny.build_mp4_url(metadata), workspace,
                         media_progress, linked_cancel,
+                        duration_seconds=metadata.duration_seconds,
                     )
                 except (MediaProtectedError, BunnyPlaybackError):
                     if attempt or not self.settings.bunny_token_auth_key:

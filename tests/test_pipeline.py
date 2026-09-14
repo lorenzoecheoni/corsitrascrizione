@@ -234,8 +234,9 @@ def test_pipeline_uses_direct_global_transcription_and_single_fast_analysis_when
         components.calls.append("mp4")
         return "https://cdn.example.com/video/play_240p.mp4"
 
-    def extract_visual(url, workspace, progress, cancellation_event):
+    def extract_visual(url, workspace, progress, cancellation_event, *, duration_seconds=None):
         assert url == "https://cdn.example.com/video/play_240p.mp4"
+        assert duration_seconds == 3600
         assert not cancellation_event.is_set()
         assert transcription_started.wait(1), "trascrizione e scansione slide devono partire in parallelo"
         frame = workspace / "frame.jpg"
@@ -395,8 +396,7 @@ def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
 
 
 @pytest.mark.parametrize("failure", [
-    "missing_words", "invalid_words", "silence_end", "no_filter", "no_astats",
-    "no_aresample", "no_audio", "no_progress",
+    "missing_words", "invalid_words", "silence_end", "no_filter", "no_audio",
 ])
 def test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript(
     components, tmp_path, monkeypatch, caplog, failure,
@@ -439,21 +439,13 @@ def test_real_evidence_parsers_map_to_boundaries_and_delete_remote_transcript(
             assert event.wait(2), "The malformed transcript must cancel the media worker"
             media_cancelled.set()
             raise CancelledError()
-        if failure == "no_progress":
-            from PIL import Image
-            template = Path(next(value for value in args if "frame-%06d.jpg" in value))
-            Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
         diagnostic = {
             "silence_end": "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 2",
             "no_filter": "[AVFilterGraph @ 0x1] No such filter: 'silencedetect'",
-            "no_astats": "[AVFilterGraph @ 0x1] No such filter: 'astats'",
-            "no_aresample": "[AVFilterGraph @ 0x1] No such filter: 'aresample'",
             "no_audio": "Stream map '0:a:0' matches no streams.",
-            "no_progress": "[Parsed_showinfo_0] n: 0 pts_time:0\nInput stream #0:0 1 packets read (100 bytes)",
         }[failure]
         # Real pipe draining, silencedetect parser, termination and reap.
-        return_code = 0 if failure == "no_progress" else 1
-        script = f"import sys; print({diagnostic!r}, file=sys.stderr, flush=True); sys.exit({return_code})"
+        script = f"import sys; print({diagnostic!r}, file=sys.stderr, flush=True); sys.exit(1)"
         real_run([sys.executable, "-c", script], event, consume)
 
     monkeypatch.setattr(media_module, "_run_process", run_media)
@@ -490,7 +482,8 @@ def test_real_transcription_provider_status_is_not_mapped_to_boundaries(componen
         started.set()
         return httpx.Response(status, json={"error": "PRIVATE-PROVIDER-BODY"})
 
-    def extract_visual(url, workspace, progress, event):
+    def extract_visual(url, workspace, progress, event, *, duration_seconds=None):
+        assert duration_seconds == 3600
         assert started.wait(2)
         assert event.wait(2)
         raise CancelledError()
@@ -533,7 +526,8 @@ def test_fast_parallel_failure_cancels_the_other_stage_and_preserves_root_error(
     counterpart_cancelled = Event()
     components.pipeline.bunny.build_mp4_url = lambda _metadata: "https://cdn.example/video.mp4"
 
-    def extract_visual(_url, _workspace, _progress, cancellation_event):
+    def extract_visual(_url, _workspace, _progress, cancellation_event, *, duration_seconds=None):
+        assert duration_seconds == 3600
         if failing_stage == "media":
             raise MediaError("private media failure")
         assert cancellation_event.wait(1)

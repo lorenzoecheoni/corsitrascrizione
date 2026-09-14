@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
+import socket
 from uuid import UUID
 
+import httpx
 import pytest
 
 from app import intermediate_report
@@ -12,6 +14,7 @@ from app.intermediate_models import (
 )
 from app.intermediate_report import (
     build_intermediate_report,
+    parse_material_source,
     registered_slug,
     split_role_organization,
 )
@@ -523,3 +526,221 @@ def test_warnings_without_critical_checks_leave_report_verified() -> None:
     result = build_intermediate_report(report, TARGET_GUID)
 
     assert result.stato == "verificato"
+
+
+def test_parse_material_source_extracts_only_a_declared_url_and_title() -> None:
+    material = parse_material_source(
+        "Slide governance | https://example.test/governance.pdf"
+    )
+
+    assert material is not None
+    assert material.model_dump(exclude_none=True) == {
+        "titolo": "Slide governance",
+        "url": "https://example.test/governance.pdf",
+        "accesso": "iscritti",
+    }
+
+
+def test_file_material_is_retained_and_warned_without_network_access() -> None:
+    report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+
+    result = build_intermediate_report(report, TARGET_GUID, material_sources=["dispensa.pdf"])
+
+    assert result.video[0].materiali[0].model_dump(exclude_none=True) == {
+        "titolo": "dispensa",
+        "file": "dispensa.pdf",
+        "accesso": "iscritti",
+    }
+    assert any(
+        check.codice == "MATERIALE_NON_RAGGIUNGIBILE"
+        for check in result.verifiche_richieste
+    )
+
+
+def test_unreachable_url_checker_warns_but_does_not_block_report_creation() -> None:
+    report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+
+    result = build_intermediate_report(
+        report,
+        TARGET_GUID,
+        material_sources=["Slide | https://example.test/unavailable.pdf"],
+        material_url_checker=lambda url: False,
+    )
+
+    assert result.stato == "verificato"
+    assert any(
+        check.codice == "MATERIALE_NON_RAGGIUNGIBILE"
+        for check in result.verifiche_richieste
+    )
+
+
+def test_empty_material_sources_leave_materials_and_slide_links_empty() -> None:
+    report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+
+    result = build_intermediate_report(report, TARGET_GUID)
+    data = result.model_dump(mode="json", exclude_none=True)
+
+    assert data["video"][0]["materiali"] == []
+    assert all("materiale" not in slide and "pagina" not in slide for slide in data["video"][0]["slide"])
+
+
+def test_parse_material_source_strips_trailing_prose_punctuation_and_whitespace() -> None:
+    material = parse_material_source(
+        " \n\t https://example.test/materiali/dispensa.pdf).,| \n"
+    )
+
+    assert material is not None
+    assert material.model_dump(exclude_none=True) == {
+        "titolo": "dispensa.pdf",
+        "url": "https://example.test/materiali/dispensa.pdf",
+        "accesso": "iscritti",
+    }
+
+
+def test_parse_material_source_strips_mixed_title_url_separators() -> None:
+    material = parse_material_source(
+        "Slide | - \t https://example.test/materiali/dispensa.pdf"
+    )
+
+    assert material is not None
+    assert material.titolo == "Slide"
+
+
+def test_material_url_checker_rejects_private_direct_targets_before_any_request(monkeypatch) -> None:
+    monkeypatch.setattr(
+        intermediate_report.httpx,
+        "Client",
+        lambda **kwargs: pytest.fail("private URL must not create an HTTP client"),
+    )
+
+    assert intermediate_report._material_url_is_reachable("http://127.0.0.1/private") is False
+
+
+def test_material_url_checker_rejects_private_dns_answers_before_any_request(monkeypatch) -> None:
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (2, 1, 6, "", ("10.0.0.12", 80)),
+        ],
+    )
+    monkeypatch.setattr(
+        intermediate_report.httpx,
+        "Client",
+        lambda **kwargs: pytest.fail("private DNS answer must not create an HTTP client"),
+    )
+
+    assert intermediate_report._material_url_is_reachable("https://materials.example.test/doc.pdf") is False
+
+
+def test_material_url_checker_rejects_credentials_before_any_request(monkeypatch) -> None:
+    monkeypatch.setattr(
+        intermediate_report.httpx,
+        "Client",
+        lambda **kwargs: pytest.fail("credential URL must not create an HTTP client"),
+    )
+
+    assert intermediate_report._material_url_is_reachable(
+        "https://user:password@materials.example.test/doc.pdf"
+    ) is False
+
+
+def test_material_url_checker_rejects_private_redirect_without_fetching_it(monkeypatch) -> None:
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": "http://127.0.0.1/private"},
+            request=request,
+    )
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+
+    assert intermediate_report._material_url_is_reachable("http://93.184.216.34/doc.pdf") is False
+    assert requests == ["http://93.184.216.34/doc.pdf"]
+
+
+def test_material_url_checker_enforces_one_wall_clock_deadline_across_redirects(monkeypatch) -> None:
+    now = [0.0]
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        now[0] += 3.0
+        if len(requests) == 1:
+            return httpx.Response(302, headers={"location": "/next"}, request=request)
+        return httpx.Response(200, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+
+    assert intermediate_report._material_url_is_reachable("http://93.184.216.34/start") is False
+    assert requests == [
+        "http://93.184.216.34/start",
+        "http://93.184.216.34/next",
+    ]
+
+
+def test_material_url_checker_fails_closed_for_rebinding_hostname_without_request(monkeypatch) -> None:
+    resolutions: list[str] = []
+
+    def rebinding_resolver(host: str, *args, **kwargs):
+        resolutions.append(host)
+        address = "93.184.216.34" if len(resolutions) == 1 else "10.0.0.12"
+        return [(2, 1, 6, "", (address, 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_resolver)
+    monkeypatch.setattr(
+        intermediate_report.httpx,
+        "Client",
+        lambda **kwargs: pytest.fail("hostname must not be resolved or requested"),
+    )
+
+    assert intermediate_report._material_url_is_reachable(
+        "https://materials.example.test/document.pdf"
+    ) is False
+    assert resolutions == []
+
+
+def test_material_url_checker_does_not_wait_for_a_blocking_hostname_resolver(monkeypatch) -> None:
+    now = [0.0]
+    resolutions: list[str] = []
+
+    def blocking_resolver(host: str, *args, **kwargs):
+        resolutions.append(host)
+        now[0] += 10.0
+        return [(2, 1, 6, "", ("93.184.216.34", 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", blocking_resolver)
+    monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        intermediate_report.httpx,
+        "Client",
+        lambda **kwargs: pytest.fail("hostname must not start an HTTP request"),
+    )
+
+    assert intermediate_report._material_url_is_reachable(
+        "https://materials.example.test/document.pdf"
+    ) is False
+    assert resolutions == []
+    assert now[0] < 5.0
+
+
+def test_material_url_checker_uses_the_validated_public_literal_ip(monkeypatch) -> None:
+    requests: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(200, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    monkeypatch.setattr(intermediate_report.httpx, "Client", lambda **kwargs: client)
+
+    assert intermediate_report._material_url_is_reachable(
+        "http://93.184.216.34/document.pdf"
+    ) is True
+    assert requests == ["http://93.184.216.34/document.pdf"]

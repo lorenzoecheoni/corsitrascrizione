@@ -9,7 +9,7 @@ from io import StringIO
 import json
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from urllib.parse import quote
 from uuid import UUID
 
@@ -416,3 +416,27 @@ def speaker_hints_for_video(
             if cleaned and cleaned not in names:
                 names.append(cleaned)
     return names
+
+
+def material_sources_for_video(
+    courses: Sequence[InventoryCourse], video_id: UUID, title: str,
+) -> list[str]:
+    """Return only material cells explicitly associated with one video.
+
+    Materials are evidence from the inventory, so title similarity proposals
+    are deliberately excluded from this lookup.
+    """
+    normalized_title = normalize_title(title)
+    sources: list[str] = []
+    for course in sorted(courses, key=lambda item: (item.posizione_foglio, item.riga, item.id)):
+        matches = (
+            course.guid_esplicito == video_id
+            if course.guid_esplicito is not None
+            else normalize_title(course.titolo) == normalized_title
+        )
+        if not matches:
+            continue
+        for source in course.materiali:
+            if source not in sources:
+                sources.append(source)
+    return sources

@@ -1,12 +1,19 @@
 """Build the one-video Academy intermediate report v1.1 envelope."""
 
+import ipaddress
 import re
+import time
 import unicodedata
+from pathlib import Path
 from typing import Callable, Sequence
+from urllib.parse import urljoin, urlparse
 from uuid import UUID
+
+import httpx
 
 from app.intermediate_models import (
     IntermediateInterventionV11,
+    IntermediateMaterialV11,
     IntermediateReportV11,
     IntermediateSpeakerV11,
     IntermediateVideoV11,
@@ -45,6 +52,7 @@ _INTRODUCTORY_VERB = re.compile(
     r"^(?:approfondisce|tratta|descrive|presenta|illustra|discute|spiega|parla di)\s+",
     re.IGNORECASE,
 )
+_HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 def _name_key(value: str) -> str:
@@ -182,6 +190,78 @@ def _deduplicate_verifications(
     return unique
 
 
+def parse_material_source(value: str) -> IntermediateMaterialV11 | None:
+    """Conservatively convert one declared inventory material into a source."""
+    source = value.strip()
+    if not source:
+        return None
+    match = _HTTP_URL.search(source)
+    if match is not None:
+        url = match.group().rstrip(").,|")
+        title = re.sub(r"[\s|\-]+$", "", source[:match.start()])
+        if not title:
+            title = Path(urlparse(url).path).name or url
+        return IntermediateMaterialV11(titolo=title, url=url)
+    path = Path(source)
+    return IntermediateMaterialV11(titolo=path.stem, file=path.name)
+
+
+def _is_safe_material_url(url: str) -> bool:
+    """Allow only credential-free HTTP(S) URLs with a public literal address.
+
+    Hostnames fail closed: validating a DNS answer separately from the HTTPX
+    connection would allow that hostname to rebind before the actual connect.
+    """
+    try:
+        parsed = urlparse(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            return False
+        return address.is_global
+    except ValueError:
+        return False
+
+
+def _material_url_is_reachable(url: str) -> bool:
+    """Safely probe a public URL without buffering its body or trusting proxies."""
+    deadline = time.monotonic() + 5.0
+    current_url = url
+    try:
+        if not _is_safe_material_url(current_url):
+            return False
+        with httpx.Client(
+            timeout=httpx.Timeout(5.0), follow_redirects=False, trust_env=False,
+        ) as client:
+            for _ in range(20):
+                if not _is_safe_material_url(current_url):
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                with client.stream("GET", current_url, timeout=httpx.Timeout(remaining)) as response:
+                    if time.monotonic() > deadline:
+                        return False
+                    if 200 <= response.status_code < 300:
+                        return True
+                    if not 300 <= response.status_code < 400:
+                        return False
+                    location = response.headers.get("location")
+                    if location is None:
+                        return True
+                    current_url = urljoin(current_url, location)
+    except (httpx.HTTPError, OSError, ValueError):
+        return False
+    return False
+
+
 def build_verifications(
     video: IntermediateVideoV11,
     speakers: Sequence[IntermediateSpeakerV11],
@@ -259,9 +339,28 @@ def build_intermediate_report(
     material_sources: Sequence[str] = (),
     material_url_checker: Callable[[str], bool] | None = None,
 ) -> IntermediateReportV11:
-    """Transform one persisted analytical report without provider or network calls."""
-    # Material resolution and URL checks belong to the later material task.
-    _ = material_sources, material_url_checker
+    """Transform one persisted report, with bounded checks for declared material URLs."""
+    checker = material_url_checker or _material_url_is_reachable
+    materials: list[IntermediateMaterialV11] = []
+    material_failures: list[str] = []
+    seen_sources: set[str] = set()
+    for source in material_sources:
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        material = parse_material_source(source)
+        if material is None:
+            continue
+        materials.append(material)
+        if material.url is None:
+            material_failures.append(source)
+            continue
+        try:
+            reachable = checker(material.url)
+        except Exception:
+            reachable = False
+        if not reachable:
+            material_failures.append(source)
     speakers = [
         speaker for speaker in reconcile_speakers(report)
         if not GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name)
@@ -311,9 +410,9 @@ def build_intermediate_report(
         "sinossi": corrected(report.synopsis),
         "interventi": interventions,
         "slide": slides,
-        "materiali": [],
+        "materiali": materials,
     })
-    verifications = build_verifications(video, intermediate_speakers, ())
+    verifications = build_verifications(video, intermediate_speakers, material_failures)
     status = "da_verificare" if any(
         item.livello == "critico" for item in verifications
     ) else "verificato"

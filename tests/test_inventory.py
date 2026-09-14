@@ -12,6 +12,7 @@ from app.inventory import (
     InventoryCourse,
     InventoryWriteUnavailable,
     normalize_title,
+    material_sources_for_video,
     organize_catalog,
     propose_matches,
     speaker_hints_for_video,
@@ -260,6 +261,65 @@ def test_speaker_hints_use_only_explicit_guid_or_exact_normalized_title():
     )
 
     assert hints == ["Furio d'Andrea", "Luigi Morra", "Antonio Sibilia"]
+
+
+def test_material_sources_require_explicit_or_exact_video_match() -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    other_id = UUID("00000000-0000-0000-0000-000000000002")
+    courses = [
+        InventoryCourse(
+            id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+            titolo="Titolo non correlato",
+            relatori_attesi=[],
+            materiali=["Slide governance | https://example.test/governance.pdf"],
+            link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+        InventoryCourse(
+            id="0:3", foglio="Formazione", gid="0", posizione_foglio=0, riga=3,
+            titolo="Webinar: Governance delle holding", relatori_attesi=[],
+            materiali=["dispensa.pdf", "Slide governance | https://example.test/governance.pdf"],
+            link=None, colonna_link="D", guid_esplicito=None,
+        ),
+        inventory_course(
+            "Governance holding simile estesa", row=4,
+        ).model_copy(update={"materiali": ["proposta-fuzzy.pdf"]}),
+    ]
+
+    assert material_sources_for_video(courses, target_id, "Governance delle holding") == [
+        "Slide governance | https://example.test/governance.pdf",
+        "dispensa.pdf",
+    ]
+    assert material_sources_for_video(courses, other_id, "Governance holding simile") == []
+
+
+def test_material_sources_follow_spreadsheet_order_when_input_is_shuffled() -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    courses = [
+        InventoryCourse(
+            id="1:8", foglio="Secondo", gid="1", posizione_foglio=1, riga=8,
+            titolo="Altro", relatori_attesi=[], materiali=["terzo.pdf"],
+            link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+        InventoryCourse(
+            id="0:4-b", foglio="Primo", gid="0", posizione_foglio=0, riga=4,
+            titolo="Altro", relatori_attesi=[], materiali=["secondo-b.pdf"],
+            link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+        InventoryCourse(
+            id="0:2", foglio="Primo", gid="0", posizione_foglio=0, riga=2,
+            titolo="Altro", relatori_attesi=[], materiali=["primo.pdf"],
+            link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+        InventoryCourse(
+            id="0:4-a", foglio="Primo", gid="0", posizione_foglio=0, riga=4,
+            titolo="Altro", relatori_attesi=[], materiali=["secondo-a.pdf"],
+            link=None, colonna_link="D", guid_esplicito=target_id,
+        ),
+    ]
+
+    assert material_sources_for_video(courses, target_id, "Ignorato") == [
+        "primo.pdf", "secondo-a.pdf", "secondo-b.pdf", "terzo.pdf",
+    ]
 
 
 def test_sheet_write_requires_optional_credentials(csv_by_gid):

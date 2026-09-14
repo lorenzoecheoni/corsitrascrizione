@@ -17,7 +17,7 @@ from app.analysis_chunks import ConsolidatedTextReport, WindowAnalysis
 from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
 from app.models import AcademyContent, ProviderUsage
-from app.prompts import REPAIR_PROMPT, WINDOW_PROMPT
+from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, WINDOW_PROMPT
 from app.transcription import TranscriptionResult, TranscriptSegment
 
 
@@ -848,3 +848,14 @@ def test_failed_window_repair_gets_one_fresh_final_attempt(inputs, content):
     assert client.calls[1]["instructions"] == REPAIR_PROMPT
     assert client.calls[2]["instructions"] == WINDOW_PROMPT
     assert [call["max_output_tokens"] for call in client.calls[:3]] == [2000, 2000, 4000]
+
+
+@pytest.mark.parametrize("prompt", [WINDOW_PROMPT, CONSOLIDATION_PROMPT])
+def test_analysis_prompts_require_deterministic_editorial_handoff(prompt: str) -> None:
+    lowered = " ".join(prompt.casefold().split())
+
+    assert "20 secondi" in lowered
+    assert "inizino dal contenuto" in lowered
+    assert "punti_chiave" in prompt and "solo" in lowered and "intervento" in lowered
+    assert "non assegnare accessi" in lowered
+    assert "non generare verifiche academy" in lowered

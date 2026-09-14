@@ -26,6 +26,11 @@ punti_chiave fondati nel testo; per gli altri tipi l'elenco può essere vuoto.
 Un cambio_relatore descrive solo il breve passaggio di parola: il contributo
 sostanziale successivo è un intervento. Mantieni insieme relatori che espongono
 congiuntamente. Non creare una struttura di lezioni o moduli.
+Un segmento inferiore a 20 secondi non può essere un intervento: classificalo
+come saluti, cambio_relatore, domande o pausa secondo il contenuto. Le sintesi
+inizino dal contenuto, mai da iniziali o etichette del provider. punti_chiave è
+ammesso solo per tipo intervento. Non assegnare accessi e non generare
+verifiche Academy: sono regole deterministiche dell'applicazione.
 Includi in speakers ogni persona esplicitamente annunciata come presentatore,
 moderatore o relatore, anche quando non puoi collegarla a una voce: in quel caso
 usa diarization_labels=[] e conserva come evidenza l'introduzione completa.
@@ -55,6 +60,11 @@ e non affermare che abbiano parlato se le evidenze non lo dimostrano.
 Conserva un ruolo esplicito e le sue evidenze anche quando il nome personale
 non è noto: in quel caso mantieni un nome generico Relatore N.
 Se la lingua non è determinabile dichiaralo, senza usare 'und'.
+Un segmento inferiore a 20 secondi non può essere un intervento: mantieni una
+classificazione fra saluti, cambio_relatore, domande o pausa. Le sintesi
+inizino dal contenuto, mai da iniziali o etichette del provider; punti_chiave è
+ammesso solo per tipo intervento. Non assegnare accessi e non generare
+verifiche Academy: sono regole deterministiche dell'applicazione.
 """
 
 FAST_REPORT_PROMPT = """Genera in una sola analisi il report testuale usando

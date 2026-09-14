@@ -4,6 +4,12 @@ from uuid import UUID
 
 import pytest
 
+from app import intermediate_report
+from app.intermediate_models import (
+    IntermediateSlideV11,
+    IntermediateSpeakerV11,
+    IntermediateVideoV11,
+)
 from app.intermediate_report import (
     build_intermediate_report,
     registered_slug,
@@ -14,6 +20,72 @@ from app.reporting import correct_speaker_name_mentions
 
 
 TARGET_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+
+
+def make_intervention(
+    start: float,
+    end: float,
+    *,
+    tipo: str = "intervento",
+    titolo: str = "Approfondimento",
+    sintesi: str = "Approfondimento sul tema.",
+    relatori: list[str] | None = None,
+    punti_chiave: list[str] | None = None,
+    confidenza: float = .9,
+) -> Intervention:
+    return Intervention(
+        id=f"source-{start}-{end}",
+        start_seconds=start,
+        end_seconds=end,
+        tipo=tipo,
+        relatori=[] if relatori is None else relatori,
+        titolo=titolo,
+        sintesi=sintesi,
+        punti_chiave=(
+            ["Primo punto", "Secondo punto", "Terzo punto"]
+            if punti_chiave is None and tipo == "intervento"
+            else punti_chiave or []
+        ),
+        confidenza=confidenza,
+    )
+
+
+def make_report(items: list[Intervention], *, duration: int | None = None) -> AcademyReport:
+    report = report_with_reconciled_speakers()
+    report.interventions = items
+    report.duration_seconds = duration if duration is not None else int(items[-1].end_seconds)
+    return report
+
+
+def make_video(
+    interventions: list[Intervention],
+    *,
+    duration: int | None = None,
+    slide_confidences: list[float] = (),
+) -> IntermediateVideoV11:
+    normalized = intermediate_report.normalize_interventions(
+        make_report(interventions, duration=duration)
+    )
+    return IntermediateVideoV11(
+        chiave="v1",
+        guid=str(TARGET_GUID),
+        titolo_bunny="Video di prova",
+        durata_secondi=duration if duration is not None else int(interventions[-1].end_seconds),
+        ordine=1,
+        lingua="italiano",
+        sinossi="Sinossi",
+        interventi=normalized,
+        slide=[
+            IntermediateSlideV11(
+                inizio=index * 10,
+                titolo="Slide",
+                testo_principale="Contenuto",
+                confidenza=confidence,
+            )
+            for index, confidence in enumerate(slide_confidences)
+        ],
+        materiali=[],
+    )
 
 
 def report_with_reconciled_speakers() -> AcademyReport:
@@ -206,3 +278,248 @@ def test_builder_renumbers_interventions_in_chronological_stable_order() -> None
         ["Gaetano De Vito"], ["Vincenzo Manfredi"], ["Furio d'Andrea"],
         ["Antonio Sibilia"], ["Luigi Morra"],
     ]
+
+
+@pytest.mark.parametrize(("title", "summary", "speakers", "expected"), [
+    ("Ringraziamenti", "Grazie a tutti.", ["Vincenzo Manfredi"], "saluti"),
+    ("Passaggio", "Passaggio della parola ad Antonio.", ["Vincenzo Manfredi"], "cambio_relatore"),
+    ("Chiarimento", "Risposta sul regime fiscale.", ["Luigi Morra"], "domande"),
+    ("Micro-turno", "Precisazione sul valore fiscale.", ["Luigi Morra"], "domande"),
+    ("Silenzio", "Nessun parlato.", [], "pausa"),
+])
+def test_under_twenty_seconds_is_never_an_intervention(
+    title: str, summary: str, speakers: list[str], expected: str
+) -> None:
+    item = make_intervention(0, 9, titolo=title, sintesi=summary, relatori=speakers)
+
+    result = intermediate_report.normalize_interventions(make_report([item]))[0]
+
+    assert result.tipo == expected
+    assert result.punti_chiave == []
+
+
+def test_non_interventions_lose_key_points_without_mutating_the_saved_report() -> None:
+    item = make_intervention(
+        0, 30, tipo="saluti", punti_chiave=["Dati editoriali residui"],
+    )
+    report = make_report([item])
+
+    result = intermediate_report.normalize_interventions(report)[0]
+
+    assert result.punti_chiave == []
+    assert report.interventions[0].punti_chiave == ["Dati editoriali residui"]
+
+
+def test_provider_initial_summary_is_rewritten_to_content_first_form() -> None:
+    item = make_intervention(
+        0, 30, sintesi="F approfondisce il realizzo controllato.",
+    )
+
+    result = intermediate_report.normalize_interventions(make_report([item]))[0]
+
+    assert result.sintesi == "Tema trattato: il realizzo controllato."
+
+
+@pytest.mark.parametrize("label", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+@pytest.mark.parametrize("delimiter", [": ", ". ", " - "])
+def test_explicit_single_letter_provider_labels_are_rewritten_without_delimiters(
+    label: str, delimiter: str,
+) -> None:
+    item = make_intervention(
+        0, 30, sintesi=f"{label}{delimiter}approfondisce il realizzo controllato.",
+    )
+
+    result = intermediate_report.normalize_interventions(make_report([item]))[0]
+
+    assert result.sintesi == "Tema trattato: il realizzo controllato."
+
+
+@pytest.mark.parametrize("summary", [
+    "A questo punto affronta il realizzo controllato.",
+    "E approfondisce il realizzo controllato.",
+    "A seguito della premessa tratta il realizzo controllato.",
+    "E quindi approfondisce il realizzo controllato.",
+])
+def test_legitimate_italian_a_and_e_openings_are_not_provider_labels(summary: str) -> None:
+    item = make_intervention(0, 30, sintesi=summary)
+
+    result = intermediate_report.normalize_interventions(make_report([item]))[0]
+
+    assert result.sintesi == summary
+
+
+@pytest.mark.parametrize("seconds", [20, 119])
+def test_twenty_to_one_hundred_nineteen_seconds_stays_intervention_and_warns(
+    seconds: int,
+) -> None:
+    item = make_intervention(0, seconds, relatori=["Vincenzo Manfredi"])
+    report = make_report([item])
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert result.video[0].interventi[0].tipo == "intervento"
+    assert "INTERVENTO_BREVE" in [check.codice for check in result.verifiche_richieste]
+
+
+def test_one_hundred_twenty_seconds_does_not_warn_as_short_intervention() -> None:
+    item = make_intervention(0, 120, relatori=["Vincenzo Manfredi"])
+
+    result = build_intermediate_report(make_report([item]), TARGET_GUID)
+
+    assert all(check.codice != "INTERVENTO_BREVE" for check in result.verifiche_richieste)
+
+
+def test_access_selects_only_first_intervention_between_eight_and_fifteen_minutes() -> None:
+    report = make_report([
+        make_intervention(0, 360, relatori=["Vincenzo Manfredi"]),
+        make_intervention(360, 900, relatori=["Vincenzo Manfredi"]),
+        make_intervention(900, 2100, relatori=["Vincenzo Manfredi"]),
+    ])
+
+    result = build_intermediate_report(report, TARGET_GUID).video[0].interventi
+
+    assert [item.accesso for item in result] == ["iscritti", "pubblico", "iscritti"]
+
+
+def test_access_falls_back_to_first_eight_minute_intervention() -> None:
+    report = make_report([
+        make_intervention(0, 900, relatori=["Vincenzo Manfredi"]),
+        make_intervention(900, 2100, relatori=["Vincenzo Manfredi"]),
+        make_intervention(2100, 3000, relatori=["Vincenzo Manfredi"]),
+    ])
+
+    result = build_intermediate_report(report, TARGET_GUID).video[0].interventi
+
+    assert [item.accesso for item in result] == ["pubblico", "iscritti", "iscritti"]
+
+
+def test_access_falls_back_to_longest_substantive_intervention() -> None:
+    report = make_report([
+        make_intervention(0, 300, relatori=["Vincenzo Manfredi"]),
+        make_intervention(300, 720, relatori=["Vincenzo Manfredi"]),
+        make_intervention(720, 960, relatori=["Vincenzo Manfredi"]),
+    ])
+
+    result = build_intermediate_report(report, TARGET_GUID).video[0].interventi
+
+    assert [item.accesso for item in result] == ["iscritti", "pubblico", "iscritti"]
+
+
+def test_choose_public_intervention_returns_none_without_substantive_segments() -> None:
+    items = intermediate_report.normalize_interventions(make_report([
+        make_intervention(0, 10, tipo="saluti", punti_chiave=[]),
+    ]))
+
+    assert intermediate_report.choose_public_intervention(items) is None
+
+
+def test_missing_speaker_on_spoken_segment_is_critical_verification() -> None:
+    video = make_video([make_intervention(0, 30, relatori=[])])
+
+    checks = intermediate_report.build_verifications(video, [], [])
+
+    assert [(check.livello, check.codice, check.intervento) for check in checks] == [
+        ("critico", "RELATORE_NON_IDENTIFICATO", "v1-i001"),
+        ("avviso", "INTERVENTO_BREVE", "v1-i001"),
+    ]
+
+
+@pytest.mark.parametrize("second_start, second_end, duration", [
+    (11, 20, 20),
+    (9, 20, 20),
+    (10, 21, 20),
+])
+def test_gap_overlap_or_end_beyond_duration_is_critical_timeline_verification(
+    second_start: int, second_end: int, duration: int,
+) -> None:
+    video = make_video([
+        make_intervention(0, 10, relatori=["Vincenzo Manfredi"]),
+        make_intervention(second_start, second_end, relatori=["Vincenzo Manfredi"]),
+    ], duration=duration)
+
+    checks = intermediate_report.build_verifications(video, [], [])
+
+    assert any(
+        check.livello == "critico" and check.codice == "TEMPI_INCOERENTI"
+        for check in checks
+    )
+
+
+def test_low_intervention_and_slide_confidence_each_emit_a_warning() -> None:
+    video = make_video(
+        [make_intervention(0, 120, relatori=["Vincenzo Manfredi"], confidenza=.79)],
+        slide_confidences=[.69],
+    )
+
+    checks = intermediate_report.build_verifications(video, [], [])
+
+    confidence_checks = [check for check in checks if check.codice == "CONFIDENZA_BASSA"]
+    assert [(check.intervento, check.campo) for check in confidence_checks] == [
+        ("v1-i001", "confidenza"), (None, "slide[0].confidenza"),
+    ]
+
+
+def test_exact_confidence_thresholds_do_not_emit_warnings() -> None:
+    video = make_video(
+        [make_intervention(0, 120, relatori=["Vincenzo Manfredi"], confidenza=.8)],
+        slide_confidences=[.7],
+    )
+
+    checks = intermediate_report.build_verifications(video, [], [])
+
+    assert all(check.codice != "CONFIDENZA_BASSA" for check in checks)
+
+
+def test_repeated_material_detection_is_deduplicated_by_code_and_context() -> None:
+    video = make_video([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+
+    checks = intermediate_report.build_verifications(
+        video, [], ["dispensa.pdf", "dispensa.pdf"],
+    )
+
+    material_checks = [check for check in checks if check.codice == "MATERIALE_NON_RAGGIUNGIBILE"]
+    assert len(material_checks) == 1
+    assert material_checks[0].campo == "materiali:dispensa.pdf"
+
+
+@pytest.mark.parametrize("roles", [
+    (None, None),
+    ("Avvocata", "Commercialista"),
+])
+def test_unregistered_speakers_keep_distinct_warnings_and_deduplicate_exact_repeats(
+    roles: tuple[str | None, str | None],
+) -> None:
+    video = make_video([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+    furio = IntermediateSpeakerV11(
+        nome="Furio d'Andrea", ruolo=roles[0], confidenza=.65, origine_nome=["audio"],
+    )
+    marta = IntermediateSpeakerV11(
+        nome="Marta Verdi", ruolo=roles[1], confidenza=.65, origine_nome=["audio"],
+    )
+
+    checks = intermediate_report.build_verifications(video, [furio, marta, furio], [])
+
+    registry_checks = [check for check in checks if check.codice == "RELATORE_NON_NEL_REGISTRO"]
+    assert len(registry_checks) == 2
+    assert {check.campo for check in registry_checks} == {
+        "relatori:furio d andrea:ruolo" if roles[0] is None else "relatori:furio d andrea:nome",
+        "relatori:marta verdi:ruolo" if roles[1] is None else "relatori:marta verdi:nome",
+    }
+
+
+def test_critical_checks_set_report_status_after_verifications_are_deduplicated() -> None:
+    report = make_report([make_intervention(0, 30, relatori=[])])
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert result.stato == "da_verificare"
+
+
+def test_warnings_without_critical_checks_leave_report_verified() -> None:
+    report = make_report([
+        make_intervention(0, 30, relatori=["Vincenzo Manfredi"], confidenza=.79),
+    ])
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert result.stato == "verificato"

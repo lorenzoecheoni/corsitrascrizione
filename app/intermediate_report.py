@@ -5,7 +5,13 @@ import unicodedata
 from typing import Callable, Sequence
 from uuid import UUID
 
-from app.intermediate_models import IntermediateReportV11
+from app.intermediate_models import (
+    IntermediateInterventionV11,
+    IntermediateReportV11,
+    IntermediateSpeakerV11,
+    IntermediateVideoV11,
+    VerificationRequestV11,
+)
 from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
 from app.reporting import correct_speaker_name_mentions, reconcile_speakers
 
@@ -20,6 +26,25 @@ _ASSOHOLDING_ROLE = re.compile(
     r"^(?P<role>.*?)\s+di\s+(?:ass holding|asso holding|assoholding)\s*$", re.IGNORECASE
 )
 _CONFIDENCE_SCORE = {"alta": .95, "media": .65, "bassa": .35}
+_SHORT_SEGMENT_KEYWORDS = {
+    "saluti": ("grazie", "ringrazi", "saluto", "saluti", "arrivederci"),
+    "cambio_relatore": (
+        "passaggio", "passa la parola", "cedo la parola", "presentazione",
+        "presenta", "introduce", "introduzione",
+    ),
+    "domande": ("domanda", "domande", "risposta", "risposte", "chiarimento", "quesito"),
+}
+_PROVIDER_SUMMARY_PREFIX = re.compile(
+    r"^\s*(?:(?:speaker|relatore|provider|voce)\s*[-_:]?\s*[a-z0-9]+"
+    r"(?:\s*[:\-–]\s*|\s+)|[a-z]\s*(?::|\.|-|–)\s*|"
+    r"[b-df-hj-km-np-tv-z]\s+)"
+    r"(?P<body>.+?)\s*$",
+    re.IGNORECASE,
+)
+_INTRODUCTORY_VERB = re.compile(
+    r"^(?:approfondisce|tratta|descrive|presenta|illustra|discute|spiega|parla di)\s+",
+    re.IGNORECASE,
+)
 
 
 def _name_key(value: str) -> str:
@@ -57,9 +82,174 @@ def _speaker_warning(name: str, role: str | None) -> dict[str, str]:
         "livello": "avviso",
         "codice": "RELATORE_NON_NEL_REGISTRO",
         "video": "v1",
-        "campo": "ruolo" if role is None else "nome",
+        "campo": f"relatori:{_name_key(name)}:{'ruolo' if role is None else 'nome'}",
         "messaggio": message,
     }
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(_name_key(value).split())
+
+
+def _short_segment_kind(*, title: str, summary: str, speakers: Sequence[str]) -> str:
+    text = _normalized_text(f"{title} {summary}")
+    for kind in ("saluti", "cambio_relatore", "domande"):
+        if any(keyword in text for keyword in _SHORT_SEGMENT_KEYWORDS[kind]):
+            return kind
+    return "domande" if speakers else "pausa"
+
+
+def _normalize_summary(summary: str) -> str:
+    match = _PROVIDER_SUMMARY_PREFIX.match(summary)
+    if match is None:
+        return summary
+    content = _INTRODUCTORY_VERB.sub("", match.group("body")).strip()
+    return f"Tema trattato: {content}" if content else summary
+
+
+def normalize_interventions(
+    report: AcademyReport, video_key: str = "v1",
+) -> list[IntermediateInterventionV11]:
+    """Copy and deterministically normalize persisted analytical interventions."""
+    normalized = []
+    for index, intervention in enumerate(
+        sorted(report.interventions, key=lambda item: item.start_seconds), start=1
+    ):
+        duration = intervention.end_seconds - intervention.start_seconds
+        kind = intervention.tipo
+        if kind == "intervento" and duration < 20:
+            kind = _short_segment_kind(
+                title=intervention.titolo,
+                summary=intervention.sintesi,
+                speakers=intervention.relatori,
+            )
+        normalized.append(IntermediateInterventionV11(
+            id=f"{video_key}-i{index:03d}",
+            inizio=intervention.start_seconds,
+            fine=intervention.end_seconds,
+            tipo=kind,
+            relatori=list(intervention.relatori),
+            titolo=intervention.titolo,
+            sintesi=_normalize_summary(intervention.sintesi),
+            punti_chiave=list(intervention.punti_chiave) if kind == "intervento" else [],
+            accesso="iscritti",
+            confidenza=intervention.confidenza,
+        ))
+    return normalized
+
+
+def choose_public_intervention(
+    interventions: Sequence[IntermediateInterventionV11],
+) -> str | None:
+    """Return the id selected by the fixed Academy preview ranking."""
+    duration = lambda item: item.end_seconds - item.start_seconds
+    eligible = [item for item in interventions if item.tipo == "intervento"]
+    preview = next((item for item in eligible if 480 <= duration(item) < 900), None)
+    preview = preview or next((item for item in eligible if duration(item) >= 480), None)
+    preview = preview or max(eligible, key=duration, default=None)
+    return preview.id if preview else None
+
+
+def _verification(
+    level: str,
+    code: str,
+    *,
+    video: str,
+    message: str,
+    intervention: str | None = None,
+    field: str | None = None,
+) -> VerificationRequestV11:
+    return VerificationRequestV11.model_validate({
+        "livello": level,
+        "codice": code,
+        "video": video,
+        "intervento": intervention,
+        "campo": field,
+        "messaggio": message,
+    })
+
+
+def _deduplicate_verifications(
+    items: Sequence[VerificationRequestV11],
+) -> list[VerificationRequestV11]:
+    unique = []
+    seen = set()
+    for item in items:
+        key = (item.codice, item.video, item.intervento, item.campo)
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def build_verifications(
+    video: IntermediateVideoV11,
+    speakers: Sequence[IntermediateSpeakerV11],
+    material_failures: Sequence[str],
+) -> list[VerificationRequestV11]:
+    """Build all actionable checks from the normalized intermediate data."""
+    checks = []
+    interventions = video.interventi
+    for item in interventions:
+        duration = item.end_seconds - item.start_seconds
+        if item.tipo not in {"pausa", "logistica"} and not item.relatori:
+            checks.append(_verification(
+                "critico", "RELATORE_NON_IDENTIFICATO", video=video.chiave,
+                intervention=item.id, field="relatori",
+                message="Segmento parlato senza relatore identificato.",
+            ))
+        if item.tipo == "intervento" and 20 <= duration < 120:
+            checks.append(_verification(
+                "avviso", "INTERVENTO_BREVE", video=video.chiave,
+                intervention=item.id, field="durata",
+                message="Intervento separato inferiore a due minuti.",
+            ))
+        if item.confidenza < .8:
+            checks.append(_verification(
+                "avviso", "CONFIDENZA_BASSA", video=video.chiave,
+                intervention=item.id, field="confidenza",
+                message="Confidenza dell'intervento inferiore a 0,8.",
+            ))
+
+    if interventions and interventions[0].start_seconds != 0:
+        checks.append(_verification(
+            "critico", "TEMPI_INCOERENTI", video=video.chiave,
+            intervention=interventions[0].id, field="inizio",
+            message="La timeline non inizia a zero.",
+        ))
+    for previous, current in zip(interventions, interventions[1:]):
+        if current.start_seconds != previous.end_seconds:
+            checks.append(_verification(
+                "critico", "TEMPI_INCOERENTI", video=video.chiave,
+                intervention=current.id, field="inizio",
+                message="La timeline contiene un buco o una sovrapposizione.",
+            ))
+    if interventions and interventions[-1].end_seconds != video.durata_secondi:
+        checks.append(_verification(
+            "critico", "TEMPI_INCOERENTI", video=video.chiave,
+            intervention=interventions[-1].id, field="fine",
+            message="La fine della timeline non coincide con la durata del video.",
+        ))
+
+    for speaker in speakers:
+        if speaker.slug is None:
+            checks.append(VerificationRequestV11.model_validate(
+                _speaker_warning(speaker.nome, speaker.ruolo)
+            ))
+    for index, slide in enumerate(video.slide):
+        if slide.confidenza < .7:
+            checks.append(_verification(
+                "avviso", "CONFIDENZA_BASSA", video=video.chiave,
+                field=f"slide[{index}].confidenza",
+                message="Confidenza della slide inferiore a 0,7.",
+            ))
+    for source in material_failures:
+        checks.append(_verification(
+            "avviso", "MATERIALE_NON_RAGGIUNGIBILE", video=video.chiave,
+            field=f"materiali:{source}",
+            message=f"Materiale non disponibile: {source}.",
+        ))
+    return _deduplicate_verifications(checks)
 
 
 def build_intermediate_report(
@@ -79,38 +269,30 @@ def build_intermediate_report(
     canonical_names = [speaker.display_name for speaker in speakers]
     corrected = lambda value: correct_speaker_name_mentions(value, canonical_names)
 
-    intermediate_speakers = []
-    verifications = []
+    intermediate_speakers: list[IntermediateSpeakerV11] = []
     for speaker in speakers:
         role, organization = split_role_organization(speaker.role)
         slug = registered_slug(speaker.display_name)
-        intermediate_speakers.append({
+        intermediate_speakers.append(IntermediateSpeakerV11.model_validate({
             "nome": speaker.display_name,
             "slug": slug,
             "ruolo": role,
             "organizzazione": organization,
             "confidenza": _CONFIDENCE_SCORE[speaker.confidence],
             "origine_nome": speaker.origins or ["audio"],
-        })
-        if slug is None:
-            verifications.append(_speaker_warning(speaker.display_name, role))
+        }))
 
-    interventions = []
-    for index, intervention in enumerate(
-        sorted(report.interventions, key=lambda item: item.start_seconds), start=1
-    ):
-        interventions.append({
-            "id": f"v1-i{index:03d}",
-            "inizio": intervention.start_seconds,
-            "fine": intervention.end_seconds,
-            "tipo": intervention.tipo,
-            "relatori": [corrected(name) for name in intervention.relatori],
-            "titolo": corrected(intervention.titolo),
-            "sintesi": corrected(intervention.sintesi),
-            "punti_chiave": [corrected(point) for point in intervention.punti_chiave],
-            "accesso": "iscritti",
-            "confidenza": intervention.confidenza,
-        })
+    normalized = normalize_interventions(report)
+    corrected_interventions = [item.model_copy(update={
+        "relatori": [corrected(name) for name in item.relatori],
+        "titolo": corrected(item.titolo),
+        "sintesi": corrected(item.sintesi),
+        "punti_chiave": [corrected(point) for point in item.punti_chiave],
+    }) for item in normalized]
+    public_id = choose_public_intervention(corrected_interventions)
+    interventions = [item.model_copy(update={
+        "accesso": "pubblico" if item.id == public_id else "iscritti",
+    }) for item in corrected_interventions]
 
     slides = [{
         "inizio": slide.timestamp_seconds,
@@ -119,25 +301,31 @@ def build_intermediate_report(
         "confidenza": _CONFIDENCE_SCORE[slide.confidence],
     } for slide in report.slides]
 
+    video = IntermediateVideoV11.model_validate({
+        "chiave": "v1",
+        "guid": str(guid),
+        "titolo_bunny": corrected(report.bunny_title),
+        "durata_secondi": int(report.duration_seconds + .5),
+        "ordine": 1,
+        "lingua": report.detected_language,
+        "sinossi": corrected(report.synopsis),
+        "interventi": interventions,
+        "slide": slides,
+        "materiali": [],
+    })
+    verifications = build_verifications(video, intermediate_speakers, ())
+    status = "da_verificare" if any(
+        item.livello == "critico" for item in verifications
+    ) else "verificato"
+
     return IntermediateReportV11.model_validate({
         "versione": 1,
-        "stato": "verificato",
+        "stato": status,
         "corso": {
             "titolo": corrected(report.title or report.bunny_title),
             "sinossi_corso": corrected(report.synopsis),
         },
         "relatori": intermediate_speakers,
-        "video": [{
-            "chiave": "v1",
-            "guid": str(guid),
-            "titolo_bunny": corrected(report.bunny_title),
-            "durata_secondi": int(report.duration_seconds + .5),
-            "ordine": 1,
-            "lingua": report.detected_language,
-            "sinossi": corrected(report.synopsis),
-            "interventi": interventions,
-            "slide": slides,
-            "materiali": [],
-        }],
+        "video": [video],
         "verifiche_richieste": verifications,
     })

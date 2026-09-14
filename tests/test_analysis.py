@@ -14,9 +14,10 @@ import pytest
 
 from app.analysis import AnalysisError, OpenAIAnalyzer, SlideBatchResult
 from app.analysis_chunks import ConsolidatedTextReport, WindowAnalysis
+from app.boundaries import BoundaryAlignment
 from app.bunny import BunnyVideoMetadata
-from app.media import FrameCandidate
-from app.models import AcademyContent, ProviderUsage
+from app.media import FrameCandidate, SilenceInterval
+from app.models import AcademyContent, BoundaryEvidence, Intervention, ProviderUsage
 from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, WINDOW_PROMPT
 from app.transcription import TranscriptWord, TranscriptionResult, TranscriptSegment
 
@@ -49,10 +50,17 @@ def inputs(tmp_path):
                                     title="Academy", duration_seconds=90),
         transcription=TranscriptionResult(
             text="Sono Giulia Bianchi e presento la sessione. Parliamo di pubblicazione.",
-            segments=[TranscriptSegment(start_seconds=0, end_seconds=10,
-                                        diarization_label="chunk-0:A", text="Sono Giulia Bianchi.")],
+            segments=[TranscriptSegment(
+                start_seconds=0, end_seconds=10, diarization_label="chunk-0:A",
+                text="Sono Giulia Bianchi.", source_utterance_id="assembly-u000001",
+                words=[TranscriptWord(
+                    text="Giulia", start_seconds=1, end_seconds=2,
+                    diarization_label="chunk-0:A", confidence=.99,
+                )],
+            )],
             speaker_mapping={"chunk-0:A": "Relatore 1"}, audio_seconds=90),
         frames=[FrameCandidate(image, 2), FrameCandidate(image, 4), FrameCandidate(image, 6)],
+        silence_intervals=[],
     )
 
 
@@ -106,6 +114,132 @@ def window_result(segment_indexes=None, diarization_labels=None):
             "confidenza": 0.9,
         }],
     }
+
+
+def test_window_prompt_requires_complete_semantic_groups_without_model_boundaries():
+    requirement = """Raggruppa tutte le utterance che completano la stessa frase, esempio,
+spiegazione, risposta o linea di ragionamento. Non creare mai un confine nel
+mezzo di questi elementi. Se interviene il moderatore, assegna le sue
+utterance a un segmento autonomo saluti, domande o cambio_relatore: non
+accodarle all'intervento precedente. I timestamp finali sono calcolati
+localmente dall'audio; non usare i cambi di slide per dividere gli interventi."""
+
+    assert requirement in WINDOW_PROMPT
+    assert "CONFINE" not in WINDOW_PROMPT
+    assert "timestamp del silenzio" not in WINDOW_PROMPT.lower()
+
+
+def test_analyzer_aligns_semantic_groups_to_measured_silence_and_returns_compact_evidence(
+    inputs, content,
+):
+    inputs["metadata"].duration_seconds = 20
+    content["duration_seconds"] = 20
+    inputs["frames"] = []
+    inputs["silence_intervals"] = [SilenceInterval(8, 12)]
+    inputs["transcription"] = TranscriptionResult(
+        provider="assemblyai", language="it", text="FULL-TRANSCRIPT-SENTINEL",
+        audio_seconds=20,
+        segments=[
+            TranscriptSegment(
+                start_seconds=1, end_seconds=8, diarization_label="assembly:A",
+                text="Prima spiegazione completa.", source_utterance_id="u1",
+                words=[TranscriptWord(
+                    text="prima", start_seconds=1, end_seconds=8,
+                    diarization_label="assembly:A", confidence=.99,
+                )],
+            ),
+            TranscriptSegment(
+                start_seconds=12, end_seconds=19, diarization_label="assembly:B",
+                text="Seconda risposta completa.", source_utterance_id="u2",
+                words=[TranscriptWord(
+                    text="seconda", start_seconds=12, end_seconds=19,
+                    diarization_label="assembly:B", confidence=.98,
+                )],
+            ),
+        ],
+    )
+    mapped = window_result([0], ["assembly:A"])
+    mapped["interventions"].append({
+        **window_result([1], ["assembly:B"])["interventions"][0],
+        "titolo": "Seconda risposta",
+    })
+
+    result = OpenAIAnalyzer(FakeClient(mapped, content)).analyze_fast(**inputs)
+
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [
+        (0, 9), (9, 11), (11, 20),
+    ]
+    assert [item.boundary_seconds for item in result.boundaries] == [9, 11]
+    assert all(item.rule == "long_pause" for item in result.boundaries)
+    serialized = result.model_dump_json()
+    assert "FULL-TRANSCRIPT-SENTINEL" not in serialized
+    assert "assembly-u" not in serialized
+    assert '"confidence":0.99' not in serialized
+
+
+def test_analyzer_fails_closed_when_word_boundary_evidence_is_missing(inputs, content):
+    inputs["frames"] = []
+    inputs["transcription"].segments[0].words = []
+
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(FakeClient(window_result(), content)).analyze(**inputs)
+
+    assert caught.value.code == "boundaries"
+    assert caught.value.stage == "boundary"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+
+
+def test_analyzer_fails_closed_when_silence_collection_is_unavailable(inputs, content):
+    inputs["frames"] = []
+    inputs["silence_intervals"] = None
+
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(FakeClient(window_result(), content)).analyze(**inputs)
+
+    assert caught.value.code == "boundaries"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+
+
+def test_boundary_analyzer_fails_closed_after_incomplete_semantic_group_repair(inputs, content):
+    inputs["frames"] = []
+    incomplete = window_result(segment_indexes=[0, 0])
+
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(FakeClient(incomplete, incomplete, incomplete)).analyze(**inputs)
+
+    assert caught.value.code == "boundaries"
+    assert caught.value.stage == "boundary"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+
+
+def test_boundary_analyzer_rejects_nonadjacent_materializer_output(inputs, content, monkeypatch):
+    inputs["frames"] = []
+    malformed = BoundaryAlignment(
+        interventions=[
+            Intervention(
+                id="i001", start_seconds=0, end_seconds=40, tipo="intervento",
+                relatori=[], titolo="Prima", sintesi="Prima parte.",
+                punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+            ),
+            Intervention(
+                id="i002", start_seconds=41, end_seconds=90, tipo="intervento",
+                relatori=[], titolo="Seconda", sintesi="Seconda parte.",
+                punti_chiave=["Quattro", "Cinque", "Sei"], confidenza=.9,
+            ),
+        ],
+        boundaries=[BoundaryEvidence(
+            previous_intervention_id="i001", next_intervention_id="i002",
+            boundary_seconds=40, words_before=["prima"], words_after=["seconda"],
+            pause_before=True, pause_after=True, rule="no_pause",
+        )],
+    )
+    monkeypatch.setattr("app.analysis.materialize_interventions", lambda *args: malformed)
+
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(FakeClient(window_result(), content)).analyze(**inputs)
+
+    assert caught.value.code == "boundaries"
+    assert caught.value.stage == "boundary"
 
 
 def test_unnamed_moderator_role_reaches_consolidation_and_generic_report(inputs, content):
@@ -182,9 +316,16 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     inputs["metadata"].duration_seconds = 5760
     inputs["transcription"] = TranscriptionResult(
         text="private full transcript", audio_seconds=5760,
-        segments=[TranscriptSegment(start_seconds=i * 60, end_seconds=(i + 1) * 60,
-                                    diarization_label=f"chunk-{i // 10}:A",
-                                    text=f"Segmento distinto {i}: pubblicazione Academy.")
+        segments=[TranscriptSegment(
+            start_seconds=i * 60, end_seconds=(i + 1) * 60,
+            diarization_label=f"chunk-{i // 10}:A", source_utterance_id=f"u{i}",
+            text=f"Segmento distinto {i}: pubblicazione Academy.",
+            words=[TranscriptWord(
+                text=f"parola-{i}", start_seconds=i * 60 + 1,
+                end_seconds=(i + 1) * 60 - 1,
+                diarization_label=f"chunk-{i // 10}:A", confidence=.9,
+            )],
+        )
                   for i in range(96)],
     )
     inputs["frames"] = []
@@ -286,7 +427,11 @@ def test_long_provider_segment_is_split_before_remote_analysis(inputs, content, 
     inputs["metadata"].duration_seconds = 601
     content["duration_seconds"] = 601
     inputs["transcription"].segments = [TranscriptSegment(
-        start_seconds=0, end_seconds=601, text="PRIVATE SEGMENT", diarization_label="A")]
+        start_seconds=0, end_seconds=601, text="PRIVATE SEGMENT", diarization_label="A",
+        source_utterance_id="long-u1", words=[TranscriptWord(
+            text="evidenza", start_seconds=1, end_seconds=600,
+            diarization_label="A", confidence=.9,
+        )])]
     client = FakeClient(
         window_result(diarization_labels=["A"]),
         window_result(diarization_labels=["A"]),
@@ -624,19 +769,18 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
 
 def test_oversized_final_repair_is_rejected_before_second_remote_call(inputs, content, caplog, capsys):
     inputs["frames"] = []
-    inputs["transcription"].segments = []
     bad = copy.deepcopy(content)
     private_text = "PRIVATE_REPAIR_CONTENT " * 1500
     bad.update(synopsis=private_text, duration_seconds=91)
     parsed = ConsolidatedTextReport.model_validate(bad)
-    client = FakeClient(parsed, content)
+    client = FakeClient(window_result(), parsed, content)
     with pytest.raises(AnalysisError) as caught:
         OpenAIAnalyzer(client).analyze(**inputs)
     assert caught.value.code == "response"
     assert caught.value.__suppress_context__
-    assert len(client.calls) == 1
-    assert client.calls[0]["text_format"] is ConsolidatedTextReport
-    assert len(client.calls[0]["input"]) <= 30_000
+    assert len(client.calls) == 2
+    assert client.calls[1]["text_format"] is ConsolidatedTextReport
+    assert len(client.calls[1]["input"]) <= 30_000
     captured = capsys.readouterr()
     assert "PRIVATE_REPAIR_CONTENT" not in str(caught.value) + caplog.text + captured.out + captured.err
 

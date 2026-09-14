@@ -20,7 +20,8 @@ from app.config import Settings
 from app.course_models import AcademyImport
 from app.inventory import InventoryCourse
 from app.jobs import JobState
-from app.models import AcademyReport, Evidence, Intervention, SpeakerProfile
+from app.models import AcademyReport, Evidence, Intervention, ProviderUsage, SpeakerProfile, UsageEntry
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 
 
 VIDEO_ID = "00000000-0000-0000-0000-000000000001"
@@ -60,15 +61,15 @@ class OfflineOpenAI:
             ]}
         elif text_format is WindowAnalysis:
             payload = json.loads(input)
-            assert payload["segments"][0]["diarization_label"] == "chunk-0:A"
+            assert payload["segments"][0]["diarization_label"] == "assembly:A"
             data = {
                 "detected_language": "it", "synopsis_notes": ["Introduzione al corso sintetico."],
-                "speakers": [{"diarization_labels": ["chunk-0:A"], "display_name": None,
+                "speakers": [{"diarization_labels": ["assembly:A"], "display_name": None,
                               "role": None, "confidence": "bassa", "evidence": []}],
                 "uncertainties": [],
                 "interventions": [{
                     "segment_indexes": [0], "tipo": "intervento",
-                    "diarization_labels": ["chunk-0:A"], "titolo": "Introduzione",
+                    "diarization_labels": ["assembly:A"], "titolo": "Introduzione",
                     "sintesi": "Introduzione al corso.",
                     "punti_chiave": ["Corso", "Obiettivi", "Programma"],
                     "confidenza": 0.9,
@@ -86,6 +87,33 @@ class OfflineOpenAI:
                 "uncertainties": [],
             }
         return SimpleNamespace(status="completed", output_parsed=text_format.model_validate(data))
+
+
+class OfflineAssemblyAI:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def transcribe_url(self, url, *, duration_seconds, cancellation_event):
+        assert duration_seconds == 2
+        return TranscriptionResult(
+            provider="assemblyai", language="it", text="Introduzione al corso.",
+            audio_seconds=2,
+            usage=ProviderUsage(entries=[UsageEntry(
+                provider_audio_seconds=2, request_audio_seconds=2,
+            )]),
+            segments=[TranscriptSegment(
+                start_seconds=0, end_seconds=2, diarization_label="assembly:A",
+                text="Introduzione al corso.",
+                source_utterance_id="assembly-u000001",
+                words=[TranscriptWord(
+                    text="Introduzione", start_seconds=.1, end_seconds=1.9,
+                    diarization_label="assembly:A", confidence=.99,
+                )],
+            )],
+        )
+
+    def close(self):
+        pass
 
 
 def run_smoke_scenario(tmp_path, monkeypatch):
@@ -118,14 +146,20 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             assert str(metadata.video_id) == VIDEO_ID
             return str(video)
 
+        def build_mp4_url(self, metadata):
+            assert str(metadata.video_id) == VIDEO_ID
+            return str(video)
+
     def no_network(*args, **kwargs):
         raise AssertionError("The offline smoke test must not open network connections")
 
     monkeypatch.setattr(socket.socket, "connect", no_network)
     monkeypatch.setattr(main, "BunnyClient", OfflineBunny)
     monkeypatch.setattr(main, "OpenAI", OfflineOpenAI)
+    monkeypatch.setattr(main, "AssemblyAITranscriber", OfflineAssemblyAI)
     settings = Settings(bunny_library_id=123, bunny_stream_api_key="TEST_ONLY_BUNNY",
                         bunny_cdn_hostname="cdn.example.invalid", openai_api_key="TEST_ONLY_OPENAI",
+                        assemblyai_api_key="TEST_ONLY_ASSEMBLYAI",
                         app_password="TEST_ONLY_PASSWORD", temp_root=str(temporary),
                         database_path=str(tmp_path / "reports.sqlite3"), _env_file=None)
     app = main.create_app(settings)
@@ -161,6 +195,10 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             assert report.bunny_title == "Titolo originale Bunny"
             assert report.usage.transcription.provider_audio_seconds == 2
             assert report.usage.responses.requests == 2
+            serialized_report = json.dumps(status["report"])
+            assert "assembly-u000001" not in serialized_report
+            assert '"words"' not in serialized_report
+            assert "0.99" not in serialized_report
             assert status["progress"] == 100
             page = client.get(location)
             assert "Corso sintetico" in page.text
@@ -188,6 +226,10 @@ def run_smoke_scenario(tmp_path, monkeypatch):
         assert reopened.status_code == 200
         assert "Corso sintetico" in reopened.text
         assert restarted.get(f"{location}/report.txt").status_code == 200
+    persisted = Path(settings.database_path).read_bytes()
+    assert b"assembly-u000001" not in persisted
+    assert b'"words"' not in persisted
+    assert b"0.99" not in persisted
     assert monotonic() - started < 15
 
 

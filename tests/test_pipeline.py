@@ -10,8 +10,11 @@ import pytest
 from app.analysis import AnalysisError
 from app.bunny import BunnyAuthError, BunnyNotFoundError, BunnyVideoMetadata
 from app.config import Settings
-from app.media import AudioChunk, FrameCandidate, MediaArtifacts, MediaError, MediaProtectedError
-from app.models import AcademyContent
+from app.media import (
+    AudioChunk, FrameCandidate, MediaArtifacts, MediaError, MediaProtectedError,
+    SilenceInterval,
+)
+from app.models import AcademyContent, BoundaryEvidence, Intervention
 from app.pipeline import AnalysisPipeline, PipelineCancelled, PipelineError
 from app.transcription import TranscriptionError, TranscriptionResult
 
@@ -29,6 +32,12 @@ def components(tmp_path):
     content = AcademyContent.model_validate(data)
     metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600,
                                   status=3, available_resolutions=[240, 720])
+    content.duration_seconds = 3600
+    content.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=3600, tipo="intervento",
+        relatori=[], titolo="Corso di prova", sintesi="Contenuto verificato.",
+        punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+    )]
     state = SimpleNamespace(settings=settings, metadata=metadata, content=content, calls=[],
                             error=None, cancel_after=None, event=Event(), workspace=None)
 
@@ -66,8 +75,9 @@ def components(tmp_path):
         stage("transcription")
         return TranscriptionResult(text="private raw transcript", segments=[], audio_seconds=3600)
 
-    def analyze(meta, transcript, frames, *, cancellation_event, progress_callback):
+    def analyze(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback):
         assert cancellation_event is state.event
+        assert silence_intervals == []
         assert transcript.text == "private raw transcript"
         assert frames[0].path.exists()
         stage("analysis")
@@ -111,8 +121,9 @@ def test_pipeline_passes_optional_inventory_spelling_hints_to_analysis(component
     received = []
     components.pipeline.speaker_hint_provider = lambda metadata: ["Furio d'Andrea"]
 
-    def analyze(meta, transcript, frames, *, cancellation_event, progress_callback,
+    def analyze(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback,
                 speaker_name_hints):
+        assert silence_intervals == []
         received.extend(speaker_name_hints)
         return components.content
 
@@ -152,8 +163,9 @@ def test_pipeline_uses_direct_global_transcription_and_single_fast_analysis_when
             segments=[], audio_seconds=3600,
         )
 
-    def analyze_fast(meta, transcript, frames, *, cancellation_event, progress_callback):
+    def analyze_fast(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback):
         assert transcript.provider == "assemblyai"
+        assert silence_intervals == []
         assert cancellation_event is components.event
         components.calls.append("fast-analysis")
         progress_callback("transcript", 1, 1)
@@ -178,6 +190,89 @@ def test_pipeline_uses_direct_global_transcription_and_single_fast_analysis_when
     assert components.calls.count("assemblyai") == 1
     assert components.calls.count("visual-media") == 1
     assert components.calls.index("assemblyai") < components.calls.index("visual-media")
+
+
+def test_pipeline_passes_measured_silence_and_keeps_only_compact_boundary_evidence(components):
+    original_extract = components.pipeline.media.extract
+
+    def extract(*args, **kwargs):
+        media = original_extract(*args, **kwargs)
+        return MediaArtifacts(
+            media.audio_chunks, media.frame_candidates, media.downloaded_bytes,
+            [SilenceInterval(100, 102)],
+        )
+
+    def analyze(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback):
+        assert silence_intervals == [SilenceInterval(100, 102)]
+        result = components.content.model_copy(deep=True)
+        result.interventions = [
+            Intervention(
+                id="i001", start_seconds=0, end_seconds=101, tipo="intervento",
+                relatori=[], titolo="Prima parte", sintesi="Prima parte verificata.",
+                punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+            ),
+            Intervention(
+                id="i002", start_seconds=101, end_seconds=3600, tipo="intervento",
+                relatori=[], titolo="Seconda parte", sintesi="Seconda parte verificata.",
+                punti_chiave=["Quattro", "Cinque", "Sei"], confidenza=.9,
+            ),
+        ]
+        result.boundaries = [BoundaryEvidence(
+            previous_intervention_id="i001", next_intervention_id="i002",
+            boundary_seconds=101, words_before=["prima"], words_after=["seconda"],
+            pause_before=True, pause_after=True, rule="long_pause",
+        )]
+        return result
+
+    components.pipeline.media.extract = extract
+    components.pipeline.analyzer.analyze = analyze
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert report.boundaries[0].boundary_seconds == 101
+    serialized = report.model_dump_json()
+    assert "private raw transcript" not in serialized
+    assert "audio.m4a" not in serialized
+    assert "source_utterance_id" not in serialized
+    assert '"words"' not in serialized
+
+
+def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
+    import logging
+    sentinel = "PROVIDER-BODY WORD-SENTINEL /private/audio-file.m4a"
+    caplog.set_level(logging.INFO, logger="app.events")
+    components.pipeline.transcriber.transcribe = lambda *_args, **_kwargs: TranscriptionResult(
+        text=sentinel, segments=[], audio_seconds=3600,
+    )
+
+    def fail_boundary(*_args, **_kwargs):
+        raise AnalysisError("boundaries", stage="boundary")
+
+    components.pipeline.analyzer.analyze = fail_boundary
+
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert caught.value.code == "boundaries"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+    assert "boundaries" in caplog.text
+    assert "'phase': 'boundary'" in caplog.text
+    assert sentinel not in str(caught.value) + caplog.text
+
+
+def test_pipeline_rejects_report_without_complete_boundary_evidence(components, caplog):
+    import logging
+    sentinel = "FULL-TRANSCRIPT-SENTINEL provider body /private/audio-file.m4a ffmpeg diagnostic"
+    caplog.set_level(logging.INFO, logger="app.events")
+    components.content.synopsis = sentinel
+    components.content.interventions = []
+
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert caught.value.code == "boundaries"
+    assert caught.value.user_message == "Verifica audio dei confini non riuscita; riprova"
+    assert sentinel not in str(caught.value) + caplog.text
 
 
 @pytest.mark.parametrize(

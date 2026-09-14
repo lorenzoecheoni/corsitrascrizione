@@ -8,7 +8,7 @@ import pytest
 
 from app.bunny import BunnyAuthError, BunnyNotFoundError, BunnyTimeoutError
 from app.jobs import JobCancelled, JobState, JobStore, SingleWorkerRunner
-from app.models import AcademyReport
+from app.models import AcademyReport, BoundaryEvidence, Intervention
 
 
 @pytest.fixture
@@ -63,6 +63,44 @@ def test_sqlite_store_persists_completed_report_and_ordered_batch(tmp_path, repo
     assert reopened.get_batch(batch.id).job_ids == batch.job_ids
     loaded.report.speakers.clear()
     assert len(reopened.get(jobs[0].id).report.speakers) == 3
+
+
+def test_sqlite_round_trip_persists_compact_boundaries_without_transcript_or_word_arrays(
+    tmp_path, report,
+) -> None:
+    path = tmp_path / "boundary-report.sqlite3"
+    report.interventions = [
+        Intervention(
+            id="i001", start_seconds=0, end_seconds=100, tipo="intervento",
+            relatori=[], titolo="Prima parte", sintesi="Prima parte.",
+            punti_chiave=["Uno", "Due", "Tre"], confidenza=.9,
+        ),
+        Intervention(
+            id="i002", start_seconds=100, end_seconds=3720, tipo="intervento",
+            relatori=[], titolo="Seconda parte", sintesi="Seconda parte.",
+            punti_chiave=["Quattro", "Cinque", "Sei"], confidenza=.9,
+        ),
+    ]
+    report.boundaries = [BoundaryEvidence(
+        previous_intervention_id="i001", next_intervention_id="i002",
+        boundary_seconds=100, words_before=["prima"], words_after=["seconda"],
+        pause_before=True, pause_after=True, rule="long_pause",
+    )]
+    store = JobStore(path)
+    job = store.create("private-source")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+
+    loaded = JobStore(path).get(job.id).report
+
+    assert loaded is not None
+    assert loaded.boundaries == report.boundaries
+    persisted = path.read_bytes()
+    for forbidden in (
+        b"FULL-TRANSCRIPT-SENTINEL", b"source_utterance_id", b'"words"',
+        b"/private/audio-file.m4a", b"ffmpeg diagnostic", b"provider body",
+    ):
+        assert forbidden not in persisted
 
 
 def test_sqlite_store_marks_interrupted_jobs_failed_on_reopen(tmp_path) -> None:

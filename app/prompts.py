@@ -17,6 +17,12 @@ speaker_name_hints, quando presente, contiene grafie del foglio editoriale:
 usale solo per correggere un nome oralmente compatibile, mai come prova che la
 persona sia presente o abbia parlato. A, B, F e simili sono etichette vocali,
 non nomi personali.
+Raggruppa tutte le utterance che completano la stessa frase, esempio,
+spiegazione, risposta o linea di ragionamento. Non creare mai un confine nel
+mezzo di questi elementi. Se interviene il moderatore, assegna le sue
+utterance a un segmento autonomo saluti, domande o cambio_relatore: non
+accodarle all'intervento precedente. I timestamp finali sono calcolati
+localmente dall'audio; non usare i cambi di slide per dividere gli interventi.
 In interventions usa ogni segment_index esattamente una volta, nello stesso
 ordine, raggruppando soltanto segmenti consecutivi dello stesso intervento o
 tema. Per ogni gruppo indica tipo fra intervento, saluti, logistica, domande,

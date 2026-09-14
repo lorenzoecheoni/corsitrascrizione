@@ -21,10 +21,11 @@ from app.analysis_chunks import (
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
     materialize_interventions, split_transcript_windows,
 )
-from app.media import FrameCandidate
+from app.boundaries import BoundaryAlignment, has_complete_boundary_evidence
+from app.media import FrameCandidate, SilenceInterval
 from app.models import (
     Confidence, GENERIC_SPEAKER_LABEL, IDENTITY_EVIDENCE_KINDS,
-    GENERIC_INTERVENTION_SPEAKER, Intervention, ReportModel, SlideChange,
+    GENERIC_INTERVENTION_SPEAKER, ReportModel, SlideChange,
     AnalysisResult, ProviderUsage, Nonnegative,
 )
 from app.prompts import (
@@ -38,7 +39,7 @@ from app.usage import record_usage
 
 _VISUAL_BATCH_SIZE = 25
 _MAX_VISUAL_REPAIR_CHARS = 30_000
-AnalysisStage = Literal["visual", "window", "consolidation"]
+AnalysisStage = Literal["visual", "window", "consolidation", "boundary"]
 _PROVIDER_SPEAKER_NAME = re.compile(r"^(?:speaker\s+)?(?:[a-z]|\d+)$", re.I)
 
 
@@ -63,6 +64,7 @@ _MESSAGES = {
     "request": "Richiesta di analisi OpenAI non accettata",
     "transport": "Impossibile completare la richiesta di analisi",
     "frames": "Frame video non validi o non leggibili",
+    "boundaries": "Verifica audio dei confini non riuscita; riprova",
 }
 
 
@@ -74,7 +76,7 @@ class AnalysisError(Exception):
         retry_after_seconds: float | None = None,
         stage: AnalysisStage = "consolidation",
     ) -> None:
-        if stage not in {"visual", "window", "consolidation"}:
+        if stage not in {"visual", "window", "consolidation", "boundary"}:
             raise ValueError("Fase di analisi non valida")
         super().__init__(_MESSAGES[code])
         self.stage = stage
@@ -292,6 +294,8 @@ class OpenAIAnalyzer:
         cancellation_event: Event | None, usage: ProviderUsage,
         max_repair_chars: int,
         stage: AnalysisStage,
+        validation_error_code: str = "response",
+        validation_error_stage: AnalysisStage | None = None,
         model: str = "gpt-5.6-luna",
         max_output_tokens: int = 4000,
     ) -> T:
@@ -399,20 +403,27 @@ class OpenAIAnalyzer:
                     current_max_output_tokens = max_output_tokens * 2
                     output_limit_retry_used = True
                     continue
-                raise AnalysisError("response", stage=stage)
+                raise AnalysisError(
+                    validation_error_code, stage=validation_error_stage or stage,
+                )
             if attempts >= 3:
-                raise AnalysisError("response", stage=stage)
+                raise AnalysisError(
+                    validation_error_code, stage=validation_error_stage or stage,
+                )
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)
             if len(payload) > max_repair_chars:
-                raise AnalysisError("response", stage=stage) from None
+                raise AnalysisError(
+                    validation_error_code, stage=validation_error_stage or stage,
+                ) from None
             instructions = REPAIR_PROMPT
             repair_used = True
         raise AnalysisError("response", stage=stage)  # Defensive; the loop returns or raises.
 
     def analyze(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
-        frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
+        frames: Sequence[FrameCandidate], *, silence_intervals: Sequence[SilenceInterval],
+        cancellation_event: Event | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
         speaker_name_hints: Sequence[str] = (),
     ) -> AnalysisResult:
@@ -440,19 +451,24 @@ class OpenAIAnalyzer:
                 usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
                 stage="window",
+                validation_error_code="boundaries",
+                validation_error_stage="boundary",
             ))
             if progress_callback is not None:
                 progress_callback("transcript", index, len(windows))
         check_cancelled(cancellation_event)
         try:
-            interventions = materialize_interventions(
+            if silence_intervals is None:
+                raise ValueError("Le pause audio non sono disponibili")
+            alignment = materialize_interventions(
                 metadata.duration_seconds,
                 windows,
                 analyses,
                 _supported_window_speaker_names(analyses),
+                silence_intervals,
             )
-        except ValueError:
-            raise AnalysisError("response", stage="window") from None
+        except (AttributeError, TypeError, ValueError):
+            raise AnalysisError("boundaries", stage="boundary") from None
         try:
             payload = build_consolidation_payload(metadata, analyses, slides)
         except ValueError:
@@ -470,7 +486,7 @@ class OpenAIAnalyzer:
             stage="consolidation",
         )
         return self._result_with_slides(
-            result, slide_data, interventions, uncertain_count, usage, cancellation_event
+            result, slide_data, alignment, uncertain_count, usage, cancellation_event
         )
 
     def _classify_slides(
@@ -524,7 +540,8 @@ class OpenAIAnalyzer:
 
     def analyze_fast(
         self, metadata: BunnyVideoMetadata, transcription: TranscriptionResult,
-        frames: Sequence[FrameCandidate], *, cancellation_event: Event | None = None,
+        frames: Sequence[FrameCandidate], *, silence_intervals: Sequence[SilenceInterval],
+        cancellation_event: Event | None = None,
         progress_callback: Callable[[str, int, int], None] | None = None,
         speaker_name_hints: Sequence[str] = (),
     ) -> AnalysisResult:
@@ -533,6 +550,7 @@ class OpenAIAnalyzer:
             metadata,
             transcription,
             frames,
+            silence_intervals=silence_intervals,
             cancellation_event=cancellation_event,
             progress_callback=progress_callback,
             speaker_name_hints=speaker_name_hints,
@@ -540,7 +558,7 @@ class OpenAIAnalyzer:
 
     @staticmethod
     def _result_with_slides(
-        result: ConsolidatedTextReport, slide_data: list[dict], interventions: list[Intervention],
+        result: ConsolidatedTextReport, slide_data: list[dict], alignment: BoundaryAlignment,
         uncertain_count: int,
         usage: ProviderUsage, cancellation_event: Event | None,
     ) -> AnalysisResult:
@@ -550,6 +568,13 @@ class OpenAIAnalyzer:
             note = f"{uncertain_count} frame con classificazione incerta esclusi dalle slide."
             if note not in data["uncertainties"]:
                 data["uncertainties"].append(note)
-        return AnalysisResult(
-            **data, slides=slide_data, interventions=interventions, usage=usage
-        )
+        try:
+            content = AnalysisResult(
+                **data, slides=slide_data, interventions=alignment.interventions,
+                boundaries=alignment.boundaries, usage=usage,
+            )
+        except (AttributeError, TypeError, ValidationError, ValueError):
+            raise AnalysisError("boundaries", stage="boundary") from None
+        if not has_complete_boundary_evidence(content):
+            raise AnalysisError("boundaries", stage="boundary")
+        return content

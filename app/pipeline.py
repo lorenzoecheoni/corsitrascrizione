@@ -8,6 +8,7 @@ from threading import Event
 from time import monotonic
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
+from app.boundaries import has_complete_boundary_evidence
 from app.assemblyai import AssemblyAITranscriber
 from app.bunny import (BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError,
                        BunnyPlaybackError, BunnyReadinessError, parse_bunny_url, read_metadata)
@@ -40,6 +41,7 @@ _MESSAGES = {
     "not_ready": "Video ancora in elaborazione su Bunny; attendere la fine della codifica",
     "encoding_failed": "Codifica o caricamento Bunny fallito; verificare il video nella libreria",
     "unsupported_media": "Formato o risoluzioni Bunny non supportati; verificare la codifica HLS",
+    "boundaries": "Verifica audio dei confini non riuscita; riprova",
 }
 
 
@@ -240,6 +242,7 @@ class AnalysisPipeline:
                 analysis_options = {
                     "cancellation_event": event,
                     "progress_callback": analysis_progress,
+                    "silence_intervals": media.silence_intervals,
                 }
                 if self.speaker_hint_provider is not None:
                     analysis_options["speaker_name_hints"] = speaker_name_hints
@@ -255,6 +258,10 @@ class AnalysisPipeline:
                     ))
                 # No transcript or media references escape this method.
                 del transcript
+                next_phase("boundary")
+                if not has_complete_boundary_evidence(report):
+                    raise PipelineError("boundaries")
+                next_phase("report")
                 progress(98, "Report pronto; pulizia dei file temporanei")
             progress(100, "Completato")
             log_event(phase, elapsed_seconds=monotonic() - started)
@@ -282,9 +289,13 @@ class AnalysisPipeline:
             elif isinstance(exc, TranscriptionError):
                 code = "transcription"
             elif isinstance(exc, AnalysisError):
-                code = f"analysis_{exc.stage}"
-                if exc.code == "rate_limit":
-                    code += "_rate_limit"
+                if exc.code == "boundaries" or exc.stage == "boundary":
+                    code = "boundaries"
+                    phase = "boundary"
+                else:
+                    code = f"analysis_{exc.stage}"
+                    if exc.code == "rate_limit":
+                        code += "_rate_limit"
             else:
                 code = "temporary_failure"
             log_event(phase, elapsed_seconds=monotonic() - started, error_code=code,

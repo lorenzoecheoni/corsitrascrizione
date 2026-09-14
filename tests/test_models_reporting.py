@@ -103,6 +103,36 @@ def test_exports_merge_duplicate_speakers_and_correct_near_name_mentions() -> No
     assert "Furio d'Andrea illustra" in payload["interventi"][0]["sintesi"]
 
 
+def test_exports_include_named_intervention_speakers_missing_from_profiles() -> None:
+    report = load_report()
+    report.speakers = report.speakers[:1]
+    report.interventions = [
+        Intervention(
+            id="i001", start_seconds=0, end_seconds=300, tipo="intervento",
+            relatori=["Gaetano De Vito"], titolo="Apertura",
+            sintesi="Introduzione alla governance.",
+            punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.90,
+        ),
+        Intervention(
+            id="i002", start_seconds=300, end_seconds=900, tipo="intervento",
+            relatori=["Furio d'Andrea"], titolo="Poteri e responsabilità",
+            sintesi="Analisi della governance della holding.",
+            punti_chiave=["Soci", "Amministratori", "Statuto"], confidenza=.95,
+        ),
+    ]
+
+    payload = build_video_report_payload(
+        report, UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+    )
+    markdown = render_markdown(report)
+
+    assert [speaker["nome"] for speaker in payload["relatori"]] == [
+        "Giulia Bianchi", "Gaetano De Vito", "Furio d'Andrea",
+    ]
+    assert "- Gaetano De Vito" in markdown
+    assert "- Furio d'Andrea" in markdown
+
+
 def test_speaker_rejects_personal_name_with_inference_only() -> None:
     with pytest.raises(ValidationError, match="evidenza ammessa"):
         SpeakerProfile.model_validate(

@@ -1,15 +1,24 @@
 """Structured and human-readable renderers for per-video reports."""
 
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from uuid import UUID
 import re
 import unicodedata
 
-from app.models import AcademyReport, GENERIC_SPEAKER_LABEL, SpeakerProfile
+from app.models import AcademyReport, Confidence, Evidence, GENERIC_SPEAKER_LABEL
 
 
 _CONFIDENCE_SCORE = {"alta": .95, "media": .65, "bassa": .35}
 _CONFIDENCE_RANK = {"bassa": 0, "media": 1, "alta": 2}
+
+
+@dataclass
+class _ExportSpeaker:
+    display_name: str
+    role: str | None
+    confidence: Confidence
+    evidence: list[Evidence]
 
 
 def _name_key(value: str) -> str:
@@ -49,15 +58,23 @@ def _correct_near_name_mentions(value: str, canonical_names: list[str]) -> str:
     return corrected
 
 
-def _unique_speakers(report: AcademyReport) -> list[SpeakerProfile]:
-    canonical_names = list(dict.fromkeys(
+def _unique_speakers(report: AcademyReport) -> list[_ExportSpeaker]:
+    canonical_names = list(dict.fromkeys([
         speaker.display_name for speaker in report.speakers
         if not GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name)
-    ))
-    merged: dict[str, SpeakerProfile] = {}
+    ] + [
+        name for intervention in report.interventions for name in intervention.relatori
+        if not GENERIC_SPEAKER_LABEL.fullmatch(name)
+    ]))
+    merged: dict[str, _ExportSpeaker] = {}
     evidence_keys: dict[str, set[tuple[str, float | None, str]]] = {}
     for source in report.speakers:
-        speaker = source.model_copy(deep=True)
+        speaker = _ExportSpeaker(
+            display_name=source.display_name,
+            role=source.role,
+            confidence=source.confidence,
+            evidence=[evidence.model_copy(deep=True) for evidence in source.evidence],
+        )
         for evidence in speaker.evidence:
             evidence.note = _correct_near_name_mentions(evidence.note, canonical_names)
         key = _name_key(speaker.display_name)
@@ -78,6 +95,18 @@ def _unique_speakers(report: AcademyReport) -> list[SpeakerProfile]:
             if evidence_key not in evidence_keys[key]:
                 current.evidence.append(evidence)
                 evidence_keys[key].add(evidence_key)
+    for intervention in report.interventions:
+        for name in intervention.relatori:
+            key = _name_key(name)
+            if not key or key in merged or GENERIC_SPEAKER_LABEL.fullmatch(name):
+                continue
+            merged[key] = _ExportSpeaker(
+                display_name=name,
+                role=None,
+                confidence="media",
+                evidence=[],
+            )
+            evidence_keys[key] = set()
     return list(merged.values())
 
 

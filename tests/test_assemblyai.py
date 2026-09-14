@@ -45,12 +45,101 @@ def test_assemblyai_preserves_ordered_word_timing_in_memory():
     ]
 
 
+def test_assemblyai_accepts_overlapping_words_and_expands_segment_to_word_evidence():
+    from app.assemblyai import AssemblyAITranscriber
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 3,
+        "language_code": "it",
+        "text": "La governance evolve.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 500,
+            "end": 2500,
+            "text": "La governance evolve.",
+            "words": [
+                word("La", 450, 800),
+                word("governance", 750, 1500),
+                word("evolve.", 1600, 2550),
+            ],
+        }],
+    }, 3)
+
+    segment = result.original_segments[0]
+
+    assert (segment.start_seconds, segment.end_seconds) == (.45, 2.55)
+    assert segment.source_utterance_id == "assembly-u000001"
+    assert [(item.text, item.start_seconds, item.end_seconds) for item in segment.words] == [
+        ("La", .45, .8), ("governance", .75, 1.5), ("evolve.", 1.6, 2.55),
+    ]
+
+
+def test_assemblyai_rejects_words_beyond_bunny_duration_when_provider_duration_is_longer():
+    from app.assemblyai import AssemblyAITranscriber
+    from app.transcription import TranscriptionError
+
+    with pytest.raises(TranscriptionError) as caught:
+        AssemblyAITranscriber._parse_result({
+            "status": "completed",
+            "audio_duration": 4,
+            "language_code": "it",
+            "text": "Fuori durata.",
+            "utterances": [{
+                "speaker": "A",
+                "start": 2500,
+                "end": 3000,
+                "text": "Fuori durata.",
+                "words": [word("Fuori", 2500, 2800), word("durata.", 2800, 3100)],
+            }],
+        }, 3)
+
+    assert caught.value.code == "response"
+
+
+def test_assemblyai_provider_word_variance_remains_usable_for_boundary_alignment():
+    from app.assemblyai import AssemblyAITranscriber
+    from app.boundaries import SemanticIntervention, align_intervention_boundaries
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 2.5,
+        "language_code": "it",
+        "text": "Prima parte. Seconda parte.",
+        "utterances": [
+            {"speaker": "A", "start": 0, "end": 1000, "text": "Prima parte.",
+             "words": [word("Prima", 0, 700), word("parte.", 650, 1050)]},
+            {"speaker": "A", "start": 1200, "end": 2000, "text": "Seconda parte.",
+             "words": [word("Seconda", 1150, 1500), word("parte.", 1500, 2000)]},
+        ],
+    }, 2.5)
+    groups = [
+        SemanticIntervention(
+            tipo="intervento", relatori=("Relatore 1",), titolo="Prima", sintesi="",
+            punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+            segments=(result.original_segments[0],),
+        ),
+        SemanticIntervention(
+            tipo="intervento", relatori=("Relatore 1",), titolo="Seconda", sintesi="",
+            punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+            segments=(result.original_segments[1],),
+        ),
+    ]
+
+    alignment = align_intervention_boundaries(2.5, groups, [])
+
+    assert [(item.start_seconds, item.end_seconds) for item in alignment.interventions] == [(0, 1), (1, 2)]
+    assert alignment.boundaries[0].words_before == ["Prima", "parte."]
+    assert alignment.boundaries[0].words_after == ["Seconda", "parte."]
+
+
 @pytest.mark.parametrize("words", [
     None,
     [],
     [word("PRIVATE-WORD-EVIDENCE", 700, 500)],
     [word("PRIVATE-WORD-EVIDENCE", 800, 1000), word("seconda", 500, 700)],
-    [word("PRIVATE-WORD-EVIDENCE", 400, 700)],
+    [word("PRIVATE-WORD-EVIDENCE", -1, 700)],
+    [word("PRIVATE-WORD-EVIDENCE", 500, 3_001)],
     [word("PRIVATE-WORD-EVIDENCE", 500, 700, speaker="B")],
     [word("", 500, 700)],
     [{**word("PRIVATE-WORD-EVIDENCE", 500, 700), "confidence": float("nan")}],

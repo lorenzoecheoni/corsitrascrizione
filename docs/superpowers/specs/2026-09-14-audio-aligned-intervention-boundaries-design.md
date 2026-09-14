@@ -98,8 +98,12 @@ class TranscriptWord(BaseModel):
 utterance text, timing, speaker label, and source utterance ID. AssemblyAI parsing
 requires a valid, ordered, non-empty word list for every non-empty utterance.
 The word text concatenation need not reproduce punctuation byte-for-byte, but
-all words must fall within their utterance interval and use the utterance's
-speaker label. Invalid or missing word timing raises the existing fixed
+all words must have finite, positive spans within the Bunny-measured source
+duration and use the utterance's speaker label. AssemblyAI's documented
+sequential word array is ordered by nondecreasing word start; adjacent word
+spans may overlap and the diarized utterance window is not a required exact
+container. The local segment envelope expands to cover the validated word
+extents without altering any word timestamp. Invalid or missing word timing raises the existing fixed
 transcription-response text in the dedicated `WordEvidenceError` subtype; the
 pipeline maps that subtype to the fixed boundary-verification failure.
 

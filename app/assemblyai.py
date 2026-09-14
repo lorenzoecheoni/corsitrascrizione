@@ -136,6 +136,10 @@ class AssemblyAITranscriber:
             raise TranscriptionError("response") from None
         if not math.isfinite(provider_duration) or provider_duration <= 0:
             raise TranscriptionError("response")
+        # Bunny metadata describes the source media requested for this job. A
+        # differing provider-reported duration must not extend word evidence
+        # beyond the source timeline used by the boundary aligner.
+        word_duration_limit = expected_duration
 
         originals: list[TranscriptSegment] = []
         mapping: dict[str, str] = {}
@@ -160,7 +164,7 @@ class AssemblyAITranscriber:
             if not isinstance(raw_words, list) or not raw_words:
                 raise WordEvidenceError()
             words: list[TranscriptWord] = []
-            previous_end = start
+            previous_start = -1.0
             for raw_word in raw_words:
                 try:
                     word_text = raw_word["text"]
@@ -175,7 +179,8 @@ class AssemblyAITranscriber:
                     or not isinstance(word_speaker, str) or word_speaker.strip() != speaker.strip()
                     or not math.isfinite(word_start) or not math.isfinite(word_end)
                     or not math.isfinite(confidence)
-                    or word_start < start or word_end > end or word_start < previous_end
+                    or word_start < 0 or word_end > word_duration_limit
+                    or word_start < previous_start
                 ):
                     raise WordEvidenceError()
                 try:
@@ -186,10 +191,10 @@ class AssemblyAITranscriber:
                 except (TypeError, ValueError):
                     raise WordEvidenceError() from None
                 words.append(parsed_word)
-                previous_end = word_end
+                previous_start = word_start
             originals.append(TranscriptSegment(
-                start_seconds=start,
-                end_seconds=end,
+                start_seconds=min(start, words[0].start_seconds),
+                end_seconds=max(end, max(word.end_seconds for word in words)),
                 diarization_label=label,
                 text=text.strip(),
                 source_utterance_id=f"assembly-u{utterance_index:06d}",

@@ -83,7 +83,7 @@ Add a word fixture and a completed response whose expected in-memory values are 
             ("La", .5, .7), ("governance", .8, 1.5), ("evolve.", 1.6, 2.5),
         ]
 
-Parameterize missing/empty words, reversed or unordered word times, word outside utterance, mismatched speaker, empty text, non-finite confidence, and confidence outside 0 through 1. Require TranscriptionError code response and safe exception/log text.
+Parameterize missing/empty words, reversed or decreasing-start word times, word outside the Bunny-measured source duration, mismatched speaker, empty text, non-finite confidence, and confidence outside 0 through 1. Also accept sequential words with a small overlap and word extents slightly outside the diarized utterance window; expand the local segment envelope to the validated word extents. Require TranscriptionError code response and safe exception/log text.
 
 - [ ] **Step 2: Verify RED**
 
@@ -108,7 +108,7 @@ Add:
                 raise ValueError("Intervallo parola non valido")
             return self
 
-Extend TranscriptSegment with source_utterance_id: str = "" and words: list[TranscriptWord] using a default factory and repr=False. In AssemblyAI parsing, number utterances from one, namespace IDs as assembly-uNNNNNN, validate every word against its utterance and label, and preserve provider order. Never synthesize words from text. The OpenAI fallback keeps words empty; Task 4 rejects that path for conforming reports.
+Extend TranscriptSegment with source_utterance_id: str = "" and words: list[TranscriptWord] using a default factory and repr=False. In AssemblyAI parsing, number utterances from one, namespace IDs as assembly-uNNNNNN, require nondecreasing word starts and source-duration-bounded word spans, keep speaker labels strict, and preserve provider order. Word spans may overlap or extend slightly beyond the diarized utterance window; expand the segment envelope to cover them without clipping or synthesizing timestamps. Never synthesize words from text. The OpenAI fallback keeps words empty; Task 4 rejects that path for conforming reports.
 
 - [ ] **Step 4: Prove words never enter AI payloads**
 

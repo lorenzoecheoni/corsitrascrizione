@@ -115,7 +115,11 @@
           <p class="video-meta">Completato {{ job.updated_at.strftime('%d/%m/%Y alle %H:%M') }}</p>
         </div>
         <div class="compact-actions">
+          {% if job.id in boundary_reanalysis_job_ids %}
+          <a href="/#catalog-title">Rianalisi necessaria</a>
+          {% else %}
           <a href="/jobs/{{ job.id }}/report.json">Download JSON v1.1</a>
+          {% endif %}
           <a href="/jobs/{{ job.id }}/report.txt">TXT</a>
           <a href="/jobs/{{ job.id }}/report.md">Markdown</a>
         </div>

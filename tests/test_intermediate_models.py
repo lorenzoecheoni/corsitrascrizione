@@ -93,6 +93,22 @@ def test_v11_rejects_verification_code_level_mismatch():
         IntermediateReportV11.model_validate(data)
 
 
+def test_v11_accepts_confine_only_as_warning():
+    data = valid_payload()
+    data["verifiche_richieste"] = [{
+        "livello": "avviso", "codice": "CONFINE", "video": "v1",
+        "intervento": "v1-i001", "campo": "inizio",
+        "messaggio": "Confine 0:00:00; verifica audio.",
+    }]
+
+    assert IntermediateReportV11.model_validate(data).stato == "verificato"
+
+    data["verifiche_richieste"][0]["livello"] = "critico"
+    data["stato"] = "da_verificare"
+    with pytest.raises(ValidationError):
+        IntermediateReportV11.model_validate(data)
+
+
 def test_v11_rejects_unknown_intervention_speaker_reference():
     data = valid_payload()
     data["video"][0]["interventi"][0]["relatori"] = ["Missing"]

@@ -12,6 +12,7 @@ from fastapi.templating import Jinja2Templates
 from app.academy import AcademyGenerationError
 from app.academy_prompt import CONTRACT_VERSION, PROMPT_VERSION
 from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
+from app.boundaries import has_complete_boundary_evidence
 from app.bunny import (
     BunnyAuthError,
     BunnyCatalogTooLarge,
@@ -142,13 +143,19 @@ def get_course(request: Request, course_id: str):
 
 @router.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
+    saved_reports = request.app.state.store.list_completed()
+    boundary_reanalysis_job_ids = {
+        job.id for job in saved_reports
+        if job.report is not None and not has_complete_boundary_evidence(job.report)
+    }
     try:
         catalog = request.app.state.bunny.list_videos()
     except BunnyError as exc:
         return templates.TemplateResponse(request, "home.html", {
             "catalog_error": _catalog_error_message(exc), "videos": [], "total_items": 0,
             "total_duration": 0, "recent_jobs": request.app.state.store.list_uncompleted(),
-            "saved_reports": request.app.state.store.list_completed(),
+            "saved_reports": saved_reports,
+            "boundary_reanalysis_job_ids": boundary_reanalysis_job_ids,
             "fast_mode": request.app.state.assemblyai is not None,
         })
     inventory_error = None
@@ -176,7 +183,8 @@ def home(request: Request) -> HTMLResponse:
         "total_items": catalog.total_items,
         "total_duration": sum(video.duration_seconds for video in catalog.videos),
         "recent_jobs": request.app.state.store.list_uncompleted(),
-        "saved_reports": request.app.state.store.list_completed(),
+        "saved_reports": saved_reports,
+        "boundary_reanalysis_job_ids": boundary_reanalysis_job_ids,
         "fast_mode": request.app.state.assemblyai is not None,
     })
 
@@ -638,7 +646,16 @@ def create_job(request: Request, confirmation: str = Form("")) -> RedirectRespon
 def job_page(request: Request, job_id: str) -> HTMLResponse:
     job = get_job(request, job_id)
     report_text = render_text(job.report) if job.state == JobState.COMPLETED and job.report else ""
-    return templates.TemplateResponse(request, "job.html", {"job": job, "report_text": report_text})
+    boundary_reanalysis_required = bool(
+        job.state == JobState.COMPLETED
+        and job.report is not None
+        and not has_complete_boundary_evidence(job.report)
+    )
+    return templates.TemplateResponse(request, "job.html", {
+        "job": job,
+        "report_text": report_text,
+        "boundary_reanalysis_required": boundary_reanalysis_required,
+    })
 
 
 @router.get("/api/jobs/{job_id}")
@@ -696,6 +713,10 @@ def json_report(request: Request, job_id: str) -> Response:
     job = get_job(request, job_id)
     if job.state != JobState.COMPLETED or job.report is None:
         raise HTTPException(409, "Il report non è ancora disponibile")
+    if not has_complete_boundary_evidence(job.report):
+        raise HTTPException(
+            409, "Rianalisi necessaria per verificare i confini sull’audio",
+        )
     settings = request.app.state.settings
     try:
         reference = parse_bunny_url(

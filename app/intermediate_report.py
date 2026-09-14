@@ -6,12 +6,13 @@ import re
 import time
 import unicodedata
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
 
 import httpx
 
+from app.boundaries import has_complete_boundary_evidence
 from app.intermediate_models import (
     IntermediateInterventionV11,
     IntermediateMaterialV11,
@@ -19,6 +20,7 @@ from app.intermediate_models import (
     IntermediateSpeakerV11,
     IntermediateVideoV11,
     VerificationRequestV11,
+    format_hms,
 )
 from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
 from app.reporting import canonical_speaker_name_map, correct_speaker_name_mentions, reconcile_speakers
@@ -117,13 +119,23 @@ def _normalize_summary(summary: str) -> str:
 
 
 def normalize_interventions(
-    report: AcademyReport, video_key: str = "v1",
+    report: AcademyReport,
+    video_key: str = "v1",
+    *,
+    stored_to_exported_ids: Mapping[str, str] | None = None,
 ) -> list[IntermediateInterventionV11]:
     """Copy and deterministically normalize persisted analytical interventions."""
     normalized = []
-    for index, intervention in enumerate(
-        sorted(report.interventions, key=lambda item: item.start_seconds), start=1
-    ):
+    ordered_interventions = sorted(report.interventions, key=lambda item: item.start_seconds)
+    exported_ids = (
+        stored_to_exported_ids
+        if stored_to_exported_ids is not None
+        else {
+            stored.id: f"{video_key}-i{index:03d}"
+            for index, stored in enumerate(ordered_interventions, start=1)
+        }
+    )
+    for intervention in ordered_interventions:
         duration = intervention.end_seconds - intervention.start_seconds
         kind = intervention.tipo
         if kind == "intervento" and duration < 20:
@@ -133,7 +145,7 @@ def normalize_interventions(
                 speakers=intervention.relatori,
             )
         normalized.append(IntermediateInterventionV11(
-            id=f"{video_key}-i{index:03d}",
+            id=exported_ids[intervention.id],
             inizio=intervention.start_seconds,
             fine=intervention.end_seconds,
             tipo=kind,
@@ -145,6 +157,36 @@ def normalize_interventions(
             confidenza=intervention.confidenza,
         ))
     return normalized
+
+
+def _boundary_excerpt(words: Sequence[str], pause: bool) -> str:
+    if not words:
+        return "(pausa)"
+    excerpt = f"«{' '.join(words)}»"
+    return f"{excerpt} (pausa)" if pause else excerpt
+
+
+def build_boundary_verifications(
+    report: AcademyReport,
+    stored_to_exported_ids: Mapping[str, str],
+) -> list[VerificationRequestV11]:
+    """Render one auditable warning for every final neighboring pair."""
+    if not has_complete_boundary_evidence(report):
+        raise ValueError("Il report non contiene prove complete dei confini")
+    checks = []
+    for evidence in report.boundaries:
+        previous_id = stored_to_exported_ids[evidence.previous_intervention_id]
+        next_id = stored_to_exported_ids[evidence.next_intervention_id]
+        message = (
+            f"Confine {format_hms(evidence.boundary_seconds)}; termina {previous_id}. "
+            f"Prima: {_boundary_excerpt(evidence.words_before, evidence.pause_before)}. "
+            f"Dopo: {_boundary_excerpt(evidence.words_after, evidence.pause_after)}."
+        )
+        checks.append(_verification(
+            "avviso", "CONFINE", video="v1", intervention=next_id, field="inizio",
+            message=message,
+        ))
+    return checks
 
 
 def choose_public_intervention(
@@ -368,6 +410,16 @@ def build_intermediate_report(
     material_url_checker: Callable[[str], bool] | None = None,
 ) -> IntermediateReportV11:
     """Transform one persisted report, with bounded checks for declared material URLs."""
+    ordered_interventions = sorted(report.interventions, key=lambda item: item.start_seconds)
+    stored_to_exported_ids = {
+        stored.id: f"v1-i{index:03d}"
+        for index, stored in enumerate(ordered_interventions, start=1)
+    }
+    boundary_verifications = (
+        build_boundary_verifications(report, stored_to_exported_ids)
+        if has_complete_boundary_evidence(report)
+        else []
+    )
     checker = material_url_checker or _material_url_is_reachable
     materials: list[IntermediateMaterialV11] = []
     material_failures: list[str] = []
@@ -410,7 +462,9 @@ def build_intermediate_report(
             "origine_nome": speaker.origins or ["audio"],
         }))
 
-    normalized = normalize_interventions(report)
+    normalized = normalize_interventions(
+        report, stored_to_exported_ids=stored_to_exported_ids,
+    )
     corrected_interventions = [item.model_copy(update={
         "relatori": [canonical_by_key[_name_key(name)] for name in item.relatori],
         "titolo": corrected(item.titolo),
@@ -441,7 +495,10 @@ def build_intermediate_report(
         "slide": slides,
         "materiali": materials,
     })
-    verifications = build_verifications(video, intermediate_speakers, material_failures)
+    verifications = [
+        *build_verifications(video, intermediate_speakers, material_failures),
+        *boundary_verifications,
+    ]
     status = "da_verificare" if any(
         item.livello == "critico" for item in verifications
     ) else "verificato"

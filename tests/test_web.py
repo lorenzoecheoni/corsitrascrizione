@@ -23,7 +23,7 @@ from app.course_models import AcademyImport, IntermediateCourseReport
 from app.jobs import JobState
 from app.inventory import InventoryCourse, InventoryError
 from app.main import create_app
-from app.models import AcademyReport, Intervention
+from app.models import AcademyReport, BoundaryEvidence, Intervention
 from app.pipeline import AnalysisPipeline
 from app.selection import sign_selection
 
@@ -32,6 +32,27 @@ VIDEO_ID = "00000000-0000-0000-0000-000000000001"
 OTHER_VIDEO_ID = "00000000-0000-0000-0000-000000000002"
 VIDEO_TITLE = "Corso di prova"
 OTHER_VIDEO_TITLE = "Secondo corso"
+
+
+def add_complete_boundary_evidence(report: AcademyReport) -> AcademyReport:
+    if not report.interventions:
+        report.interventions = [Intervention(
+            id="i001", start_seconds=0, end_seconds=report.duration_seconds,
+            tipo="intervento", relatori=["Giulia Bianchi"], titolo="Governance",
+            sintesi="Il corso tratta governance e controlli.",
+            punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
+        )]
+    report.boundaries = [
+        BoundaryEvidence(
+            previous_intervention_id=previous.id,
+            next_intervention_id=following.id,
+            boundary_seconds=int(previous.end_seconds),
+            words_before=[], words_after=[], pause_before=True, pause_after=True,
+            rule="long_pause",
+        )
+        for previous, following in zip(report.interventions, report.interventions[1:])
+    ]
+    return report
 
 
 def extract_hidden(page: str, name: str) -> str:
@@ -149,11 +170,27 @@ def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
     assert f'/jobs/{completed.id}' in archive
     assert f'/jobs/{completed.id}/report.txt' in archive
     assert f'/jobs/{completed.id}/report.md' in archive
-    assert f'/jobs/{completed.id}/report.json' in archive
-    assert "Download JSON v1.1" in archive
+    assert f'/jobs/{completed.id}/report.json' not in archive
+    assert "Rianalisi necessaria" in archive
+    assert 'href="/#catalog-title"' in archive
     assert "Lavoro fallito" not in archive
     assert "Lavoro fallito" in recent
     assert "Report salvato" not in recent
+
+
+def test_dashboard_retains_json_download_for_complete_boundary_evidence(client):
+    report = add_complete_boundary_evidence(
+        AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    )
+    store = client.app.state.store
+    completed = store.create("completed-source", source_title="Report conforme")
+    store.update(completed.id, state=JobState.PROCESSING)
+    store.update(completed.id, state=JobState.COMPLETED, report=report)
+
+    archive = client.get("/").text
+
+    assert f'/jobs/{completed.id}/report.json' in archive
+    assert "Download JSON v1.1" in archive
 
 
 def test_dashboard_has_accessible_catalog_controls_and_lazy_bunny_thumbnails(client):
@@ -562,8 +599,43 @@ def test_exports_require_completion_and_queued_job_can_be_cancelled(client):
     assert client.get(f"/api/jobs/{job.id}").json()["state"] == "cancelled"
 
 
-def test_completed_job_downloads_and_page_escape_untrusted_content(client):
+def test_historical_json_requires_reanalysis_before_any_external_work(client, monkeypatch):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    store = client.app.state.store
+    job = store.create("not-even-a-bunny-url", source_title="Report storico")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    client.app.state.inventory = _ForbiddenProvider()
+    client.app.state.bunny = _ForbiddenProvider()
+    client.app.state.assemblyai = _ForbiddenProvider()
+    client.app.state.openai = _ForbiddenProvider()
+    monkeypatch.setattr(
+        "app.web.material_sources_for_video",
+        lambda *args: (_ for _ in ()).throw(AssertionError("material checker called")),
+    )
+    monkeypatch.setattr(
+        "app.web.build_intermediate_report",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("JSON builder called")),
+    )
+
+    response = client.get(f"/jobs/{job.id}/report.json")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Rianalisi necessaria per verificare i confini sull’audio",
+    }
+    assert client.get(f"/jobs/{job.id}/report.md").status_code == 200
+    assert client.get(f"/jobs/{job.id}/report.txt").status_code == 200
+    page = client.get(f"/jobs/{job.id}").text
+    assert "Rianalisi necessaria" in page
+    assert f'href="/#catalog-title"' in page
+    assert "Download JSON v1.1" not in page
+
+
+def test_completed_job_downloads_and_page_escape_untrusted_content(client):
+    report = add_complete_boundary_evidence(
+        AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    )
     report.title = "<script>alert('unsafe')</script>"
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
@@ -587,7 +659,7 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         assert report.synopsis in response.text
         for section in ("Sinossi", "Relatori", "Slide"):
             assert section in response.text
-        for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
+        for obsolete_section in ("Punti chiave", "Obiettivi formativi"):
             assert obsolete_section not in response.text
     json_response = client.get(f"/jobs/{job.id}/report.json")
     assert json_response.status_code == 200
@@ -621,7 +693,7 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
     assert "&lt;script&gt;" in page.text
     for section in ("Sinossi", "Relatori", "Slide"):
         assert section in page.text
-    for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
+    for obsolete_section in ("Punti chiave", "Obiettivi formativi"):
         assert obsolete_section not in page.text
     for control in ("Download JSON v1.1", "Download Markdown", "Download TXT", "Stampa / Salva PDF"):
         assert control in page.text
@@ -632,12 +704,25 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
 def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
     report.bunny_title = "Titolo Bunny originale"
-    report.interventions = [Intervention(
+    report.interventions = [
+        Intervention(
+            id="lead-in", start_seconds=0, end_seconds=125, tipo="pausa",
+            relatori=[], titolo="Attesa", sintesi="Attesa iniziale.",
+            punti_chiave=[], confidenza=.92,
+        ),
+        Intervention(
         id="i001", start_seconds=125, end_seconds=905, tipo="intervento",
         relatori=["Marco Rossi"], titolo="Assetti di governance",
         sintesi="Il relatore illustra gli assetti di governance.",
         punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
-    )]
+        ),
+        Intervention(
+            id="tail", start_seconds=905, end_seconds=3720, tipo="pausa",
+            relatori=[], titolo="Coda", sintesi="Attesa finale.",
+            punti_chiave=[], confidenza=.92,
+        ),
+    ]
+    add_complete_boundary_evidence(report)
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
     store.update(job.id, state=JobState.PROCESSING)
@@ -649,14 +734,14 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
     assert video["titolo_bunny"] == "Titolo Bunny originale"
     assert video["chiave"] == "v1"
     assert video["ordine"] == 1
-    assert video["interventi"] == [{
-        "id": "v1-i001", "inizio": "0:02:05", "fine": "0:15:05",
+    assert video["interventi"][1] == {
+        "id": "v1-i002", "inizio": "0:02:05", "fine": "0:15:05",
         "tipo": "intervento", "relatori": ["Marco Rossi"],
         "titolo": "Assetti di governance",
         "sintesi": "Il relatore illustra gli assetti di governance.",
         "punti_chiave": ["Organi", "Deleghe", "Controlli"], "accesso": "pubblico",
         "confidenza": .92,
-    }]
+    }
     assert "incertezze" not in payload
 
 
@@ -669,6 +754,8 @@ def test_json_export_preserves_accented_identity_and_survives_malformed_material
         relatori=["Jose Nunez"], titolo="Governance", sintesi="Assetti e controlli.",
         punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
     )]
+    report.duration_seconds = 120
+    add_complete_boundary_evidence(report)
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
     store.update(job.id, state=JobState.PROCESSING)
@@ -696,7 +783,9 @@ def test_json_export_preserves_accented_identity_and_survives_malformed_material
 
 
 def test_json_export_survives_inventory_failure_without_leaking_cell_data(client):
-    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report = add_complete_boundary_evidence(
+        AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    )
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
     store.update(job.id, state=JobState.PROCESSING)

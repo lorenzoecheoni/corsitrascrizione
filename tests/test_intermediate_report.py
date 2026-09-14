@@ -20,11 +20,120 @@ from app.intermediate_report import (
     registered_slug,
     split_role_organization,
 )
-from app.models import AcademyReport, Intervention, SpeakerProfile
+from app.models import AcademyReport, BoundaryEvidence, Intervention, SpeakerProfile
 from app.reporting import correct_speaker_name_mentions, render_markdown, render_text
 
 
 TARGET_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+
+
+def report_with_boundary_evidence() -> AcademyReport:
+    interventions = [
+        make_intervention(0, 11, titolo="Uno"),
+        make_intervention(11, 22, titolo="Due"),
+        make_intervention(22, 33, titolo="Tre"),
+        make_intervention(33, 44, titolo="Quattro"),
+    ]
+    for intervention, stored_id in zip(
+        interventions, ["stored-z", "stored-a", "stored-y", "stored-b"], strict=True,
+    ):
+        intervention.id = stored_id
+    report = make_report(interventions, duration=44)
+    report.boundaries = [
+        BoundaryEvidence(
+            previous_intervention_id="stored-z", next_intervention_id="stored-a",
+            boundary_seconds=11,
+            words_before=["la", "governance", "si", "chiude", "qui"],
+            words_after=["passiamo", "ora", "al", "tema", "fiscale"],
+            pause_before=False, pause_after=False, rule="no_pause",
+        ),
+        BoundaryEvidence(
+            previous_intervention_id="stored-a", next_intervention_id="stored-y",
+            boundary_seconds=22, words_before=["solo", "quattro", "parole", "qui"],
+            words_after=[], pause_before=True, pause_after=True, rule="short_pause",
+        ),
+        BoundaryEvidence(
+            previous_intervention_id="stored-y", next_intervention_id="stored-b",
+            boundary_seconds=33, words_before=[], words_after=[],
+            pause_before=True, pause_after=True, rule="long_pause",
+        ),
+    ]
+    return report
+
+
+def test_confine_warnings_use_chronological_export_ids_and_exact_audio_evidence():
+    report = report_with_boundary_evidence()
+
+    payload = build_intermediate_report(report, TARGET_GUID).model_dump(
+        mode="json", by_alias=True, exclude_none=True,
+    )
+    checks = [
+        item for item in payload["verifiche_richieste"] if item["codice"] == "CONFINE"
+    ]
+
+    assert [item["intervento"] for item in checks] == ["v1-i002", "v1-i003", "v1-i004"]
+    assert [item["campo"] for item in checks] == ["inizio", "inizio", "inizio"]
+    assert "Confine 0:00:11; termina v1-i001." in checks[0]["messaggio"]
+    assert "Prima: «la governance si chiude qui»." in checks[0]["messaggio"]
+    assert "Dopo: «passiamo ora al tema fiscale»." in checks[0]["messaggio"]
+    assert "Prima: «solo quattro parole qui» (pausa)." in checks[1]["messaggio"]
+    assert "Dopo: (pausa)." in checks[1]["messaggio"]
+    assert checks[2]["messaggio"].count("(pausa)") == 2
+    assert payload["stato"] == "verificato"
+
+
+def test_boundary_builder_rejects_incomplete_evidence_and_keeps_distinct_pairs():
+    report = report_with_boundary_evidence()
+    mapping = {
+        intervention.id: f"v1-i{index:03d}"
+        for index, intervention in enumerate(report.interventions, start=1)
+    }
+
+    checks = intermediate_report.build_boundary_verifications(report, mapping)
+
+    assert len(checks) == 3
+    assert all(item.livello == "avviso" for item in checks)
+    report.boundaries.pop()
+    with pytest.raises(ValueError, match="confini"):
+        intermediate_report.build_boundary_verifications(report, mapping)
+
+
+@pytest.mark.parametrize(("words_before", "pause_before", "words_after", "pause_after", "expected"), [
+    (["meno", "di", "cinque", "parole"], True,
+     ["dopo", "restano", "cinque", "parole", "esatte"], False,
+     "Prima: «meno di cinque parole» (pausa). Dopo: «dopo restano cinque parole esatte»."),
+    (["prima", "restano", "cinque", "parole", "esatte"], False,
+     [], True,
+     "Prima: «prima restano cinque parole esatte». Dopo: (pausa)."),
+    (["cinque", "parole", "ma", "pausa", "prima"], True,
+     ["dopo", "restano", "cinque", "parole", "esatte"], False,
+     "Prima: «cinque parole ma pausa prima» (pausa). Dopo: «dopo restano cinque parole esatte»."),
+    (["prima", "restano", "cinque", "parole", "esatte"], False,
+     ["cinque", "parole", "ma", "pausa", "dopo"], True,
+     "Prima: «prima restano cinque parole esatte». Dopo: «cinque parole ma pausa dopo» (pausa)."),
+    (["cinque", "parole", "ma", "pausa", "prima"], True,
+     ["cinque", "parole", "ma", "pausa", "dopo"], True,
+     "Prima: «cinque parole ma pausa prima» (pausa). Dopo: «cinque parole ma pausa dopo» (pausa)."),
+])
+def test_confine_renders_pause_flags_instead_of_partial_or_zero_word_excerpts(
+    words_before, pause_before, words_after, pause_after, expected,
+):
+    report = make_report([
+        make_intervention(0, 10), make_intervention(10, 20),
+    ], duration=20)
+    report.interventions[0].id = "first"
+    report.interventions[1].id = "second"
+    report.boundaries = [BoundaryEvidence(
+        previous_intervention_id="first", next_intervention_id="second",
+        boundary_seconds=10, words_before=words_before, words_after=words_after,
+        pause_before=pause_before, pause_after=pause_after, rule="short_pause",
+    )]
+
+    check = intermediate_report.build_boundary_verifications(
+        report, {"first": "v1-i001", "second": "v1-i002"},
+    )[0]
+
+    assert expected in check.messaggio
 
 
 @pytest.mark.parametrize("formal_names", [

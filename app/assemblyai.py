@@ -138,11 +138,11 @@ class AssemblyAITranscriber:
             raise TranscriptionError("response")
         # The two independent duration measurements may disagree by one final
         # second due to provider rounding. Anything larger is ambiguous and
-        # cannot safely share Bunny's timeline. Keep raw word times intact and
-        # bound them by the accepted provider measurement instead of clipping.
+        # cannot safely share Bunny's timeline. Bunny remains the canonical
+        # export timeline; a terminal provider word that crosses its rounded
+        # end is clipped to the real source duration below.
         if abs(provider_duration - expected_duration) > 1:
             raise WordEvidenceError()
-        word_duration_limit = provider_duration
 
         originals: list[TranscriptSegment] = []
         mapping: dict[str, str] = {}
@@ -168,7 +168,7 @@ class AssemblyAITranscriber:
                 raise WordEvidenceError()
             words: list[TranscriptWord] = []
             previous_start = -1.0
-            for raw_word in raw_words:
+            for word_index, raw_word in enumerate(raw_words, start=1):
                 try:
                     word_text = raw_word["text"]
                     word_speaker = raw_word["speaker"]
@@ -177,18 +177,30 @@ class AssemblyAITranscriber:
                     confidence = float(raw_word["confidence"])
                 except (KeyError, TypeError, ValueError, OverflowError):
                     raise WordEvidenceError() from None
+                terminal_word = (
+                    utterance_index == len(utterances) and word_index == len(raw_words)
+                )
+                terminal_rounding = (
+                    terminal_word
+                    and provider_duration > expected_duration
+                    and word_start < expected_duration
+                    and word_end <= provider_duration + 1
+                )
                 if (
                     not isinstance(word_text, str) or not word_text.strip()
                     or not isinstance(word_speaker, str) or word_speaker.strip() != speaker.strip()
                     or not math.isfinite(word_start) or not math.isfinite(word_end)
                     or not math.isfinite(confidence)
-                    or word_start < 0 or word_end > word_duration_limit
+                    or word_start < 0
+                    or (word_end > provider_duration and not terminal_rounding)
                     or word_start < previous_start
                 ):
                     raise WordEvidenceError()
+                canonical_word_end = min(word_end, expected_duration)
                 try:
                     parsed_word = TranscriptWord(
-                        text=word_text.strip(), start_seconds=word_start, end_seconds=word_end,
+                        text=word_text.strip(), start_seconds=word_start,
+                        end_seconds=canonical_word_end,
                         diarization_label=label, confidence=confidence,
                     )
                 except (TypeError, ValueError):
@@ -197,7 +209,7 @@ class AssemblyAITranscriber:
                 previous_start = word_start
             originals.append(TranscriptSegment(
                 start_seconds=min(start, words[0].start_seconds),
-                end_seconds=max(end, max(word.end_seconds for word in words)),
+                end_seconds=max(min(end, expected_duration), max(word.end_seconds for word in words)),
                 diarization_label=label,
                 text=text.strip(),
                 source_utterance_id=f"assembly-u{utterance_index:06d}",

@@ -90,7 +90,7 @@ def test_assemblyai_rejects_words_beyond_accepted_provider_duration():
                 "start": 2500,
                 "end": 3000,
                 "text": "Fuori durata.",
-                "words": [word("Fuori", 2500, 2800), word("durata.", 2800, 4100)],
+                "words": [word("Fuori", 2500, 2800), word("durata.", 2800, 5100)],
             }],
         }, 3)
 
@@ -139,6 +139,29 @@ def test_assemblyai_reconciles_one_second_terminal_provider_rounding_for_alignme
     ]
     assert alignment.interventions[-1].end_seconds == 5789
     assert has_complete_boundary_evidence(report)
+
+
+def test_assemblyai_clips_terminal_word_past_rounded_provider_duration_to_bunny_timeline():
+    from app.assemblyai import AssemblyAITranscriber
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 5790,
+        "language_code": "it",
+        "text": "Conclusione.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 5_788_000,
+            "end": 5_790_200,
+            "text": "Conclusione.",
+            "words": [word("Conclusione.", 5_788_000, 5_790_200)],
+        }],
+    }, 5789)
+
+    assert result.original_segments[0].start_seconds == 5788
+    assert result.original_segments[0].end_seconds == 5789
+    assert result.original_segments[0].words[0].start_seconds == 5788
+    assert result.original_segments[0].words[0].end_seconds == 5789
 
 
 def test_assemblyai_rejects_provider_duration_skew_larger_than_one_second():

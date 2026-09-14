@@ -98,12 +98,14 @@ class TranscriptWord(BaseModel):
 utterance text, timing, speaker label, and source utterance ID. AssemblyAI parsing
 requires a valid, ordered, non-empty word list for every non-empty utterance.
 The word text concatenation need not reproduce punctuation byte-for-byte, but
-all words must have finite, positive spans within the Bunny-measured source
-duration and use the utterance's speaker label. AssemblyAI's documented
-sequential word array is ordered by nondecreasing word start; adjacent word
-spans may overlap and the diarized utterance window is not a required exact
-container. The local segment envelope expands to cover the validated word
-extents without altering any word timestamp. Invalid or missing word timing raises the existing fixed
+all words must have finite, positive spans within AssemblyAI's reported duration
+and use the utterance's speaker label. Bunny and AssemblyAI duration measurements
+may differ by no more than one terminal rounding second; a larger difference, or
+a word beyond the accepted provider duration, fails closed. AssemblyAI's
+documented sequential word array is ordered by nondecreasing word start;
+adjacent word spans may overlap and the diarized utterance window is not a
+required exact container. The local segment envelope expands to cover the
+validated word extents without altering any word timestamp. Invalid or missing word timing raises the existing fixed
 transcription-response text in the dedicated `WordEvidenceError` subtype; the
 pipeline maps that subtype to the fixed boundary-verification failure.
 
@@ -242,6 +244,12 @@ The algorithm operates in chronological order:
 8. Set `previous.end_seconds == next.start_seconds` for every final neighboring
    pair, including generated pauses.
 9. Generate exactly one `BoundaryEvidence` for every final neighboring pair.
+
+All internal spoken groups remain strictly within the Bunny duration. Only the
+final semantic group may have a word extent up to one second beyond it, after
+the accepted AssemblyAI duration reconciliation; it must still contain speech
+before the Bunny end. The exported final intervention always ends at Bunny's
+nearest whole second. No word timestamp is clipped or synthesized.
 
 For a generated pause there are two boundaries. On the spoken-to-pause boundary,
 the after side is marked `(pausa)`; on the pause-to-spoken boundary, the before

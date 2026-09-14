@@ -163,6 +163,24 @@ def test_fractional_moderator_start_fails_when_no_prior_valid_second():
         )
 
 
+def test_nonfinal_group_cannot_extend_into_terminal_provider_rounding_tolerance():
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(
+            5789,
+            [group(0, 5789.4), group(5789.5, 5790)],
+            [],
+        )
+
+
+def test_terminal_group_must_contain_speech_before_bunny_end():
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(
+            5789,
+            [group(0, 10), group(5789, 5789.5)],
+            [],
+        )
+
+
 @pytest.mark.parametrize("groups,duration", [
     ([], 10),
     ([group(0, 10, ())], 10),

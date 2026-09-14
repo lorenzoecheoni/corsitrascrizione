@@ -169,7 +169,18 @@ def align_intervention_boundaries(
             source = segment.source_utterance_id
             if source and source_owners.setdefault(source, index) != index:
                 raise ValueError("La partizione divide una stessa utterance sorgente")
-        if extents[index][0] >= extents[index][1] or extents[index][1] > duration_seconds:
+        speech_start, speech_end = extents[index]
+        is_terminal_group = index == len(semantic_groups) - 1
+        # Only AssemblyAI's final rounding can exceed Bunny's source timeline,
+        # and only by one second. Internal groups stay strictly bounded so no
+        # generated cut can land outside the actual video. The terminal group
+        # must still contain speech before Bunny's end even though its final
+        # word may extend into the accepted provider rounding second.
+        if (
+            speech_start >= speech_end
+            or speech_start >= duration_seconds
+            or speech_end > duration_seconds + (1 if is_terminal_group else 0)
+        ):
             raise ValueError("La partizione contiene tempi vocali non validi")
 
     final_groups = [semantic_groups[0]]

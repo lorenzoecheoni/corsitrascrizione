@@ -136,10 +136,13 @@ class AssemblyAITranscriber:
             raise TranscriptionError("response") from None
         if not math.isfinite(provider_duration) or provider_duration <= 0:
             raise TranscriptionError("response")
-        # Bunny metadata describes the source media requested for this job. A
-        # differing provider-reported duration must not extend word evidence
-        # beyond the source timeline used by the boundary aligner.
-        word_duration_limit = expected_duration
+        # The two independent duration measurements may disagree by one final
+        # second due to provider rounding. Anything larger is ambiguous and
+        # cannot safely share Bunny's timeline. Keep raw word times intact and
+        # bound them by the accepted provider measurement instead of clipping.
+        if abs(provider_duration - expected_duration) > 1:
+            raise WordEvidenceError()
+        word_duration_limit = provider_duration
 
         originals: list[TranscriptSegment] = []
         mapping: dict[str, str] = {}

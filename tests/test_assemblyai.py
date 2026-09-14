@@ -75,7 +75,7 @@ def test_assemblyai_accepts_overlapping_words_and_expands_segment_to_word_eviden
     ]
 
 
-def test_assemblyai_rejects_words_beyond_bunny_duration_when_provider_duration_is_longer():
+def test_assemblyai_rejects_words_beyond_accepted_provider_duration():
     from app.assemblyai import AssemblyAITranscriber
     from app.transcription import TranscriptionError
 
@@ -90,9 +90,72 @@ def test_assemblyai_rejects_words_beyond_bunny_duration_when_provider_duration_i
                 "start": 2500,
                 "end": 3000,
                 "text": "Fuori durata.",
-                "words": [word("Fuori", 2500, 2800), word("durata.", 2800, 3100)],
+                "words": [word("Fuori", 2500, 2800), word("durata.", 2800, 4100)],
             }],
         }, 3)
+
+    assert caught.value.code == "response"
+
+
+def test_assemblyai_reconciles_one_second_terminal_provider_rounding_for_alignment_and_report():
+    from app.assemblyai import AssemblyAITranscriber
+    from app.boundaries import SemanticIntervention, align_intervention_boundaries, has_complete_boundary_evidence
+    from app.models import AcademyContent
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 5790,
+        "language_code": "it",
+        "text": "Apertura. Conclusione.",
+        "utterances": [
+            {"speaker": "A", "start": 0, "end": 1000, "text": "Apertura.",
+             "words": [word("Apertura.", 0, 1000)]},
+            {"speaker": "A", "start": 5_788_000, "end": 5_790_000, "text": "Conclusione.",
+             "words": [word("Conclusione.", 5_788_000, 5_789_400)]},
+        ],
+    }, 5789)
+    groups = [
+        SemanticIntervention(
+            tipo="intervento", relatori=("Relatore 1",), titolo="Apertura", sintesi="",
+            punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+            segments=(result.original_segments[0],),
+        ),
+        SemanticIntervention(
+            tipo="intervento", relatori=("Relatore 1",), titolo="Conclusione", sintesi="",
+            punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+            segments=(result.original_segments[1],),
+        ),
+    ]
+
+    alignment = align_intervention_boundaries(5789, groups, [])
+    report = AcademyContent(
+        title="Corso", duration_seconds=5789, detected_language="it", synopsis="",
+        speakers=[], slides=[], uncertainties=[], interventions=alignment.interventions,
+        boundaries=alignment.boundaries, audio_boundary_version=1,
+    )
+
+    assert [(item.start_seconds, item.end_seconds) for item in alignment.interventions] == [
+        (0, 1), (1, 5789),
+    ]
+    assert alignment.interventions[-1].end_seconds == 5789
+    assert has_complete_boundary_evidence(report)
+
+
+def test_assemblyai_rejects_provider_duration_skew_larger_than_one_second():
+    from app.assemblyai import AssemblyAITranscriber
+    from app.transcription import TranscriptionError
+
+    with pytest.raises(TranscriptionError) as caught:
+        AssemblyAITranscriber._parse_result({
+            "status": "completed",
+            "audio_duration": 5790.01,
+            "language_code": "it",
+            "text": "Fuori tolleranza.",
+            "utterances": [{
+                "speaker": "A", "start": 0, "end": 1000, "text": "Fuori tolleranza.",
+                "words": [word("Fuori", 0, 500), word("tolleranza.", 500, 1000)],
+            }],
+        }, 5789)
 
     assert caught.value.code == "response"
 

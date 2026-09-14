@@ -72,6 +72,9 @@ class MediaArtifacts:
     # upper bound: playlists, retries, encryption and transport overhead vary.
     # Output media sizes must never be substituted for input traffic.
     silence_intervals: list[SilenceInterval] = field(default_factory=list)
+    # Empty measured evidence is distinct from a media path that never ran
+    # silencedetect. This flag remains transient with the other artifacts.
+    silence_measured: bool = False
 
 
 class MediaError(RuntimeError):
@@ -443,6 +446,7 @@ class FFmpegProcessor:
         _check_cancelled(cancellation_event)
         return MediaArtifacts(
             audio_chunks, frame_candidates, (input_bytes * 120 + 99) // 100, silence_intervals,
+            silence_measured=not include_audio,
         )
 
     def _read_chunks(self, output: Path, event: Event) -> list[AudioChunk]:

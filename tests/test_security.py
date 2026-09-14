@@ -14,7 +14,7 @@ from app.config import Settings
 from app.main import create_app
 from app.media import MediaArtifacts, MediaError
 from app.pipeline import AnalysisPipeline, PipelineError
-from app.transcription import TranscriptionError, TranscriptionResult
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionError, TranscriptionResult
 
 
 @pytest.fixture
@@ -79,9 +79,20 @@ def failing_pipeline(settings, sentinels, tmp_path, phase):
             video_id=UUID(int=1), title="Fake fixture", duration_seconds=60,
             status=3, available_resolutions=[240])),
             select_hls_url=lambda _, **kwargs: sentinels.signed_url),
-        SimpleNamespace(extract=stage("media", MediaArtifacts([], [], 0))),
+        SimpleNamespace(extract=stage(
+            "media", MediaArtifacts([], [], 0, silence_measured=True),
+        )),
         SimpleNamespace(transcribe=stage("transcription", TranscriptionResult(
-            text=sentinels.transcript, segments=[], audio_seconds=60))),
+            text=sentinels.transcript, audio_seconds=60,
+            segments=[TranscriptSegment(
+                start_seconds=0, end_seconds=59, diarization_label="chunk-0:A",
+                text=sentinels.transcript, source_utterance_id="security-u1",
+                words=[TranscriptWord(
+                    text="sentinel", start_seconds=1, end_seconds=2,
+                    diarization_label="chunk-0:A", confidence=.9,
+                )],
+            )],
+        ))),
         SimpleNamespace(analyze=stage("analysis", SimpleNamespace(
             model_dump=lambda: {"title": sentinels.transcript}))), temp_root=tmp_path,
     )

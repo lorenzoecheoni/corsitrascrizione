@@ -220,6 +220,9 @@ class AnalysisPipeline:
                             check_cancelled()
                             if attempt or not self.settings.bunny_token_auth_key:
                                 raise PipelineError("protected_video") from None
+                if not media.silence_measured:
+                    next_phase("boundary")
+                    raise PipelineError("boundaries")
                 progress(45, "Immagini pronte" if self.fast_transcriber is not None else "Audio e immagini pronti")
                 progress(50, "Trascrizione e distinzione dei relatori")
                 next_phase("transcription")
@@ -242,7 +245,9 @@ class AnalysisPipeline:
                 analysis_options = {
                     "cancellation_event": event,
                     "progress_callback": analysis_progress,
-                    "silence_intervals": media.silence_intervals,
+                    "silence_intervals": (
+                        media.silence_intervals if media.silence_measured else None
+                    ),
                 }
                 if self.speaker_hint_provider is not None:
                     analysis_options["speaker_name_hints"] = speaker_name_hints

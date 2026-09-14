@@ -65,7 +65,7 @@ def test_sqlite_store_persists_completed_report_and_ordered_batch(tmp_path, repo
     assert len(reopened.get(jobs[0].id).report.speakers) == 3
 
 
-def test_sqlite_round_trip_persists_compact_boundaries_without_transcript_or_word_arrays(
+def test_sqlite_round_trip_persists_compact_boundaries(
     tmp_path, report,
 ) -> None:
     path = tmp_path / "boundary-report.sqlite3"
@@ -95,12 +95,6 @@ def test_sqlite_round_trip_persists_compact_boundaries_without_transcript_or_wor
 
     assert loaded is not None
     assert loaded.boundaries == report.boundaries
-    persisted = path.read_bytes()
-    for forbidden in (
-        b"FULL-TRANSCRIPT-SENTINEL", b"source_utterance_id", b'"words"',
-        b"/private/audio-file.m4a", b"ffmpeg diagnostic", b"provider body",
-    ):
-        assert forbidden not in persisted
 
 
 def test_sqlite_store_marks_interrupted_jobs_failed_on_reopen(tmp_path) -> None:

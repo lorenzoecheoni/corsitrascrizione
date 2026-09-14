@@ -385,6 +385,24 @@ class OpenAIAnalyzer:
                 prepare(data)
                 result = text_format.model_validate(data)
                 errors = validate(result)
+            except ValidationError as exc:
+                if attempts < 3:
+                    payload = original_payload
+                    instructions = original_instructions
+                    current_max_output_tokens = max_output_tokens * 2
+                    output_limit_retry_used = True
+                    continue
+                partition_error = any(
+                    error.get("loc") and error["loc"][0] == "interventions"
+                    for error in exc.errors(
+                        include_url=False, include_context=False, include_input=False,
+                    )
+                )
+                if partition_error and validation_error_code == "boundaries":
+                    raise AnalysisError(
+                        validation_error_code, stage=validation_error_stage or stage,
+                    ) from None
+                raise AnalysisError("response", stage=stage) from None
             except (ValueError, TypeError, AttributeError, KeyError):
                 if attempts < 3:
                     payload = original_payload
@@ -428,6 +446,12 @@ class OpenAIAnalyzer:
         speaker_name_hints: Sequence[str] = (),
     ) -> AnalysisResult:
         check_cancelled(cancellation_event)
+        if (
+            silence_intervals is None
+            or not transcription.segments
+            or any(not segment.words for segment in transcription.segments)
+        ):
+            raise AnalysisError("boundaries", stage="boundary")
         usage = ProviderUsage()
         slides, uncertain_count = self._classify_slides(
             metadata, frames, cancellation_event=cancellation_event,
@@ -458,8 +482,6 @@ class OpenAIAnalyzer:
                 progress_callback("transcript", index, len(windows))
         check_cancelled(cancellation_event)
         try:
-            if silence_intervals is None:
-                raise ValueError("Le pause audio non sono disponibili")
             alignment = materialize_interventions(
                 metadata.duration_seconds,
                 windows,

@@ -212,6 +212,19 @@ def test_boundary_analyzer_fails_closed_after_incomplete_semantic_group_repair(i
     assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
 
 
+def test_boundary_analyzer_maps_schema_invalid_partition_after_retries(inputs, content):
+    inputs["frames"] = []
+    invalid = window_result()
+    invalid["interventions"][0]["segment_indexes"] = ["not-an-index"]
+
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(FakeClient(invalid, invalid, invalid)).analyze(**inputs)
+
+    assert caught.value.code == "boundaries"
+    assert caught.value.stage == "boundary"
+    assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
+
+
 def test_boundary_analyzer_rejects_nonadjacent_materializer_output(inputs, content, monkeypatch):
     inputs["frames"] = []
     malformed = BoundaryAlignment(

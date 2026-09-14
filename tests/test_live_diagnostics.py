@@ -23,7 +23,7 @@ from app.analysis_chunks import (
 )
 from app.bunny import BunnyVideoMetadata
 from app.models import ProviderUsage
-from app.transcription import TranscriptSegment, TranscriptionResult
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 
 
 _SYNTHETIC_DURATION_SECONDS = 96 * 60
@@ -215,6 +215,13 @@ def _synthetic_long_inputs():
             end_seconds=(index + 1) * 60,
             diarization_label=f"chunk-{index // 10}:{'ABCD'[index % 4]}",
             text=_synthetic_segment_text(index),
+            source_utterance_id=f"synthetic-u{index:03d}",
+            words=[TranscriptWord(
+                text=f"evidenza-{index}", start_seconds=index * 60 + .1,
+                end_seconds=(index + 1) * 60 - .1,
+                diarization_label=f"chunk-{index // 10}:{'ABCD'[index % 4]}",
+                confidence=.99,
+            )],
         )
         for index in range(96)
     ]
@@ -251,7 +258,9 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     result = None
     passed = False
     try:
-        result = OpenAIAnalyzer(audited).analyze(metadata, transcription, frames=[])
+        result = OpenAIAnalyzer(audited).analyze(
+            metadata, transcription, frames=[], silence_intervals=[],
+        )
         assert result.synopsis.strip()
         assert result.speakers
         _assert_live_statuses(audited)
@@ -327,6 +336,11 @@ def test_announced_presenter_and_speakers_survive_live_consolidation():
                 "l'Avvocato Furio D'Andrea e Luigi Morra. Li introduco ora; dal solo "
                 "annuncio non sappiamo ancora quale voce appartenga a ciascuno di loro."
             ),
+            source_utterance_id="synthetic-announcement-u1",
+            words=[TranscriptWord(
+                text="Buongiorno", start_seconds=.1, end_seconds=59.9,
+                diarization_label="chunk-0:A", confidence=.99,
+            )],
         )],
         audio_seconds=60,
     )
@@ -336,7 +350,9 @@ def test_announced_presenter_and_speakers_survive_live_consolidation():
     names: set[str] = set()
     passed = False
     try:
-        result = OpenAIAnalyzer(audited).analyze(metadata, transcription, frames=[])
+        result = OpenAIAnalyzer(audited).analyze(
+            metadata, transcription, frames=[], silence_intervals=[],
+        )
         names = {speaker.display_name for speaker in result.speakers}
         assert expected_names <= names
         assert sum(audited.status_counts.values()) == len(audited.requests)

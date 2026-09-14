@@ -231,6 +231,7 @@ def test_extract_single_input_audio_scene_timestamps_and_byte_estimate(
             str(synthetic_video), workspace, progress.append, Event(),
         )
         assert len(result.audio_chunks) == 1
+        assert result.silence_measured is False
         chunk = result.audio_chunks[0]
         data = probe(ffprobe, chunk.path)
         stream = data["streams"][0]
@@ -291,6 +292,7 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
             "https://cdn.example/video/play_240p.mp4", workspace, progress.append, Event(),
         )
         assert result.audio_chunks == []
+        assert result.silence_measured is True
         assert result.silence_intervals == [media.SilenceInterval(12.5, 14.25)]
         assert not list(workspace.rglob("*.m4a"))
         assert not list(workspace.rglob("audio.csv"))
@@ -338,6 +340,7 @@ def test_visual_only_extraction_returns_no_intervals_when_silencedetect_reports_
         result = FFmpegProcessor().extract_visual("private", workspace, lambda _: None, Event())
 
     assert result.silence_intervals == []
+    assert result.silence_measured is True
 
 
 def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_files(tmp_path, media_tools) -> None:

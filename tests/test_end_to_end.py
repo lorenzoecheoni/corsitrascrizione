@@ -96,17 +96,19 @@ class OfflineAssemblyAI:
     def transcribe_url(self, url, *, duration_seconds, cancellation_event):
         assert duration_seconds == 2
         return TranscriptionResult(
-            provider="assemblyai", language="it", text="Introduzione al corso.",
+            provider="assemblyai", language="it",
+            text=("FULL-TRANSCRIPT-SENTINEL /private/audio-file.m4a "
+                  "provider body ffmpeg diagnostic"),
             audio_seconds=2,
             usage=ProviderUsage(entries=[UsageEntry(
                 provider_audio_seconds=2, request_audio_seconds=2,
             )]),
             segments=[TranscriptSegment(
                 start_seconds=0, end_seconds=2, diarization_label="assembly:A",
-                text="Introduzione al corso.",
+                text="FULL-TRANSCRIPT-SENTINEL",
                 source_utterance_id="assembly-u000001",
                 words=[TranscriptWord(
-                    text="Introduzione", start_seconds=.1, end_seconds=1.9,
+                    text="WORD-ARRAY-SENTINEL", start_seconds=.1, end_seconds=1.9,
                     diarization_label="assembly:A", confidence=.99,
                 )],
             )],
@@ -196,9 +198,12 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             assert report.usage.transcription.provider_audio_seconds == 2
             assert report.usage.responses.requests == 2
             serialized_report = json.dumps(status["report"])
-            assert "assembly-u000001" not in serialized_report
-            assert '"words"' not in serialized_report
-            assert "0.99" not in serialized_report
+            for forbidden in (
+                "FULL-TRANSCRIPT-SENTINEL", "WORD-ARRAY-SENTINEL",
+                "assembly-u000001", '"words"', "0.99", "/private/audio-file.m4a",
+                "provider body", "ffmpeg diagnostic",
+            ):
+                assert forbidden not in serialized_report
             assert status["progress"] == 100
             page = client.get(location)
             assert "Corso sintetico" in page.text
@@ -227,9 +232,12 @@ def run_smoke_scenario(tmp_path, monkeypatch):
         assert "Corso sintetico" in reopened.text
         assert restarted.get(f"{location}/report.txt").status_code == 200
     persisted = Path(settings.database_path).read_bytes()
-    assert b"assembly-u000001" not in persisted
-    assert b'"words"' not in persisted
-    assert b"0.99" not in persisted
+    for forbidden in (
+        b"FULL-TRANSCRIPT-SENTINEL", b"WORD-ARRAY-SENTINEL",
+        b"assembly-u000001", b'"words"', b"0.99", b"/private/audio-file.m4a",
+        b"provider body", b"ffmpeg diagnostic",
+    ):
+        assert forbidden not in persisted
     assert monotonic() - started < 15
 
 

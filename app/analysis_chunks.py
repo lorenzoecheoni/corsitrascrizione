@@ -11,13 +11,14 @@ from typing import Annotated, Mapping
 
 from pydantic import Field, field_validator, model_validator
 
+from app.boundaries import BoundaryAlignment, SemanticIntervention, align_intervention_boundaries
 from app.bunny import BunnyVideoMetadata
+from app.media import SilenceInterval
 from app.models import (
     Confidence,
     Evidence,
     IDENTITY_EVIDENCE_KINDS,
     GENERIC_INTERVENTION_SPEAKER,
-    Intervention,
     InterventionKind,
     Nonnegative,
     ReportModel,
@@ -223,10 +224,6 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
     return windows
 
 
-def _rounded_second(value: float) -> int:
-    return int(value + 0.5)
-
-
 def _speaker_names(labels: Sequence[str], mapping: Mapping[str, str]) -> list[str]:
     names: list[str] = []
     for label in labels:
@@ -242,13 +239,13 @@ def materialize_interventions(
     windows: Sequence[TranscriptWindow],
     analyses: Sequence[WindowAnalysis],
     speaker_names: Mapping[str, str],
-) -> list[Intervention]:
-    """Create a gap-free, one-second timeline from validated local partitions."""
-    duration = _rounded_second(duration_seconds)
-    if duration <= 0 or len(windows) != len(analyses):
+    silence_intervals: Sequence[SilenceInterval],
+) -> BoundaryAlignment:
+    """Validate AI groupings, join split utterances, then align them to audio."""
+    if len(windows) != len(analyses):
         raise ValueError("La partizione degli interventi non è valida")
 
-    groups: list[dict] = []
+    groups: list[SemanticIntervention] = []
     for window, analysis in zip(windows, analyses):
         if not window.segments or not analysis.interventions:
             raise ValueError("La partizione degli interventi deve includere ogni segmento")
@@ -267,87 +264,43 @@ def materialize_interventions(
             labels = draft.diarization_labels or list(
                 dict.fromkeys(segment.diarization_label for segment in selected)
             )
-            groups.append(
-                {
-                    "start": max(0, _rounded_second(min(item.start_seconds for item in selected))),
-                    "end": min(duration, _rounded_second(max(item.end_seconds for item in selected))),
-                    "tipo": draft.tipo,
-                    "relatori": _speaker_names(labels, speaker_names),
-                    "titolo": draft.titolo,
-                    "sintesi": draft.sintesi,
-                    "punti_chiave": draft.punti_chiave,
-                    "confidenza": draft.confidenza,
-                }
+            current = SemanticIntervention(
+                tipo=draft.tipo,
+                relatori=tuple(_speaker_names(labels, speaker_names)),
+                titolo=draft.titolo,
+                sintesi=draft.sintesi,
+                punti_chiave=tuple(draft.punti_chiave),
+                confidenza=draft.confidenza,
+                segments=tuple(selected),
             )
-
-    groups.sort(key=lambda item: (item["start"], item["end"]))
-    for group in groups:
-        if group["end"] <= group["start"]:
-            group["end"] = min(duration, group["start"] + 1)
-        if group["end"] <= group["start"]:
-            raise ValueError("La partizione produce un intervallo vuoto")
-
-    # Diarization providers can overlap turns. Split the overlap at a stable
-    # second so the final course contract remains strictly adjacent.
-    for previous, current in zip(groups, groups[1:]):
-        if current["start"] < previous["end"]:
-            boundary = _rounded_second((previous["end"] + current["start"]) / 2)
-            lower = previous["start"] + 1
-            upper = current["end"] - 1
-            if lower > upper:
-                raise ValueError("La partizione contiene interventi sovrapposti non separabili")
-            boundary = max(lower, min(upper, boundary))
-            previous["end"] = boundary
-            current["start"] = boundary
-
-    materialized: list[dict] = []
-    cursor = 0
-    for group in groups:
-        if group["start"] > cursor:
-            materialized.append(
-                {
-                    "start": cursor,
-                    "end": group["start"],
-                    "tipo": "pausa",
-                    "relatori": [],
-                    "titolo": "Pausa o silenzio",
-                    "sintesi": "Intervallo senza parlato rilevato nella trascrizione.",
-                    "punti_chiave": [],
-                    "confidenza": 0.6,
-                }
+            previous_sources = (
+                {segment.source_utterance_id for segment in groups[-1].segments
+                 if segment.source_utterance_id}
+                if groups else set()
             )
-        if group["start"] < cursor:
-            raise ValueError("La partizione degli interventi non è cronologica")
-        materialized.append(group)
-        cursor = group["end"]
-    if cursor < duration:
-        materialized.append(
-            {
-                "start": cursor,
-                "end": duration,
-                "tipo": "pausa",
-                "relatori": [],
-                "titolo": "Pausa o silenzio",
-                "sintesi": "Intervallo senza parlato rilevato nella trascrizione.",
-                "punti_chiave": [],
-                "confidenza": 0.6,
+            current_sources = {
+                segment.source_utterance_id for segment in current.segments
+                if segment.source_utterance_id
             }
-        )
+            if groups and previous_sources & current_sources:
+                previous = groups.pop()
+                groups.append(SemanticIntervention(
+                    tipo=previous.tipo,
+                    relatori=tuple(dict.fromkeys((*previous.relatori, *current.relatori))),
+                    titolo=previous.titolo,
+                    sintesi=previous.sintesi,
+                    punti_chiave=previous.punti_chiave,
+                    confidenza=previous.confidenza,
+                    segments=(*previous.segments, *current.segments),
+                ))
+            else:
+                groups.append(current)
 
-    return [
-        Intervention(
-            id=f"i{index:03d}",
-            start_seconds=item["start"],
-            end_seconds=item["end"],
-            tipo=item["tipo"],
-            relatori=item["relatori"],
-            titolo=item["titolo"],
-            sintesi=item["sintesi"],
-            punti_chiave=item["punti_chiave"],
-            confidenza=item["confidenza"],
-        )
-        for index, item in enumerate(materialized, start=1)
-    ]
+    return align_intervention_boundaries(
+        duration_seconds=duration_seconds,
+        semantic_groups=groups,
+        silence_intervals=silence_intervals,
+    )
 
 
 def _bounded_text(value: str | None) -> str | None:

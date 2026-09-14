@@ -6,7 +6,16 @@ from pydantic import ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.models import SlideChange
-from app.transcription import TranscriptSegment, TranscriptionResult
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
+
+
+def _spoken(start, end, label, text, source=""):
+    return TranscriptSegment(
+        start_seconds=start, end_seconds=end, diarization_label=label, text=text,
+        source_utterance_id=source,
+        words=[TranscriptWord(text=text, start_seconds=start, end_seconds=end,
+                              diarization_label=label, confidence=.9)],
+    )
 
 
 def _draft(indexes, **changes):
@@ -55,12 +64,13 @@ def test_window_payload_preserves_source_utterance_id_without_word_evidence():
     assert json.loads(payload)["segments"][0]["source_utterance_id"] == "assembly-u000001"
 
 
-def test_materialize_interventions_covers_preroll_gaps_and_postroll_exactly():
+def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+    from app.media import SilenceInterval
 
     segments = [
-        TranscriptSegment(start_seconds=2.2, end_seconds=8.4, diarization_label="assembly:A", text="uno"),
-        TranscriptSegment(start_seconds=12.2, end_seconds=20.2, diarization_label="assembly:B", text="due"),
+        _spoken(2.2, 8.4, "assembly:A", "uno"),
+        _spoken(12.2, 20.2, "assembly:B", "due"),
     ]
     windows = split_transcript_windows(segments)
     analyses = [WindowAnalysis(
@@ -74,26 +84,28 @@ def test_materialize_interventions_covers_preroll_gaps_and_postroll_exactly():
     result = materialize_interventions(
         25, windows, analyses,
         {"assembly:A": "Mario Rossi", "assembly:B": "Anna Bianchi"},
+        [SilenceInterval(8.5, 12.1)],
     )
 
-    assert [(item.start_seconds, item.end_seconds, item.tipo) for item in result] == [
-        (0, 2, "pausa"),
-        (2, 8, "intervento"),
-        (8, 12, "pausa"),
-        (12, 20, "intervento"),
-        (20, 25, "pausa"),
+    assert [(item.start_seconds, item.end_seconds, item.tipo) for item in result.interventions] == [
+        (0, 9, "intervento"),
+        (9, 11, "pausa"),
+        (11, 25, "intervento"),
     ]
-    assert result[1].relatori == ["Mario Rossi"]
-    assert result[3].relatori == ["Anna Bianchi"]
-    assert [item.id for item in result] == [f"i{number:03d}" for number in range(1, 6)]
+    assert result.interventions[0].relatori == ["Mario Rossi"]
+    assert result.interventions[2].relatori == ["Anna Bianchi"]
+    assert [item.id for item in result.interventions] == ["i001", "i002", "i003"]
+    assert [(item.previous_intervention_id, item.next_intervention_id) for item in result.boundaries] == [
+        ("i001", "i002"), ("i002", "i003"),
+    ]
 
 
 def test_materialize_interventions_supports_joint_speakers_and_omits_generic_names():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
 
     segments = [
-        TranscriptSegment(start_seconds=0, end_seconds=60, diarization_label="assembly:A", text="uno"),
-        TranscriptSegment(start_seconds=60, end_seconds=120, diarization_label="assembly:B", text="due"),
+        _spoken(0, 60, "assembly:A", "uno"),
+        _spoken(60, 120, "assembly:B", "due"),
     ]
     windows = split_transcript_windows(segments)
     analyses = [WindowAnalysis(
@@ -104,11 +116,12 @@ def test_materialize_interventions_supports_joint_speakers_and_omits_generic_nam
     result = materialize_interventions(
         120, windows, analyses,
         {"assembly:A": "Mario Rossi", "assembly:B": "Relatore 2"},
+        [],
     )
 
-    assert len(result) == 1
-    assert result[0].relatori == ["Mario Rossi"]
-    assert (result[0].start_seconds, result[0].end_seconds) == (0, 120)
+    assert len(result.interventions) == 1
+    assert result.interventions[0].relatori == ["Mario Rossi"]
+    assert (result.interventions[0].start_seconds, result.interventions[0].end_seconds) == (0, 120)
 
 
 @pytest.mark.parametrize(
@@ -135,15 +148,15 @@ def test_materialize_interventions_rejects_missing_duplicate_noncontiguous_or_un
     )]
 
     with pytest.raises(ValueError, match="partizione"):
-        materialize_interventions(30, windows, analyses, {})
+        materialize_interventions(30, windows, analyses, {}, [])
 
 
-def test_materialize_interventions_resolves_overlapping_turns_with_adjacent_seconds():
+def test_materialize_interventions_rejects_overlapping_speech():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
 
     segments = [
-        TranscriptSegment(start_seconds=0, end_seconds=10.6, diarization_label="A", text="uno"),
-        TranscriptSegment(start_seconds=9.4, end_seconds=20, diarization_label="B", text="due"),
+        _spoken(0, 10.6, "A", "uno"),
+        _spoken(9.4, 20, "B", "due"),
     ]
     windows = split_transcript_windows(segments)
     analyses = [WindowAnalysis(
@@ -154,10 +167,43 @@ def test_materialize_interventions_resolves_overlapping_turns_with_adjacent_seco
         ],
     )]
 
-    result = materialize_interventions(20, windows, analyses, {})
+    with pytest.raises(ValueError):
+        materialize_interventions(20, windows, analyses, {}, [])
 
-    assert [(item.start_seconds, item.end_seconds) for item in result] == [(0, 10), (10, 20)]
-    assert result[1].tipo == "domande"
+
+def test_materialize_merges_shared_source_utterance_across_adjacent_windows():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    original = _spoken(0, 1300, "assembly:A", "esempio " * 2000, "utterance-1")
+    windows = split_transcript_windows([original])
+    analyses = [WindowAnalysis(
+        detected_language="it", synopsis_notes=[], speakers=[],
+        interventions=[_draft([index], titolo=f"Parte {index}") for index in range(len(window.segments))],
+    ) for window in windows]
+
+    result = materialize_interventions(1300, windows, analyses, {"assembly:A": "Mario Rossi"}, [])
+
+    assert len(windows) >= 3
+    assert len(result.interventions) == 1
+    assert (result.interventions[0].start_seconds, result.interventions[0].end_seconds) == (0, 1300)
+    assert result.interventions[0].relatori == ["Mario Rossi"]
+    assert result.boundaries == []
+
+
+def test_materialize_preserves_one_example_grouped_over_three_utterances():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+    from app.media import SilenceInterval
+
+    windows = split_transcript_windows([
+        _spoken(0, 5, "assembly:A", "Premessa", "u1"),
+        _spoken(7, 10, "assembly:A", "Esempio", "u2"),
+        _spoken(12, 15, "assembly:A", "Conclusione", "u3"),
+    ])
+    analyses = [WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
+                               interventions=[_draft([0, 1, 2])])]
+    result = materialize_interventions(15, windows, analyses, {}, [SilenceInterval(5, 7)])
+    assert len(result.interventions) == 1
+    assert result.boundaries == []
 
 
 def test_prompts_preserve_every_announced_presenter_moderator_and_speaker_without_voice_mapping():

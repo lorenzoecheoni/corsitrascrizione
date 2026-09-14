@@ -22,9 +22,52 @@ def test_report_fixture_covers_requested_text_report() -> None:
     assert report.slides[0].timestamp_seconds == 95
     assert set(report.model_dump()) == {
         "title", "duration_seconds", "detected_language", "synopsis",
-        "speakers", "slides", "uncertainties", "interventions", "cost", "bunny_title", "usage",
+        "speakers", "slides", "uncertainties", "interventions", "boundaries", "cost", "bunny_title", "usage",
     }
     assert report.interventions == []
+    assert report.boundaries == []
+
+
+def _boundary_data():
+    return dict(
+        previous_intervention_id="i001", next_intervention_id="i002", boundary_seconds=14,
+        words_before=["la", "governance", "si", "chiude", "qui"],
+        words_after=["passiamo", "ora", "al", "tema", "fiscale"],
+        pause_before=True, pause_after=True, rule="long_pause",
+    )
+
+
+def test_boundary_contract_is_shared_by_analysis_and_report():
+    from app.models import AcademyContent, AnalysisResult, BoundaryEvidence
+
+    evidence = BoundaryEvidence(**_boundary_data())
+    report = load_report().model_copy(update={"boundaries": [evidence]})
+    data = report.model_dump(exclude={"cost", "bunny_title", "usage"})
+    assert AcademyContent.model_validate(data).boundaries == [evidence]
+    assert AnalysisResult.model_validate(data).boundaries == [evidence]
+    assert report.model_dump(mode="json")["boundaries"] == [_boundary_data()]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("boundary_seconds", 14.0), ("boundary_seconds", "14"), ("boundary_seconds", True),
+    ("boundary_seconds", -1), ("words_before", ["a"] * 6),
+    ("words_after", [""]), ("words_before", ["  "]),
+    ("next_intervention_id", "i001"), ("previous_intervention_id", ""),
+    ("rule", "midpoint"),
+])
+def test_boundary_evidence_rejects_invalid_contract(field, value):
+    from app.models import BoundaryEvidence
+
+    with pytest.raises(ValidationError):
+        BoundaryEvidence(**{**_boundary_data(), field: value})
+
+
+@pytest.mark.parametrize("count", [0, 1, 4, 5])
+def test_boundary_evidence_allows_zero_to_five_verbatim_words(count):
+    from app.models import BoundaryEvidence
+
+    evidence = BoundaryEvidence(**{**_boundary_data(), "words_before": ["Così,"] * count})
+    assert evidence.words_before == ["Così,"] * count
 
 
 def test_one_hour_cost_is_in_approved_range() -> None:

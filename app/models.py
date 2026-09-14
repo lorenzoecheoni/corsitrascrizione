@@ -127,6 +127,32 @@ class Intervention(ReportModel):
         return self
 
 
+class BoundaryEvidence(ReportModel):
+    """Compact, verbatim audio evidence for one final neighboring pair."""
+
+    previous_intervention_id: str = Field(min_length=1)
+    next_intervention_id: str = Field(min_length=1)
+    boundary_seconds: Counter
+    words_before: list[str] = Field(max_length=5)
+    words_after: list[str] = Field(max_length=5)
+    pause_before: bool
+    pause_after: bool
+    rule: Literal["long_pause", "short_pause", "no_pause"]
+
+    @field_validator("words_before", "words_after")
+    @classmethod
+    def nonempty_verbatim_words(cls, words: list[str]) -> list[str]:
+        if any(not word.strip() for word in words):
+            raise ValueError("Le parole del confine non possono essere vuote")
+        return words
+
+    @model_validator(mode="after")
+    def distinct_interventions(self) -> "BoundaryEvidence":
+        if self.previous_intervention_id == self.next_intervention_id:
+            raise ValueError("Un confine richiede due interventi distinti")
+        return self
+
+
 class CostEstimate(ReportModel):
     estimated_low_usd: Nonnegative
     estimated_high_usd: Nonnegative
@@ -197,6 +223,7 @@ class AcademyContent(ReportModel):
     slides: list[SlideChange]
     uncertainties: list[str]
     interventions: list[Intervention] = Field(default_factory=list)
+    boundaries: list[BoundaryEvidence] = Field(default_factory=list)
 
 
 class AcademyReport(AcademyContent):

@@ -289,9 +289,6 @@ def test_single_remote_job_returns_global_diarization_and_deletes_provider_copy(
                 "speech_models": ["universal-3-5-pro", "universal-2"],
                 "language_detection": True,
                 "speaker_labels": True,
-                "speech_understanding": {
-                    "request": {"speaker_identification": {"speaker_type": "name"}}
-                },
             }
             return httpx.Response(200, json={"id": "transcript-safe-id"})
         if request.method == "GET":

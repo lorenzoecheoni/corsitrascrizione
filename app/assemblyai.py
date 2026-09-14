@@ -272,9 +272,6 @@ class AssemblyAITranscriber:
                     "speech_models": ["universal-3-5-pro", "universal-2"],
                     "language_detection": True,
                     "speaker_labels": True,
-                    "speech_understanding": {
-                        "request": {"speaker_identification": {"speaker_type": "name"}}
-                    },
                 },
                 cancellation_event=cancellation_event,
             )

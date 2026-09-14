@@ -10,7 +10,7 @@ from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from contextvars import ContextVar
 import csv
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -46,6 +46,22 @@ class FrameCandidate:
 
 
 @dataclass(frozen=True)
+class SilenceInterval:
+    start_seconds: float
+    end_seconds: float
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.start_seconds)
+            or not math.isfinite(self.end_seconds)
+            or self.start_seconds < 0
+            or self.end_seconds < 0
+            or self.end_seconds < self.start_seconds
+        ):
+            raise ValueError("I limiti della pausa devono essere finiti, non negativi e ordinati")
+
+
+@dataclass(frozen=True)
 class MediaArtifacts:
     audio_chunks: list[AudioChunk]
     frame_candidates: list[FrameCandidate]
@@ -55,6 +71,7 @@ class MediaArtifacts:
     # container/HTTP overhead. It is NOT measured network traffic or a guaranteed
     # upper bound: playlists, retries, encryption and transport overhead vary.
     # Output media sizes must never be substituted for input traffic.
+    silence_intervals: list[SilenceInterval] = field(default_factory=list)
 
 
 class MediaError(RuntimeError):
@@ -63,6 +80,80 @@ class MediaError(RuntimeError):
 
 class MediaProtectedError(MediaError):
     """FFmpeg encountered an authorization or unsupported protection failure."""
+
+
+_SILENCE_NUMBER = r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"
+_SILENCE_START = re.compile(
+    rf"^\[silencedetect @ [^\]]+\] silence_start: (?P<seconds>{_SILENCE_NUMBER})\s*$"
+)
+_SILENCE_END = re.compile(
+    rf"^\[silencedetect @ [^\]]+\] silence_end: (?P<seconds>{_SILENCE_NUMBER})"
+    rf" \| silence_duration: (?P<duration>{_SILENCE_NUMBER})\s*$"
+)
+_SILENCE_PREFIX = re.compile(r"^\[silencedetect @ [^\]]+\] silence_(?:start|end)\b")
+
+
+class _SilenceEvents:
+    """Validate the small, transient subset of silencedetect diagnostics we need."""
+
+    _error = "Impossibile verificare le pause audio"
+
+    def __init__(self) -> None:
+        self._intervals: list[SilenceInterval] = []
+        self._open_start: float | None = None
+
+    @classmethod
+    def _seconds(cls, value: str) -> float:
+        try:
+            seconds = float(value)
+        except ValueError:
+            raise MediaError(cls._error) from None
+        if not math.isfinite(seconds) or seconds < 0:
+            raise MediaError(cls._error)
+        return seconds
+
+    def consume(self, line: str) -> None:
+        start = _SILENCE_START.fullmatch(line)
+        if start:
+            if self._open_start is not None:
+                raise MediaError(self._error)
+            value = self._seconds(start["seconds"])
+            if self._intervals and value < self._intervals[-1].end_seconds:
+                raise MediaError(self._error)
+            self._open_start = value
+            return
+
+        end = _SILENCE_END.fullmatch(line)
+        if end:
+            if self._open_start is None:
+                raise MediaError(self._error)
+            end_seconds = self._seconds(end["seconds"])
+            self._seconds(end["duration"])
+            try:
+                interval = SilenceInterval(self._open_start, end_seconds)
+            except ValueError:
+                raise MediaError(self._error) from None
+            self._intervals.append(interval)
+            self._open_start = None
+            return
+
+        if _SILENCE_PREFIX.match(line):
+            raise MediaError(self._error)
+
+    def finish(self, duration_seconds: float) -> list[SilenceInterval]:
+        try:
+            duration = self._seconds(str(duration_seconds))
+        except MediaError:
+            raise
+        if self._open_start is not None:
+            try:
+                self._intervals.append(SilenceInterval(self._open_start, duration))
+            except ValueError:
+                raise MediaError(self._error) from None
+            self._open_start = None
+        if any(interval.end_seconds > duration for interval in self._intervals):
+            raise MediaError(self._error)
+        return list(self._intervals)
 
 
 @dataclass(frozen=True)
@@ -279,6 +370,7 @@ class FFmpegProcessor:
         input_bytes = 0
         saw_input_bytes = False
         processed_seconds = 0.0
+        silence_events = _SilenceEvents()
 
         def consume(name: str, line: str) -> None:
             nonlocal input_bytes, saw_input_bytes, processed_seconds
@@ -290,6 +382,8 @@ class FFmpegProcessor:
                 if count:
                     input_bytes += int(count[1])
                     saw_input_bytes = True
+                if not include_audio:
+                    silence_events.consume(line)
             elif line.startswith("out_time_us="):
                 try:
                     seconds = max(0.0, int(line.split("=", 1)[1]) / 1_000_000)
@@ -319,9 +413,13 @@ class FFmpegProcessor:
             str(output / "frame-%06d.jpg"),
         ])
         if not include_audio:
-            # Copy audio packets to the null muxer so FFmpeg progress advances
-            # through long static slides without encoding or persisting audio.
-            command.extend(["-map", "0:a:0", "-vn", "-c:a", "copy", "-f", "null", os.devnull])
+            # Decode through silencedetect in the existing source pass. The null
+            # muxer lets progress advance without persisting any audio bytes.
+            command.extend([
+                "-map", "0:a:0", "-vn",
+                "-af", "silencedetect=noise=-45dB:d=0.15",
+                "-f", "null", os.devnull,
+            ])
         _run_process(command, cancellation_event, consume)
         _check_cancelled(cancellation_event)
         frames = sorted(output.glob("frame-*.jpg"))
@@ -333,11 +431,14 @@ class FFmpegProcessor:
         ):
             raise MediaError("Impossibile verificare i fotogrammi o la lettura del video")
         audio_chunks = self._read_chunks(output, cancellation_event) if include_audio else []
+        silence_intervals = silence_events.finish(processed_seconds) if not include_audio else []
         frame_candidates = deduplicate_frames([
             FrameCandidate(path, timestamps[i]) for i, path in enumerate(frames)
         ], cancellation_event)
         _check_cancelled(cancellation_event)
-        return MediaArtifacts(audio_chunks, frame_candidates, (input_bytes * 120 + 99) // 100)
+        return MediaArtifacts(
+            audio_chunks, frame_candidates, (input_bytes * 120 + 99) // 100, silence_intervals,
+        )
 
     def _read_chunks(self, output: Path, event: Event) -> list[AudioChunk]:
         chunks = []

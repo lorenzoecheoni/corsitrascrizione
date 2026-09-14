@@ -101,6 +101,12 @@ def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, 
     assert "private raw transcript" not in " ".join(messages)
 
 
+def test_media_artifacts_positional_constructor_keeps_empty_silence_intervals():
+    artifact = MediaArtifacts([], [], 0)
+
+    assert artifact.silence_intervals == []
+
+
 def test_pipeline_passes_optional_inventory_spelling_hints_to_analysis(components):
     received = []
     components.pipeline.speaker_hint_provider = lambda metadata: ["Furio d'Andrea"]

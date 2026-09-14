@@ -2,6 +2,7 @@
 
 from concurrent.futures import CancelledError
 import json
+import os
 from pathlib import Path
 import random
 import shutil
@@ -15,6 +16,47 @@ import pytest
 
 from app.media import FFmpegProcessor, FrameCandidate, MediaError, deduplicate_frames, temporary_workspace
 from app import media
+
+
+def test_silence_events_pair_and_close_end_of_file():
+    events = media._SilenceEvents()
+    events.consume("[silencedetect @ 0x1] silence_start: 2.25")
+    events.consume("[silencedetect @ 0x1] silence_end: 4.75 | silence_duration: 2.5")
+    events.consume("[silencedetect @ 0x1] silence_start: 9")
+
+    assert events.finish(10) == [
+        media.SilenceInterval(2.25, 4.75),
+        media.SilenceInterval(9, 10),
+    ]
+
+
+@pytest.mark.parametrize("diagnostics, duration", [
+    (["[silencedetect @ 0x1] silence_end: 4.75 | silence_duration: 2.5"], 10),
+    (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_start: 3"], 10),
+    (["[silencedetect @ 0x1] silence_start: 4", "[silencedetect @ 0x1] silence_end: 3 | silence_duration: 1"], 10),
+    (["[silencedetect @ 0x1] silence_start: nan"], 10),
+    (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 2", "[silencedetect @ 0x1] silence_start: 3"], 10),
+    (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_end: 11 | silence_duration: 9"], 10),
+    (["[silencedetect @ 0x1] silence_start: 9"], 8),
+    (["[silencedetect @ 0x1] silence_start: not-a-number"], 10),
+])
+def test_silence_events_reject_invalid_or_malformed_diagnostics(diagnostics, duration):
+    events = media._SilenceEvents()
+
+    with pytest.raises(MediaError) as caught:
+        for diagnostic in diagnostics:
+            events.consume(diagnostic)
+        events.finish(duration)
+
+    assert str(caught.value) == "Impossibile verificare le pause audio"
+
+
+@pytest.mark.parametrize("start, end", [
+    (-1, 0), (0, -1), (float("nan"), 1), (0, float("inf")), (2, 1),
+])
+def test_silence_interval_requires_finite_nonnegative_ordered_bounds(start, end):
+    with pytest.raises(ValueError):
+        media.SilenceInterval(start, end)
 
 
 @pytest.mark.parametrize("diagnostic", [
@@ -237,6 +279,8 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
         Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
         consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
         consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stderr", "[silencedetect @ 0x1] silence_start: 12.5")
+        consume("stderr", "[silencedetect @ 0x1] silence_end: 14.25 | silence_duration: 1.75")
         consume("stdout", "out_time_us=60000000")
 
     monkeypatch.setattr(media, "_run_process", fake_run)
@@ -246,6 +290,7 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
             "https://cdn.example/video/play_240p.mp4", workspace, progress.append, Event(),
         )
         assert result.audio_chunks == []
+        assert result.silence_intervals == [media.SilenceInterval(12.5, 14.25)]
         assert not list(workspace.rglob("*.m4a"))
         assert not list(workspace.rglob("audio.csv"))
         assert [frame.timestamp_seconds for frame in result.frame_candidates] == [0]
@@ -254,7 +299,67 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
 
     assert len(commands) == 1
     assert commands[0].count("https://cdn.example/video/play_240p.mp4") == 1
-    assert "copy" in commands[0]
+    assert commands[0][-8:] == [
+        "-map", "0:a:0", "-vn", "-af", "silencedetect=noise=-45dB:d=0.15",
+        "-f", "null", os.devnull,
+    ]
+    assert "copy" not in commands[0]
+    assert not any(value.endswith((".m4a", "audio.csv")) for value in commands[0])
+
+
+def test_visual_only_extraction_rejects_malformed_silence_diagnostics_safely(tmp_path, monkeypatch) -> None:
+    def fake_run(args, event, consume):
+        template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+        Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
+        consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stderr", "[silencedetect @ 0x1] silence_start: private diagnostic")
+        consume("stdout", "out_time_us=60000000")
+
+    monkeypatch.setattr(media, "_run_process", fake_run)
+    with temporary_workspace(tmp_path) as workspace:
+        with pytest.raises(MediaError) as caught:
+            FFmpegProcessor().extract_visual("private", workspace, lambda _: None, Event())
+
+    assert str(caught.value) == "Impossibile verificare le pause audio"
+
+
+def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_files(tmp_path, media_tools) -> None:
+    ffmpeg, _ = media_tools
+    source = tmp_path / "speech-pauses.mp4"
+    subprocess.run([
+        ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=blue:s=32x32:r=1:d=6.2",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=2.4",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=.8",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
+        "-filter_complex", "[1:a][2:a][3:a][4:a][5:a]concat=n=5:v=0:a=1[a]",
+        "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True, capture_output=True)
+
+    with temporary_workspace(tmp_path) as workspace:
+        result = FFmpegProcessor(*media_tools).extract_visual(
+            str(source), workspace, lambda _: None, Event(),
+        )
+        assert [(item.start_seconds, item.end_seconds) for item in result.silence_intervals] == pytest.approx([
+            (1, 3.4), (4.4, 5.2),
+        ], abs=.15)
+        assert result.audio_chunks == []
+        assert not list(workspace.rglob("*.m4a"))
+        assert not list(workspace.rglob("audio.csv"))
+
+
+def test_visual_only_cancellation_before_start_never_launches_ffmpeg(tmp_path) -> None:
+    event = Event()
+    event.set()
+    with temporary_workspace(tmp_path) as workspace:
+        with pytest.raises(CancelledError):
+            FFmpegProcessor("missing-ffmpeg", "missing-ffprobe").extract_visual(
+                "private", workspace, lambda _: None, event,
+            )
 
 
 def test_cancelled_before_start_never_launches_ffmpeg(tmp_path) -> None:

@@ -306,6 +306,7 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
         consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
         consume("stderr", "[silencedetect @ 0x1] silence_start: 12.5")
         consume("stderr", "[silencedetect @ 0x1] silence_end: 14.25 | silence_duration: 1.75")
+        consume("stderr", "[Parsed_astats_2 @ 0x1] Number of samples: 60000")
         consume("stdout", "out_time_us=60000000")
 
     monkeypatch.setattr(media, "_run_process", fake_run)
@@ -326,11 +327,38 @@ def test_visual_only_extraction_reads_source_once_without_writing_audio(tmp_path
     assert len(commands) == 1
     assert commands[0].count("https://cdn.example/video/play_240p.mp4") == 1
     assert commands[0][-8:] == [
-        "-map", "0:a:0", "-vn", "-af", "silencedetect=noise=-45dB:d=0.15",
+        "-map", "0:a:0", "-vn", "-af",
+        "silencedetect=noise=-45dB:d=0.15,aresample=1000,astats=metadata=0:reset=0",
         "-f", "null", os.devnull,
     ]
     assert "copy" not in commands[0]
     assert not any(value.endswith((".m4a", "audio.csv")) for value in commands[0])
+
+
+def test_audio_extraction_finishes_progress_from_verified_local_chunk_duration(tmp_path, monkeypatch) -> None:
+    commands = []
+    processor = FFmpegProcessor()
+
+    def fake_run(args, event, consume):
+        commands.append(args)
+        template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+        Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
+        consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stdout", "out_time_us=8000000")
+
+    def verified_chunks(output, event):
+        return [media.AudioChunk(output / "audio-00000.m4a", 0, 12)]
+
+    monkeypatch.setattr(media, "_run_process", fake_run)
+    monkeypatch.setattr(processor, "_read_chunks", verified_chunks)
+    progress = []
+    with temporary_workspace(tmp_path) as workspace:
+        processor.extract("https://cdn.example/video/play_240p.mp4", workspace, progress.append, Event())
+
+    assert progress == [8, 12]
+    assert len(commands) == 1
+    assert commands[0].count("https://cdn.example/video/play_240p.mp4") == 1
 
 
 def test_visual_only_extraction_rejects_malformed_silence_diagnostics_safely(tmp_path, monkeypatch) -> None:
@@ -356,6 +384,7 @@ def test_visual_only_extraction_returns_no_intervals_when_silencedetect_reports_
         Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
         consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
         consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stderr", "[Parsed_astats_2 @ 0x1] Number of samples: 60000")
         consume("stdout", "out_time_us=60000000")
 
     monkeypatch.setattr(media, "_run_process", fake_run)
@@ -398,18 +427,20 @@ def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_fi
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=2.4",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
-        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=.8",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=0.8",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1",
         "-filter_complex", "[1:a][2:a][3:a][4:a][5:a]concat=n=5:v=0:a=1[a]",
         "-map", "0:v", "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast",
         "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
     ], check=True, capture_output=True)
 
+    progress = []
     with temporary_workspace(tmp_path) as workspace:
         result = FFmpegProcessor(*media_tools).extract_visual(
-            str(source), workspace, lambda _: None, Event(),
+            str(source), workspace, progress.append, Event(),
         )
         _assert_synthetic_speech_pauses(result.silence_intervals)
+        assert progress == sorted(progress) and progress[-1] >= 6.1
         assert result.audio_chunks == []
         assert not list(workspace.rglob("*.m4a"))
         assert not list(workspace.rglob("audio.csv"))

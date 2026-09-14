@@ -31,6 +31,7 @@ from PIL import Image
 _TRANSCRIPTION_SEGMENT_SECONDS = 600
 _OPENAI_MAX_AUDIO_SECONDS = 1400
 _OPENAI_MAX_AUDIO_BYTES = 24_000_000
+_DURATION_SAMPLE_RATE = 1000
 
 
 @dataclass(frozen=True)
@@ -358,6 +359,9 @@ def _run_process(args: list[str], event: Event, on_line: Callable[[str, str], No
 
 _FRAME_INFO = re.compile(r"\[.*showinfo.*\].*\bn:\s*(\d+).*\bpts_time:([\d.eE+-]+)")
 _INPUT_BYTES = re.compile(r"Input stream #0:\d+.*?\d+ packets read \((\d+) bytes\)")
+_AUDIO_SAMPLES = re.compile(
+    r"^\[Parsed_astats_\d+ @ [^\]]+\] Number of samples: (\d+(?:\.0+)?)\s*$"
+)
 
 
 class FFmpegProcessor:
@@ -403,10 +407,11 @@ class FFmpegProcessor:
         input_bytes = 0
         saw_input_bytes = False
         processed_seconds = 0.0
+        audio_samples: int | None = None
         silence_events = _SilenceEvents()
 
         def consume(name: str, line: str) -> None:
-            nonlocal input_bytes, saw_input_bytes, processed_seconds
+            nonlocal input_bytes, saw_input_bytes, processed_seconds, audio_samples
             if name == "stderr":
                 frame = _FRAME_INFO.search(line)
                 if frame:
@@ -417,6 +422,14 @@ class FFmpegProcessor:
                     saw_input_bytes = True
                 if not include_audio:
                     silence_events.consume(line)
+                    sample_count = _AUDIO_SAMPLES.fullmatch(line)
+                    if sample_count:
+                        samples = float(sample_count[1])
+                        if not samples.is_integer() or samples <= 0:
+                            raise SilenceEvidenceError()
+                        if audio_samples is not None and audio_samples != int(samples):
+                            raise SilenceEvidenceError()
+                        audio_samples = int(samples)
             elif line.startswith("out_time_us="):
                 try:
                     seconds = max(0.0, int(line.split("=", 1)[1]) / 1_000_000)
@@ -446,11 +459,15 @@ class FFmpegProcessor:
             str(output / "frame-%06d.jpg"),
         ])
         if not include_audio:
-            # Decode through silencedetect in the existing source pass. The null
-            # muxer lets progress advance without persisting any audio bytes.
+            # Decode through silencedetect in the existing source pass. FFmpeg's
+            # progress clock follows the sparse JPEG output, so a fixed-rate
+            # end-of-stream sample count supplies the verified audio duration.
             command.extend([
                 "-map", "0:a:0", "-vn",
-                "-af", "silencedetect=noise=-45dB:d=0.15",
+                "-af", (
+                    "silencedetect=noise=-45dB:d=0.15,"
+                    f"aresample={_DURATION_SAMPLE_RATE},astats=metadata=0:reset=0"
+                ),
                 "-f", "null", os.devnull,
             ])
         _run_process(command, cancellation_event, consume)
@@ -464,11 +481,23 @@ class FFmpegProcessor:
         ):
             raise MediaError("Impossibile verificare i fotogrammi o la lettura del video")
         audio_chunks = self._read_chunks(output, cancellation_event) if include_audio else []
-        silence_intervals = silence_events.finish(processed_seconds) if not include_audio else []
+        if include_audio:
+            terminal_seconds = max(
+                chunk.start_seconds + chunk.duration_seconds for chunk in audio_chunks
+            )
+            silence_intervals = []
+        else:
+            if audio_samples is None:
+                raise SilenceEvidenceError()
+            terminal_seconds = audio_samples / _DURATION_SAMPLE_RATE
+            silence_intervals = silence_events.finish(terminal_seconds)
         frame_candidates = deduplicate_frames([
             FrameCandidate(path, timestamps[i]) for i, path in enumerate(frames)
         ], cancellation_event)
         _check_cancelled(cancellation_event)
+        if terminal_seconds > processed_seconds:
+            processed_seconds = terminal_seconds
+            progress_callback(terminal_seconds)
         return MediaArtifacts(
             audio_chunks, frame_candidates, (input_bytes * 120 + 99) // 100, silence_intervals,
             silence_measured=not include_audio,

@@ -196,7 +196,7 @@ def run_smoke_scenario(tmp_path, monkeypatch):
             assert report.cost.estimated_high_usd > 0
             assert report.bunny_title == "Titolo originale Bunny"
             assert report.usage.transcription.provider_audio_seconds == 2
-            assert report.usage.responses.requests == 2
+            assert report.usage.responses.requests == 3
             serialized_report = json.dumps(status["report"])
             for forbidden in (
                 "FULL-TRANSCRIPT-SENTINEL", "WORD-ARRAY-SENTINEL",

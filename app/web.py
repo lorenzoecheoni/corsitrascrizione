@@ -3,7 +3,6 @@
 from pathlib import Path
 from uuid import UUID
 import hmac
-import json
 import time
 
 from fastapi import APIRouter, Body, Form, HTTPException, Request
@@ -27,11 +26,12 @@ from app.bunny import (
     read_metadata,
 )
 from app.costs import estimate_cost
-from app.courses import CourseAssemblyError, build_intermediate_report, sign_course_selection
+from app.courses import CourseAssemblyError, build_intermediate_report as build_course_intermediate_report, sign_course_selection
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
-from app.inventory import InventoryError, organize_catalog, propose_matches
+from app.intermediate_report import build_intermediate_report
+from app.inventory import InventoryError, material_sources_for_video, organize_catalog, propose_matches
 from app.jobs import JobRecord, JobState
-from app.reporting import build_video_report_payload, format_timestamp, render_markdown, render_text
+from app.reporting import format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
 from pydantic import ValidationError
 
@@ -313,7 +313,7 @@ def _refresh_course_report(request: Request, course):
     jobs = [request.app.state.store.get(job_id) for job_id in course.job_ids]
     if all(job.state == JobState.COMPLETED and job.report is not None for job in jobs):
         try:
-            report = build_intermediate_report(course, jobs)
+            report = build_course_intermediate_report(course, jobs)
             request.app.state.course_store.save_intermediate(course.id, report)
             return request.app.state.course_store.get_course(course.id), None
         except CourseAssemblyError:
@@ -705,9 +705,18 @@ def json_report(request: Request, job_id: str) -> Response:
         )
     except BunnyUrlError:
         raise HTTPException(409, "Il report non contiene un riferimento Bunny valido") from None
-    payload = build_video_report_payload(job.report, reference.video_id)
+    try:
+        courses = request.app.state.inventory.fetch()
+    except InventoryError:
+        courses = []
+    material_sources = material_sources_for_video(
+        courses, reference.video_id, job.report.bunny_title,
+    )
+    report = build_intermediate_report(
+        job.report, reference.video_id, material_sources=material_sources,
+    )
     return Response(
-        json.dumps(payload, ensure_ascii=False, indent=2),
+        report.model_dump_json(indent=2, by_alias=True, exclude_none=True),
         media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="report-{job.id}.json"'},
+        headers={"Content-Disposition": f'attachment; filename="report-intermedio-{job.id}.json"'},
     )

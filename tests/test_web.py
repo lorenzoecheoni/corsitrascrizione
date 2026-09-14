@@ -21,7 +21,7 @@ from app.bunny import (
 from app.config import Settings
 from app.course_models import AcademyImport, IntermediateCourseReport
 from app.jobs import JobState
-from app.inventory import InventoryCourse
+from app.inventory import InventoryCourse, InventoryError
 from app.main import create_app
 from app.models import AcademyReport, Intervention
 from app.pipeline import AnalysisPipeline
@@ -150,6 +150,7 @@ def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
     assert f'/jobs/{completed.id}/report.txt' in archive
     assert f'/jobs/{completed.id}/report.md' in archive
     assert f'/jobs/{completed.id}/report.json' in archive
+    assert "Download JSON v1.1" in archive
     assert "Lavoro fallito" not in archive
     assert "Lavoro fallito" in recent
     assert "Report salvato" not in recent
@@ -568,6 +569,16 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
     store.update(job.id, state=JobState.PROCESSING)
     store.update(job.id, state=JobState.COMPLETED, report=report)
+    client.app.state.inventory.fetch = lambda: [InventoryCourse(
+        id="0:2", foglio="Formazione", gid="0", posizione_foglio=0, riga=2,
+        titolo="Corso inventario", relatori_attesi=[], materiali=["dispensa.pdf"],
+        link="bunny", colonna_link="D", guid_esplicito=UUID(VIDEO_ID),
+    )]
+    client.app.state.bunny.get_metadata = lambda _: (_ for _ in ()).throw(
+        AssertionError("A saved JSON report must not read Bunny metadata")
+    )
+    client.app.state.assemblyai = _ForbiddenProvider()
+    client.app.state.openai = _ForbiddenProvider()
     for extension, mime in (("md", "text/markdown"), ("txt", "text/plain")):
         response = client.get(f"/jobs/{job.id}/report.{extension}")
         assert response.status_code == 200
@@ -582,18 +593,28 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
     assert json_response.status_code == 200
     assert json_response.headers["content-type"].startswith("application/json")
     assert "attachment" in json_response.headers["content-disposition"]
+    assert 'filename="report-intermedio-' in json_response.headers["content-disposition"]
     payload = json_response.json()
+    assert set(payload) == {
+        "versione", "stato", "corso", "relatori", "video", "verifiche_richieste",
+    }
     assert payload["versione"] == 1
-    assert payload["video"]["guid"] == VIDEO_ID
-    assert payload["video"]["durata_secondi"] == 3720
+    assert payload["video"][0]["guid"] == VIDEO_ID
+    assert payload["video"][0]["chiave"] == "v1"
+    assert payload["video"][0]["ordine"] == 1
+    assert payload["video"][0]["durata_secondi"] == 3720
     assert payload["relatori"][0]["nome"] == "Giulia Bianchi"
     assert "Relatore 2" not in [speaker["nome"] for speaker in payload["relatori"]]
-    assert payload["slide"][0] == {
+    assert payload["video"][0]["slide"][0] == {
         "inizio": "0:01:35",
         "titolo": "Agenda",
         "testo_principale": "Obiettivi · Flusso di pubblicazione",
         "confidenza": 0.95,
     }
+    assert payload["video"][0]["materiali"] == [{
+        "titolo": "dispensa", "file": "dispensa.pdf", "accesso": "iscritti",
+    }]
+    assert "incertezze" not in payload
     assert "transcript" not in json_response.text.lower()
     page = client.get(f"/jobs/{job.id}")
     assert "<script>alert('unsafe')</script>" not in page.text
@@ -602,7 +623,7 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         assert section in page.text
     for obsolete_section in ("Punti chiave", "Obiettivi formativi", "Interventi"):
         assert obsolete_section not in page.text
-    for control in ("Download JSON", "Download Markdown", "Download TXT", "Stampa / Salva PDF"):
+    for control in ("Download JSON v1.1", "Download Markdown", "Download TXT", "Stampa / Salva PDF"):
         assert control in page.text
     assert f'action="/jobs/{job.id}/delete"' in page.text
     assert "non elimina il video da Bunny" in page.text
@@ -624,14 +645,41 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
 
     payload = client.get(f"/jobs/{job.id}/report.json").json()
 
-    assert payload["video"]["titolo_bunny"] == "Titolo Bunny originale"
-    assert payload["interventi"] == [{
-        "id": "i001", "inizio": "0:02:05", "fine": "0:15:05",
+    video = payload["video"][0]
+    assert video["titolo_bunny"] == "Titolo Bunny originale"
+    assert video["chiave"] == "v1"
+    assert video["ordine"] == 1
+    assert video["interventi"] == [{
+        "id": "v1-i001", "inizio": "0:02:05", "fine": "0:15:05",
         "tipo": "intervento", "relatori": ["Marco Rossi"],
         "titolo": "Assetti di governance",
         "sintesi": "Il relatore illustra gli assetti di governance.",
-        "punti_chiave": ["Organi", "Deleghe", "Controlli"], "confidenza": .92,
+        "punti_chiave": ["Organi", "Deleghe", "Controlli"], "accesso": "pubblico",
+        "confidenza": .92,
     }]
+    assert "incertezze" not in payload
+
+
+def test_json_export_survives_inventory_failure_without_leaking_cell_data(client):
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    client.app.state.inventory.fetch = lambda: (_ for _ in ()).throw(
+        InventoryError("Cella privata: segreto del foglio")
+    )
+
+    response = client.get(f"/jobs/{job.id}/report.json")
+
+    assert response.status_code == 200
+    assert response.json()["video"][0]["materiali"] == []
+    assert "Cella privata" not in response.text
+
+
+class _ForbiddenProvider:
+    def __getattr__(self, name):
+        raise AssertionError(f"Saved JSON reports must not call {name}")
 
 
 def test_completed_report_can_be_deleted_without_calling_bunny(client):

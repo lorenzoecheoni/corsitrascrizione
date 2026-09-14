@@ -12,7 +12,7 @@ from uuid import UUID
 
 import httpx
 
-from app.boundaries import has_complete_boundary_evidence
+from app.boundaries import has_complete_boundary_evidence, nearest_second
 from app.intermediate_models import (
     IntermediateInterventionV11,
     IntermediateMaterialV11,
@@ -415,10 +415,8 @@ def build_intermediate_report(
         stored.id: f"v1-i{index:03d}"
         for index, stored in enumerate(ordered_interventions, start=1)
     }
-    boundary_verifications = (
-        build_boundary_verifications(report, stored_to_exported_ids)
-        if has_complete_boundary_evidence(report)
-        else []
+    boundary_verifications = build_boundary_verifications(
+        report, stored_to_exported_ids,
     )
     checker = material_url_checker or _material_url_is_reachable
     materials: list[IntermediateMaterialV11] = []
@@ -487,7 +485,7 @@ def build_intermediate_report(
         "chiave": "v1",
         "guid": str(guid),
         "titolo_bunny": corrected(report.bunny_title),
-        "durata_secondi": int(report.duration_seconds + .5),
+        "durata_secondi": nearest_second(report.duration_seconds),
         "ordine": 1,
         "lingua": report.detected_language,
         "sinossi": corrected(report.synopsis),

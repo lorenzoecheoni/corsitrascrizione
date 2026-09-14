@@ -26,7 +26,7 @@ class BoundaryAlignment:
     boundaries: list[BoundaryEvidence]
 
 
-def _nearest_second(value: float) -> int:
+def nearest_second(value: float) -> int:
     """Nearest whole second, resolving exact ties to the preceding second."""
     return math.ceil(value - .5)
 
@@ -76,7 +76,7 @@ def _whole_second(candidate: float, lower: int, upper: int, silence: SilenceInte
         inside_upper = min(upper, math.floor(silence.end_seconds))
         if inside_lower <= inside_upper:
             lower, upper = inside_lower, inside_upper
-    return max(lower, min(upper, _nearest_second(candidate)))
+    return max(lower, min(upper, nearest_second(candidate)))
 
 
 def _pause_group() -> SemanticIntervention:
@@ -145,7 +145,7 @@ def has_complete_boundary_evidence(report: AcademyContent) -> bool:
     """Historical content may deserialize without being eligible for export."""
     if not math.isfinite(report.duration_seconds) or report.duration_seconds <= 0:
         return False
-    return _complete(report.interventions, report.boundaries, _nearest_second(report.duration_seconds))
+    return _complete(report.interventions, report.boundaries, nearest_second(report.duration_seconds))
 
 
 def align_intervention_boundaries(
@@ -155,7 +155,7 @@ def align_intervention_boundaries(
 ) -> BoundaryAlignment:
     if not math.isfinite(duration_seconds) or duration_seconds <= 0 or not semantic_groups:
         raise ValueError("La partizione degli interventi non è valida")
-    duration = _nearest_second(duration_seconds)
+    duration = nearest_second(duration_seconds)
     if duration <= 0:
         raise ValueError("La partizione richiede almeno un secondo")
 
@@ -180,8 +180,8 @@ def align_intervention_boundaries(
             raise ValueError("La partizione contiene parlato sovrapposto non separabile")
         # Quantization may move a word edge by half a second; never move the
         # candidate beyond the quantized speech gap or collapse a final segment.
-        lower = max((cuts[-1] if cuts else 0) + 1, _nearest_second(previous_end))
-        upper = min(duration - 1, _nearest_second(extents[index + 1][1]) - 1, _nearest_second(next_start))
+        lower = max((cuts[-1] if cuts else 0) + 1, nearest_second(previous_end))
+        upper = min(duration - 1, nearest_second(extents[index + 1][1]) - 1, nearest_second(next_start))
         if semantic_groups[index + 1].tipo in {"saluti", "domande", "cambio_relatore"}:
             upper = min(upper, math.ceil(next_start) - 1)
         silence = _matching_silence(previous_end, next_start, silence_intervals)

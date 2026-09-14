@@ -98,6 +98,38 @@ def test_boundary_builder_rejects_incomplete_evidence_and_keeps_distinct_pairs()
         intermediate_report.build_boundary_verifications(report, mapping)
 
 
+def test_main_builder_rejects_incomplete_boundaries_before_material_checks():
+    report = make_report([
+        make_intervention(0, 10), make_intervention(10, 20),
+    ], duration=20)
+    report.boundaries = []
+
+    checked_urls = []
+
+    def record_material_check(url):
+        checked_urls.append(url)
+        return True
+
+    with pytest.raises(ValueError, match="confini"):
+        build_intermediate_report(
+            report,
+            TARGET_GUID,
+            material_sources=["https://materials.example.test/dispensa.pdf"],
+            material_url_checker=record_material_check,
+        )
+    assert checked_urls == []
+
+
+def test_builder_uses_aligner_tie_to_previous_second_for_export_duration():
+    report = make_report([make_intervention(0, 10)], duration=10)
+    report.duration_seconds = 10.5
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert result.video[0].durata_secondi == 10
+    assert all(check.codice != "TEMPI_INCOERENTI" for check in result.verifiche_richieste)
+
+
 @pytest.mark.parametrize(("words_before", "pause_before", "words_after", "pause_after", "expected"), [
     (["meno", "di", "cinque", "parole"], True,
      ["dopo", "restano", "cinque", "parole", "esatte"], False,
@@ -366,6 +398,16 @@ def make_report(items: list[Intervention], *, duration: int | None = None) -> Ac
     report = report_with_reconciled_speakers()
     report.interventions = items
     report.duration_seconds = duration if duration is not None else int(items[-1].end_seconds)
+    report.boundaries = [
+        BoundaryEvidence(
+            previous_intervention_id=previous.id,
+            next_intervention_id=following.id,
+            boundary_seconds=int(previous.end_seconds),
+            words_before=[], words_after=[], pause_before=True, pause_after=True,
+            rule="long_pause",
+        )
+        for previous, following in zip(items, items[1:])
+    ]
     return report
 
 
@@ -441,6 +483,17 @@ def report_with_reconciled_speakers() -> AcademyReport:
     report.title = "Webinar con Fulvio D'Andrea"
     report.bunny_title = "Bunny: Fulvio D'Andrea"
     report.synopsis = "Fulvio D'Andrea presenta la sinossi."
+    report.duration_seconds = 900
+    report.boundaries = [
+        BoundaryEvidence(
+            previous_intervention_id=previous.id,
+            next_intervention_id=following.id,
+            boundary_seconds=int(previous.end_seconds),
+            words_before=[], words_after=[], pause_before=True, pause_after=True,
+            rule="long_pause",
+        )
+        for previous, following in zip(report.interventions, report.interventions[1:])
+    ]
     return report
 
 
@@ -580,8 +633,7 @@ def test_builder_renumbers_interventions_in_chronological_stable_order() -> None
     second.start_seconds = 0
     report.interventions = [fourth, second, first, third, fifth]
 
-    result = build_intermediate_report(report, TARGET_GUID)
-    interventions = result.video[0].interventi
+    interventions = intermediate_report.normalize_interventions(report)
 
     assert [item.id for item in interventions] == [
         "v1-i001", "v1-i002", "v1-i003", "v1-i004", "v1-i005",

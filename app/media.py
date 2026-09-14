@@ -128,11 +128,16 @@ class _SilenceEvents:
             if self._open_start is None:
                 raise MediaError(self._error)
             end_seconds = self._seconds(end["seconds"])
-            self._seconds(end["duration"])
+            reported_duration = self._seconds(end["duration"])
             try:
                 interval = SilenceInterval(self._open_start, end_seconds)
             except ValueError:
                 raise MediaError(self._error) from None
+            if not math.isclose(
+                interval.end_seconds - interval.start_seconds, reported_duration,
+                rel_tol=0, abs_tol=1e-6,
+            ):
+                raise MediaError(self._error)
             self._intervals.append(interval)
             self._open_start = None
             return

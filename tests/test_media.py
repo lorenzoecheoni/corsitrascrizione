@@ -34,6 +34,7 @@ def test_silence_events_pair_and_close_end_of_file():
     (["[silencedetect @ 0x1] silence_end: 4.75 | silence_duration: 2.5"], 10),
     (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_start: 3"], 10),
     (["[silencedetect @ 0x1] silence_start: 4", "[silencedetect @ 0x1] silence_end: 3 | silence_duration: 1"], 10),
+    (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 999"], 10),
     (["[silencedetect @ 0x1] silence_start: nan"], 10),
     (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_end: 4 | silence_duration: 2", "[silencedetect @ 0x1] silence_start: 3"], 10),
     (["[silencedetect @ 0x1] silence_start: 2", "[silencedetect @ 0x1] silence_end: 11 | silence_duration: 9"], 10),
@@ -322,6 +323,21 @@ def test_visual_only_extraction_rejects_malformed_silence_diagnostics_safely(tmp
             FFmpegProcessor().extract_visual("private", workspace, lambda _: None, Event())
 
     assert str(caught.value) == "Impossibile verificare le pause audio"
+
+
+def test_visual_only_extraction_returns_no_intervals_when_silencedetect_reports_none(tmp_path, monkeypatch) -> None:
+    def fake_run(args, event, consume):
+        template = Path(next(value for value in args if "frame-%06d.jpg" in value))
+        Image.new("RGB", (32, 18), "white").save(Path(str(template).replace("%06d", "000001")))
+        consume("stderr", "[Parsed_showinfo_0] n:   0 pts_time:0")
+        consume("stderr", "Input stream #0:0 1 packets read (100 bytes)")
+        consume("stdout", "out_time_us=60000000")
+
+    monkeypatch.setattr(media, "_run_process", fake_run)
+    with temporary_workspace(tmp_path) as workspace:
+        result = FFmpegProcessor().extract_visual("private", workspace, lambda _: None, Event())
+
+    assert result.silence_intervals == []
 
 
 def test_visual_only_extraction_detects_synthetic_speech_pauses_without_audio_files(tmp_path, media_tools) -> None:

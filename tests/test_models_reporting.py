@@ -133,6 +133,14 @@ def test_exports_include_named_intervention_speakers_missing_from_profiles() -> 
     assert "- Furio d'Andrea" in markdown
 
 
+def test_markdown_preserves_generic_formal_speaker_profiles() -> None:
+    report = load_report()
+
+    rendered = render_markdown(report)
+
+    assert "- Relatore 2 — Relatrice tecnica (confidenza: bassa)" in rendered
+
+
 def test_speaker_rejects_personal_name_with_inference_only() -> None:
     with pytest.raises(ValidationError, match="evidenza ammessa"):
         SpeakerProfile.model_validate(

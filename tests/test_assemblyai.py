@@ -7,6 +7,82 @@ import httpx
 import pytest
 
 
+def word(text: str, start: int, end: int, speaker: str = "A") -> dict:
+    return {
+        "text": text,
+        "start": start,
+        "end": end,
+        "confidence": 0.97,
+        "speaker": speaker,
+    }
+
+
+def test_assemblyai_preserves_ordered_word_timing_in_memory():
+    from app.assemblyai import AssemblyAITranscriber
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 3,
+        "language_code": "it",
+        "text": "La governance evolve.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 500,
+            "end": 2500,
+            "text": "La governance evolve.",
+            "words": [
+                word("La", 500, 700),
+                word("governance", 800, 1500),
+                word("evolve.", 1600, 2500),
+            ],
+        }],
+    }, 3)
+    segment = result.original_segments[0]
+
+    assert segment.source_utterance_id == "assembly-u000001"
+    assert [(item.text, item.start_seconds, item.end_seconds) for item in segment.words] == [
+        ("La", .5, .7), ("governance", .8, 1.5), ("evolve.", 1.6, 2.5),
+    ]
+
+
+@pytest.mark.parametrize("words", [
+    None,
+    [],
+    [word("PRIVATE-WORD-EVIDENCE", 700, 500)],
+    [word("PRIVATE-WORD-EVIDENCE", 800, 1000), word("seconda", 500, 700)],
+    [word("PRIVATE-WORD-EVIDENCE", 400, 700)],
+    [word("PRIVATE-WORD-EVIDENCE", 500, 700, speaker="B")],
+    [word("", 500, 700)],
+    [{**word("PRIVATE-WORD-EVIDENCE", 500, 700), "confidence": float("nan")}],
+    [{**word("PRIVATE-WORD-EVIDENCE", 500, 700), "confidence": 1.01}],
+    [{**word("PRIVATE-WORD-EVIDENCE", 500, 700), "confidence": -0.01}],
+])
+def test_assemblyai_rejects_invalid_word_evidence_safely(words):
+    from app.assemblyai import AssemblyAITranscriber
+    from app.transcription import TranscriptionError
+
+    payload = {
+        "status": "completed",
+        "audio_duration": 3,
+        "language_code": "it",
+        "text": "Testo sicuro.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 500,
+            "end": 2500,
+            "text": "Testo sicuro.",
+        }],
+    }
+    if words is not None:
+        payload["utterances"][0]["words"] = words
+
+    with pytest.raises(TranscriptionError) as caught:
+        AssemblyAITranscriber._parse_result(payload, 3)
+
+    assert caught.value.code == "response"
+    assert "PRIVATE-WORD-EVIDENCE" not in "".join(traceback.format_exception(caught.value))
+
+
 def test_single_remote_job_returns_global_diarization_and_deletes_provider_copy():
     from app.assemblyai import AssemblyAITranscriber
 
@@ -21,8 +97,10 @@ def test_single_remote_job_returns_global_diarization_and_deletes_provider_copy(
             "text": "Sono Vincenzo. Buongiorno.",
             "utterances": [
                 {"speaker": "Vincenzo Manfredi", "start": 1000, "end": 3000,
-                 "text": "Sono Vincenzo."},
-                {"speaker": "B", "start": 4000, "end": 5000, "text": "Buongiorno."},
+                 "text": "Sono Vincenzo.",
+                 "words": [word("Sono Vincenzo.", 1000, 3000, speaker="Vincenzo Manfredi")]},
+                {"speaker": "B", "start": 4000, "end": 5000, "text": "Buongiorno.",
+                 "words": [word("Buongiorno.", 4000, 5000, speaker="B")]},
             ],
         },
     ])
@@ -88,9 +166,12 @@ def test_each_provider_utterance_remains_available_for_whole_video_sampling():
         "language_code": "it",
         "text": "Apertura. Parte centrale. Conclusione.",
         "utterances": [
-            {"speaker": "A", "start": 0, "end": 1000, "text": "Apertura."},
-            {"speaker": "A", "start": 1200, "end": 2200, "text": "Parte centrale."},
-            {"speaker": "A", "start": 3_599_000, "end": 3_600_000, "text": "Conclusione."},
+            {"speaker": "A", "start": 0, "end": 1000, "text": "Apertura.",
+             "words": [word("Apertura.", 0, 1000)]},
+            {"speaker": "A", "start": 1200, "end": 2200, "text": "Parte centrale.",
+             "words": [word("Parte centrale.", 1200, 2200)]},
+            {"speaker": "A", "start": 3_599_000, "end": 3_600_000, "text": "Conclusione.",
+             "words": [word("Conclusione.", 3_599_000, 3_600_000)]},
         ],
     }, 3600)
 
@@ -194,7 +275,8 @@ def test_report_is_not_released_when_remote_deletion_is_rejected():
             return httpx.Response(200, json={
                 "id": "transcript-safe-id", "status": "completed",
                 "audio_duration": 60, "language_code": "it", "text": "Contenuto.",
-                "utterances": [{"speaker": "A", "start": 0, "end": 1000, "text": "Contenuto."}],
+                "utterances": [{"speaker": "A", "start": 0, "end": 1000, "text": "Contenuto.",
+                                "words": [word("Contenuto.", 0, 1000)]}],
             })
         return httpx.Response(401, json={"error": "PRIVATE"})
 

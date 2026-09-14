@@ -6,7 +6,7 @@ from pydantic import ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.models import SlideChange
-from app.transcription import TranscriptionResult, TranscriptSegment
+from app.transcription import TranscriptSegment, TranscriptionResult
 
 
 def _draft(indexes, **changes):
@@ -34,6 +34,25 @@ def test_window_payload_has_stable_local_segment_indexes():
     payload = json.loads(split_transcript_windows(segments)[0].to_payload())
 
     assert [item["segment_index"] for item in payload["segments"]] == [0, 1]
+
+
+def test_window_payload_preserves_source_utterance_id_without_word_evidence():
+    from app.analysis_chunks import split_transcript_windows
+    from app.transcription import TranscriptWord
+
+    segment = TranscriptSegment(
+        start_seconds=0, end_seconds=5, diarization_label="assembly:A", text="uno",
+        source_utterance_id="assembly-u000001",
+        words=[TranscriptWord(
+            text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+            diarization_label="assembly:A", confidence=.97,
+        )],
+    )
+
+    payload = split_transcript_windows([segment])[0].to_payload()
+
+    assert "PRIVATE-WORD-EVIDENCE" not in payload
+    assert json.loads(payload)["segments"][0]["source_utterance_id"] == "assembly-u000001"
 
 
 def test_materialize_interventions_covers_preroll_gaps_and_postroll_exactly():
@@ -196,6 +215,27 @@ def test_one_oversized_text_segment_is_split_deterministically_with_original_tim
     assert len(pieces) > 1
     assert "".join(piece.text for piece in pieces) == segment.text
     assert all((piece.start_seconds, piece.end_seconds) == (15, 45) for piece in pieces)
+    assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
+
+
+def test_split_segments_preserve_source_utterance_id_without_serializing_words():
+    from app.analysis_chunks import MAX_WINDOW_CHARS, split_transcript_windows
+    from app.transcription import TranscriptWord
+
+    segment = TranscriptSegment(
+        start_seconds=15, end_seconds=45, diarization_label="assembly:A", text="a" * 50_000,
+        source_utterance_id="assembly-u000001",
+        words=[TranscriptWord(
+            text="PRIVATE-WORD-EVIDENCE", start_seconds=15, end_seconds=16,
+            diarization_label="assembly:A", confidence=.97,
+        )],
+    )
+
+    windows = split_transcript_windows([segment])
+    pieces = [piece for window in windows for piece in window.segments]
+
+    assert all(piece.source_utterance_id == "assembly-u000001" for piece in pieces)
+    assert all("PRIVATE-WORD-EVIDENCE" not in window.to_payload() for window in windows)
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
 

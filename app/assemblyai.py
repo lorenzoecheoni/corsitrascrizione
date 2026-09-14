@@ -11,7 +11,7 @@ import httpx
 
 from app.models import ProviderUsage, UsageEntry
 from app.retry import check_cancelled, retry_remote
-from app.transcription import TranscriptSegment, TranscriptionError, TranscriptionResult
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionError, TranscriptionResult
 
 
 _TRANSCRIPT_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -133,7 +133,7 @@ class AssemblyAITranscriber:
         originals: list[TranscriptSegment] = []
         mapping: dict[str, str] = {}
         next_speaker = 1
-        for utterance in utterances:
+        for utterance_index, utterance in enumerate(utterances, start=1):
             try:
                 speaker = utterance["speaker"]
                 text = utterance["text"]
@@ -149,11 +149,44 @@ class AssemblyAITranscriber:
             ):
                 raise TranscriptionError("response")
             label = f"assembly:{speaker.strip()}"
+            raw_words = utterance.get("words") if isinstance(utterance, dict) else None
+            if not isinstance(raw_words, list) or not raw_words:
+                raise TranscriptionError("response")
+            words: list[TranscriptWord] = []
+            previous_end = start
+            for raw_word in raw_words:
+                try:
+                    word_text = raw_word["text"]
+                    word_speaker = raw_word["speaker"]
+                    word_start = float(raw_word["start"]) / 1000
+                    word_end = float(raw_word["end"]) / 1000
+                    confidence = float(raw_word["confidence"])
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    raise TranscriptionError("response") from None
+                if (
+                    not isinstance(word_text, str) or not word_text.strip()
+                    or not isinstance(word_speaker, str) or word_speaker.strip() != speaker.strip()
+                    or not math.isfinite(word_start) or not math.isfinite(word_end)
+                    or not math.isfinite(confidence)
+                    or word_start < start or word_end > end or word_start < previous_end
+                ):
+                    raise TranscriptionError("response")
+                try:
+                    parsed_word = TranscriptWord(
+                        text=word_text.strip(), start_seconds=word_start, end_seconds=word_end,
+                        diarization_label=label, confidence=confidence,
+                    )
+                except (TypeError, ValueError):
+                    raise TranscriptionError("response") from None
+                words.append(parsed_word)
+                previous_end = word_end
             originals.append(TranscriptSegment(
                 start_seconds=start,
                 end_seconds=end,
                 diarization_label=label,
                 text=text.strip(),
+                source_utterance_id=f"assembly-u{utterance_index:06d}",
+                words=words,
             ))
             if label not in mapping:
                 if _GENERIC_PROVIDER_SPEAKER.fullmatch(speaker.strip()):

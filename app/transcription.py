@@ -26,11 +26,27 @@ from app.models import ProviderUsage
 from app.usage import record_usage
 
 
+class TranscriptWord(BaseModel):
+    text: str = Field(min_length=1, repr=False)
+    start_seconds: float = Field(ge=0, allow_inf_nan=False)
+    end_seconds: float = Field(ge=0, allow_inf_nan=False)
+    diarization_label: str = Field(min_length=1)
+    confidence: float = Field(ge=0, le=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def ordered_interval(self) -> "TranscriptWord":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("Intervallo parola non valido")
+        return self
+
+
 class TranscriptSegment(BaseModel):
     start_seconds: float = Field(ge=0, allow_inf_nan=False)
     end_seconds: float = Field(ge=0, allow_inf_nan=False)
     diarization_label: str = Field(min_length=1)
     text: str = Field(repr=False)
+    source_utterance_id: str = ""
+    words: list[TranscriptWord] = Field(default_factory=list, repr=False)
 
     @model_validator(mode="after")
     def ordered_interval(self) -> "TranscriptSegment":

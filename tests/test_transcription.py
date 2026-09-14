@@ -30,6 +30,16 @@ def response(segments, *, duration=300, usage=None):
     })
 
 
+def test_transcript_word_rejects_zero_duration():
+    from app.transcription import TranscriptWord
+
+    with pytest.raises(ValueError, match="Intervallo parola non valido"):
+        TranscriptWord(
+            text="PRIVATE-WORD-EVIDENCE", start_seconds=1, end_seconds=1,
+            diarization_label="assembly:A", confidence=.97,
+        )
+
+
 class FakeClient:
     def __init__(self, responses, hook=None):
         self.responses = iter(responses)

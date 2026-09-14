@@ -49,7 +49,7 @@ class TranscriptWindow(ReportModel):
                 "start_seconds": self.start_seconds,
                 "end_seconds": self.end_seconds,
                 "segments": [
-                    {"segment_index": index, **segment.model_dump(mode="json")}
+                    {"segment_index": index, **segment.model_dump(mode="json", exclude={"words"})}
                     for index, segment in enumerate(self.segments)
                 ],
             },

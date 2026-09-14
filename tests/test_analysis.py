@@ -18,7 +18,7 @@ from app.bunny import BunnyVideoMetadata
 from app.media import FrameCandidate
 from app.models import AcademyContent, ProviderUsage
 from app.prompts import CONSOLIDATION_PROMPT, REPAIR_PROMPT, WINDOW_PROMPT
-from app.transcription import TranscriptionResult, TranscriptSegment
+from app.transcription import TranscriptWord, TranscriptionResult, TranscriptSegment
 
 
 @pytest.fixture
@@ -301,6 +301,11 @@ def test_long_provider_segment_is_split_before_remote_analysis(inputs, content, 
 
 
 def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, content):
+    inputs["transcription"].segments[0].source_utterance_id = "assembly-u000001"
+    inputs["transcription"].segments[0].words = [TranscriptWord(
+        text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+        diarization_label="chunk-0:A", confidence=.97,
+    )]
     client = FakeClient(visual("slide", "camera_change", "uncertain"), window_result(), content)
     result = OpenAIAnalyzer(client).analyze(**inputs)
     assert isinstance(result, AcademyContent)
@@ -316,7 +321,9 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
         "end_seconds": 10.0,
         "diarization_label": "chunk-0:A",
         "text": "Sono Giulia Bianchi.",
+        "source_utterance_id": "assembly-u000001",
     }]
+    assert "PRIVATE-WORD-EVIDENCE" not in client.calls[1]["input"]
     assert [item["timestamp_seconds"] for item in payload["slides"]] == [2]
     assert "Visible 1" not in client.calls[-1]["input"]
     assert "Visible 2" not in client.calls[-1]["input"]
@@ -593,6 +600,10 @@ def test_unsupported_names_and_roles_become_generic_with_uncertainties(inputs, c
 @pytest.mark.parametrize("fault", ["duplicate", "duration", "language", "evidence"])
 def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors(inputs, content, fault):
     inputs["frames"] = []
+    inputs["transcription"].segments[0].words = [TranscriptWord(
+        text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+        diarization_label="chunk-0:A", confidence=.97,
+    )]
     bad = copy.deepcopy(content)
     if fault == "duplicate": bad["speakers"][1]["id"] = "host"
     if fault == "duration": bad["duration_seconds"] = 91
@@ -606,6 +617,7 @@ def test_semantic_errors_get_one_repair_containing_only_previous_json_and_errors
     assert set(repair) == {"errors", "previous_json"}
     assert repair["errors"]
     assert "transcription" not in repair
+    assert "PRIVATE-WORD-EVIDENCE" not in client.calls[2]["input"]
     assert len(client.calls[2]["input"]) <= 30_000
     assert all(call["max_output_tokens"] == 4000 for call in client.calls[1:])
 

@@ -233,9 +233,20 @@ class IntermediateVideoV11(_Model):
 
     @model_validator(mode="after")
     def validate_granular_contract(self) -> "IntermediateVideoV11":
-        strict_contract = bool(self.blocchi_parlato) or self.costo_stimato is not None
-        if not strict_contract:
+        intervention_ids = [intervention.id for intervention in self.interventi]
+        if len(intervention_ids) != len(set(intervention_ids)):
+            raise ValueError("gli id degli interventi devono essere univoci")
+
+        granular_fields = {"blocchi_parlato", "costo_stimato"}
+        supplied_granular_fields = granular_fields & self.model_fields_set
+        if not supplied_granular_fields:
             return self
+        if (
+            supplied_granular_fields != granular_fields
+            or not self.blocchi_parlato
+            or self.costo_stimato is None
+        ):
+            raise ValueError("il contratto granulare richiede blocchi e costo stimato")
 
         duration = self.durata_secondi
         segments = [*self.interventi, *self.blocchi_parlato]
@@ -262,8 +273,9 @@ class IntermediateVideoV11(_Model):
                     intervention.capitolo_numero,
                     intervention.capitoli_blocco,
                 )
-            ):
+            ) or intervention.confine_inizio is not None:
                 raise ValueError("pausa e logistica non appartengono a capitoli")
+        consumed_bridge_ids: set[str] = set()
         for previous, following in zip(ordered_blocks, ordered_blocks[1:]):
             if following.start_seconds < previous.end_seconds:
                 raise ValueError("i blocchi parlato non possono sovrapporsi")
@@ -271,15 +283,20 @@ class IntermediateVideoV11(_Model):
                 continue
             covered_until = previous.end_seconds
             for bridge in bridge_segments:
+                if bridge.id in consumed_bridge_ids:
+                    continue
                 if bridge.start_seconds < covered_until or bridge.end_seconds > following.start_seconds:
                     continue
                 if bridge.start_seconds != covered_until:
                     break
                 covered_until = bridge.end_seconds
+                consumed_bridge_ids.add(bridge.id)
                 if covered_until == following.start_seconds:
                     break
             if covered_until != following.start_seconds:
                 raise ValueError("un intervallo tra blocchi richiede pausa o logistica")
+        if consumed_bridge_ids != {bridge.id for bridge in bridge_segments}:
+            raise ValueError("pausa e logistica devono coprire un solo intervallo tra blocchi")
         spoken = [
             intervention for intervention in self.interventi
             if intervention.tipo not in {"pausa", "logistica"}

@@ -238,6 +238,96 @@ def test_equal_start_sources_preserve_input_order_and_window_containment():
     )
 
 
+@pytest.mark.parametrize("second_start", [0, .2], ids=["equal-start", "later-start"])
+@pytest.mark.parametrize("output_kind", ["atoms", "windows"])
+def test_overlapping_words_with_decreasing_ends_remain_inside_every_interval(
+    second_start, output_kind,
+):
+    from app.analysis_chunks import split_transcript_atoms, split_transcript_windows
+
+    words = [
+        TranscriptWord(text="Prima", start_seconds=0, end_seconds=1.2,
+                       diarization_label="A", confidence=.97),
+        TranscriptWord(text="Seconda", start_seconds=second_start, end_seconds=.8,
+                       diarization_label="A", confidence=.86),
+        TranscriptWord(text="Terza.", start_seconds=601, end_seconds=602,
+                       diarization_label="A", confidence=.75),
+    ]
+    original_evidence = [word.model_dump() for word in words]
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=610, diarization_label="A", text="provider text",
+        source_utterance_id="assembly-u000001", words=words,
+    )
+
+    if output_kind == "atoms":
+        intervals = split_transcript_atoms(source)
+        assert intervals == split_transcript_atoms(source)
+        pieces = intervals
+    else:
+        intervals = split_transcript_windows([source])
+        assert intervals == split_transcript_windows([source])
+        pieces = [piece for window in intervals for piece in window.segments]
+
+    assert [(item.start_seconds, item.end_seconds) for item in intervals] == [
+        (0, 1.2), (601, 602),
+    ]
+    assert [(piece.start_seconds, piece.end_seconds) for piece in pieces] == [
+        (0, 1.2), (601, 602),
+    ]
+    assert [piece.text for piece in pieces] == ["Prima Seconda", "Terza."]
+    assert [piece.source_utterance_id for piece in pieces] == ["assembly-u000001"] * 2
+    assert [piece.diarization_label for piece in pieces] == ["A", "A"]
+    flattened_words = [word for piece in pieces for word in piece.words]
+    assert len(flattened_words) == len(words)
+    assert all(actual is original for actual, original in zip(flattened_words, words))
+    assert [word.model_dump() for word in words] == original_evidence
+    assert all(
+        piece.start_seconds <= word.start_seconds <= word.end_seconds <= piece.end_seconds
+        for piece in pieces for word in piece.words
+    )
+    if output_kind == "windows":
+        assert all(
+            window.start_seconds <= word.start_seconds <= word.end_seconds <= window.end_seconds
+            for window in intervals for piece in window.segments for word in piece.words
+        )
+
+
+@pytest.mark.parametrize("max_seconds, max_chars, second_text, expected_texts, expected_bounds", [
+    (1.2, 3000, "Seconda", ["Prima Seconda", "Terza", "Quarta."],
+     [(0, 1.2), (.4, 1.5), (2, 2.5)]),
+    (90, 13, "Seconda", ["Prima Seconda", "Terza Quarta."],
+     [(0, 1.2), (.4, 2.5)]),
+    (90, 20, "Seconda.", ["Prima Seconda.", "Terza Quarta."],
+     [(0, 1.2), (.4, 2.5)]),
+], ids=["duration-cap", "character-cap", "sentence-preference"])
+def test_overlapping_word_bounds_respect_caps_and_sentence_preference(
+    max_seconds, max_chars, second_text, expected_texts, expected_bounds,
+):
+    from app.analysis_chunks import split_transcript_atoms
+
+    words = [TranscriptWord(
+        text=text, start_seconds=start, end_seconds=end, diarization_label="A", confidence=.9,
+    ) for text, start, end in [
+        ("Prima", 0, 1.2), (second_text, 0, .8), ("Terza", .4, 1.5), ("Quarta.", 2, 2.5),
+    ]]
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=3, diarization_label="A", text="provider text",
+        source_utterance_id="assembly-u000001", words=words,
+    )
+
+    atoms = split_transcript_atoms(source, max_seconds=max_seconds, max_chars=max_chars)
+
+    assert [atom.text for atom in atoms] == expected_texts
+    assert [(atom.start_seconds, atom.end_seconds) for atom in atoms] == expected_bounds
+    assert all(atom.end_seconds - atom.start_seconds <= max_seconds for atom in atoms)
+    assert all(len(atom.text) <= max_chars for atom in atoms)
+    assert [word for atom in atoms for word in atom.words] == words
+    assert all(
+        atom.start_seconds <= word.start_seconds <= word.end_seconds <= atom.end_seconds
+        for atom in atoms for word in atom.words
+    )
+
+
 def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval

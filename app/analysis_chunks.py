@@ -150,9 +150,10 @@ def _fits_window(segments: list[TranscriptSegment]) -> bool:
 
 
 def _segment_from_words(source: TranscriptSegment, words: Sequence[TranscriptWord]) -> TranscriptSegment:
+    # Ordered word starts do not imply ordered ends when speech overlaps.
     return source.model_copy(update={
-        "start_seconds": words[0].start_seconds,
-        "end_seconds": words[-1].end_seconds,
+        "start_seconds": min(word.start_seconds for word in words),
+        "end_seconds": max(word.end_seconds for word in words),
         "text": " ".join(word.text for word in words),
         "words": list(words),
     })

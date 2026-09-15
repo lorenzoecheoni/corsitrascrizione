@@ -646,6 +646,10 @@ def make_video(
 def report_with_reconciled_speakers() -> AcademyReport:
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     report = AcademyReport.model_validate(data)
+    # This helper exercises the legacy conversion with its own flat timeline.
+    report.analysis_profile = 1
+    report.speech_blocks = []
+    report.boundaries = []
     report.audio_boundary_version = 1
     report.speakers = [
         SpeakerProfile(

@@ -400,6 +400,11 @@ with pytest.MonkeyPatch.context() as patch:
 
 def _course_video_report(title):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    # The course tests construct a separate legacy timeline below.
+    report.analysis_profile = 1
+    report.audio_boundary_version = None
+    report.speech_blocks = []
+    report.boundaries = []
     report.title = title
     report.bunny_title = title
     report.duration_seconds = 600

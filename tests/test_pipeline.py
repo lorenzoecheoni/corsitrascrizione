@@ -34,6 +34,8 @@ def components(tmp_path):
                         app_password="team-secret", _env_file=None)
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     data.pop("cost")
+    # This pipeline fixture supplies its own legacy, single-segment analysis.
+    data.update(analysis_profile=1, speech_blocks=[], boundaries=[])
     content = AcademyContent.model_validate(data)
     content.audio_boundary_version = 1
     metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600,

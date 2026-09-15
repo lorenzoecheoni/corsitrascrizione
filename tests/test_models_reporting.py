@@ -17,7 +17,10 @@ from app.reporting import (
 
 
 def load_report() -> AcademyReport:
+    """Legacy rendering cases deliberately omit granular provenance."""
     data = json.loads(Path("tests/fixtures/report.json").read_text())
+    data.update(analysis_profile=1, audio_boundary_version=None,
+                interventions=[], boundaries=[], speech_blocks=[])
     return AcademyReport.model_validate(data)
 
 
@@ -58,7 +61,7 @@ def test_report_models_retain_blocks_chapter_origin_and_material_page():
 
 
 def test_report_fixture_covers_requested_text_report() -> None:
-    report = load_report()
+    report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
     assert len(report.speakers) == 3
     assert report.synopsis
     assert report.slides[0].timestamp_seconds == 95
@@ -68,13 +71,13 @@ def test_report_fixture_covers_requested_text_report() -> None:
         "speech_blocks", "materials", "material_failures", "analysis_profile",
         "audio_boundary_version", "cost", "bunny_title", "usage",
     }
-    assert report.interventions == []
-    assert report.boundaries == []
-    assert report.speech_blocks == []
+    assert len(report.interventions) == 5
+    assert len(report.boundaries) == 4
+    assert len(report.speech_blocks) == 1
     assert report.materials == []
     assert report.material_failures == []
-    assert report.analysis_profile == 1
-    assert report.audio_boundary_version is None
+    assert report.analysis_profile == 2
+    assert report.audio_boundary_version == 1
 
 
 def _boundary_data():

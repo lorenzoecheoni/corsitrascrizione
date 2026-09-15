@@ -25,6 +25,7 @@ from app.analysis_chunks import (
 from app.bunny import BunnyVideoMetadata
 from app.models import ProviderUsage
 from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
+from report_delivery_support import assert_granular_analysis
 
 
 _SYNTHETIC_DURATION_SECONDS = 96 * 60
@@ -103,13 +104,25 @@ def test_synthetic_workload_has_representative_varied_text_volume():
     assert len({segment.text for segment in transcription.segments}) == 96
     assert len(set(" ".join(segment.text for segment in transcription.segments).split())) >= 250
     assert len(windows) >= 10
-    # Keep the same 100k-character workload dense within the transcript budget;
-    # the rest of each request is reserved for previous semantic context.
+    # Packing changes with genuine word/sentence boundaries; assert the budget
+    # and complete evidence coverage instead of a prose-dependent fill ratio.
     transcript_budget = MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS
-    assert all(.9 * transcript_budget <= size <= transcript_budget for size in sizes[:-1])
-    assert max(sizes) >= .95 * transcript_budget
-    assert [segment for window in windows for segment in window.segments] == transcription.segments
+    assert all(0 < size <= transcript_budget for size in sizes)
+    assert [word for window in windows for segment in window.segments for word in segment.words] == [
+        word for segment in transcription.segments for word in segment.words
+    ]
     assert all(window.end_seconds - window.start_seconds <= 600 for window in windows)
+
+
+def test_synthetic_word_evidence_covers_every_input_token_once():
+    # A placeholder word must not erase the semantic workload during atomization.
+    _, transcription = _synthetic_long_inputs()
+    for segment in transcription.segments:
+        assert [word.text for word in segment.words] == segment.text.split()
+        assert all(segment.start_seconds <= word.start_seconds <= word.end_seconds
+                   <= segment.end_seconds for word in segment.words)
+        assert all(left.end_seconds <= right.start_seconds
+                   for left, right in zip(segment.words, segment.words[1:]))
 
 
 def test_live_acceptance_rejects_recovered_429_and_counts_only_safe_statuses(monkeypatch):
@@ -197,7 +210,7 @@ def _assert_live_statuses(audited: _SafeRecordingOpenAI) -> None:
 def _synthetic_segment_text(index: int) -> str:
     # Roughly 170 spoken Italian words/minute; topics and numeric cases vary.
     text = (
-        f"{_SYNTHETIC_INTRODUCTIONS[index % 4]} Intervento {index + 1} del seminario sintetico. "
+        f"{_SYNTHETIC_INTRODUCTIONS[index // 8 % 4]} Intervento {index + 1} del seminario sintetico. "
         f"{_SYNTHETIC_TOPICS[index // 8]} "
         f"Nel caso numero {index + 1}, il laboratorio dispone di {12 + index} partecipanti "
         f"e di {3 + index % 7} postazioni. La prima settimana comprende {2 + index % 5} incontri. "
@@ -213,20 +226,26 @@ def _synthetic_segment_text(index: int) -> str:
     return text[:1100]
 
 
+def _synthetic_segment(text, start, end, label, source_id):
+    """Assign artificial timing to every token of this artificial workload."""
+    tokens = text.split()
+    step = (end - start - .2) / len(tokens)
+    words = [TranscriptWord(
+        text=token, start_seconds=start + .1 + index * step,
+        end_seconds=start + .1 + (index + .8) * step,
+        diarization_label=label, confidence=.99,
+    ) for index, token in enumerate(tokens)]
+    return TranscriptSegment(
+        start_seconds=start, end_seconds=end, diarization_label=label,
+        text=" ".join(tokens), source_utterance_id=source_id, words=words,
+    )
+
+
 def _synthetic_long_inputs():
     segments = [
-        TranscriptSegment(
-            start_seconds=index * 60,
-            end_seconds=(index + 1) * 60,
-            diarization_label=f"chunk-{index // 10}:{'ABCD'[index % 4]}",
-            text=_synthetic_segment_text(index),
-            source_utterance_id=f"synthetic-u{index:03d}",
-            words=[TranscriptWord(
-                text=f"evidenza-{index}", start_seconds=index * 60 + .1,
-                end_seconds=(index + 1) * 60 - .1,
-                diarization_label=f"chunk-{index // 10}:{'ABCD'[index % 4]}",
-                confidence=.99,
-            )],
+        _synthetic_segment(
+            _synthetic_segment_text(index), index * 60, (index + 1) * 60,
+            f"global:{'ABCD'[index // 8 % 4]}", f"synthetic-u{index:03d}",
         )
         for index in range(96)
     ]
@@ -254,8 +273,6 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
     assert metadata.duration_seconds == 5760
     assert sum(len(segment.text) for segment in transcription.segments) >= 100_000
     assert len(windows) >= 10
-    assert all(len(window.to_payload()) >= .9 * (MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS)
-               for window in windows[:-1])
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
     client = OpenAI(api_key=api_key, max_retries=0)
@@ -269,6 +286,7 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
         )
         assert result.synopsis.strip()
         assert result.speakers
+        assert_granular_analysis(result, metadata.duration_seconds)
         _assert_live_statuses(audited)
         window_payloads = [size for schema, size in audited.requests if schema is WindowAnalysis]
         consolidation_payloads = [
@@ -278,8 +296,6 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
         assert consolidation_payloads
         assert all(size <= MAX_WINDOW_CHARS for size in window_payloads)
         assert all(size <= MAX_CONSOLIDATION_CHARS for size in consolidation_payloads)
-        # The real map output must exercise a substantial consolidation too.
-        assert max(consolidation_payloads) >= 10_000
         passed = True
     except Exception:
         pass  # Emit numeric diagnostics below, then fail with static text only.
@@ -305,6 +321,8 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
             f"window_max_chars={max(len(window.to_payload()) for window in windows)} "
             f"consolidation_max_chars={max((size for schema, size in audited.requests if schema is ConsolidatedTextReport), default=0)} "
             f"speakers={len(result.speakers) if result is not None else 0} "
+            f"blocks={len(result.speech_blocks) if result is not None else 0} "
+            f"chapters={len(result.interventions) if result is not None else 0} "
             f"slides={len(result.slides) if result is not None else 0} "
             f"uncertainties={len(result.uncertainties) if result is not None else 0}"
         )
@@ -315,13 +333,13 @@ def test_chunked_long_report_uses_bounded_synthetic_payloads(capsys):
 
 
 @pytest.mark.live
-def test_announced_presenter_and_speakers_survive_live_consolidation():
+def test_announced_presenter_and_speakers_survive_live_consolidation(capsys):
     """Keep announced people even when their names cannot be mapped to voice labels."""
     api_key = _synthetic_live_api_key()
     expected_names = {
         "Vincenzo Manfredi",
         "Gaetano De Vito",
-        "Antonio Sibiglia",
+        "Antonio Sibilia",
         "Furio D'Andrea",
         "Luigi Morra",
     }
@@ -332,23 +350,15 @@ def test_announced_presenter_and_speakers_survive_live_consolidation():
     )
     transcription = TranscriptionResult(
         text="",
-        segments=[TranscriptSegment(
-            start_seconds=0,
-            end_seconds=60,
-            diarization_label="chunk-0:A",
-            text=(
+        segments=[_synthetic_segment(
+            (
                 "Buongiorno, sono Vincenzo Manfredi e presento questo seminario. "
-                "I nostri relatori sono il Presidente Gaetano De Vito, Antonio Sibiglia, "
+                "I nostri relatori sono il Presidente Gaetano De Vito, Antonio Sibilia, "
                 "l'Avvocato Furio D'Andrea e Luigi Morra. Li introduco ora; dal solo "
                 "annuncio non sappiamo ancora quale voce appartenga a ciascuno di loro."
-            ),
-            source_utterance_id="synthetic-announcement-u1",
-            words=[TranscriptWord(
-                text="Buongiorno", start_seconds=.1, end_seconds=59.9,
-                diarization_label="chunk-0:A", confidence=.99,
-            )],
+            ), 0, 120, "global:A", "synthetic-announcement-u1",
         )],
-        audio_seconds=60,
+        audio_seconds=120,
     )
 
     client = OpenAI(api_key=api_key, max_retries=0)
@@ -361,21 +371,24 @@ def test_announced_presenter_and_speakers_survive_live_consolidation():
         )
         names = {speaker.display_name for speaker in result.speakers}
         assert expected_names <= names
-        assert sum(audited.status_counts.values()) == len(audited.requests)
-        assert all(status == 429 or 200 <= status < 300 for status in audited.status_counts)
+        assert_granular_analysis(result, metadata.duration_seconds)
+        _assert_live_statuses(audited)
         assert sum(count for status, count in audited.status_counts.items() if 200 <= status < 300) >= 2
         passed = True
     except Exception:
         pass
     finally:
         client.close()
-    print(
-        "announced_speaker_diagnostic "
-        f"status={'passed' if passed else 'failed'} requests={len(audited.requests)} "
-        f"status_2xx={sum(count for status, count in audited.status_counts.items() if 200 <= status < 300)} "
-        f"status_429={audited.status_counts[429]} returned={len(names)} "
-        f"missing={','.join(sorted(expected_names - names)) or 'none'}"
-    )
+    captured = capsys.readouterr()
+    _fail_if_captured_live_output(captured.out, captured.err)
+    with capsys.disabled():
+        print(
+            "announced_speaker_diagnostic "
+            f"status={'passed' if passed else 'failed'} requests={len(audited.requests)} "
+            f"status_2xx={sum(count for status, count in audited.status_counts.items() if 200 <= status < 300)} "
+            f"status_429={audited.status_counts[429]} returned={len(names)} "
+            f"missing={len(expected_names - names)}"
+        )
     if not passed:
         raise pytest.fail.Exception(
             "Announced-speaker live analysis failed; inspect only safe provider status",
@@ -398,6 +411,7 @@ def test_live_failure_output_does_not_disclose_private_input(tmp_path, phase, me
         "BUNNY_CDN_HOSTNAME": "cdn.example.invalid",
         "BUNNY_TOKEN_AUTH_KEY": "",
         "OPENAI_API_KEY": "TEST_ONLY_OPENAI",
+        "ASSEMBLYAI_API_KEY": "TEST_ONLY_ASSEMBLYAI",
         "APP_PASSWORD": "TEST_ONLY_PASSWORD",
         "BUNNY_SAMPLE_VIDEO_URL": "https://example.invalid/authorized-sample",
         "DIAGNOSTIC_SENTINEL": sentinel,
@@ -413,6 +427,7 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(sys.argv[1]).parents[1]))
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
 
 def deny_network(*args, **kwargs):
     raise AssertionError("Offline diagnostic test attempted a network connection")

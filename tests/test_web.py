@@ -366,6 +366,7 @@ def test_obsolete_inventory_page_redirects_to_per_video_catalog(client):
 
 def test_dashboard_separates_saved_reports_from_uncompleted_jobs(client):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.analysis_profile = 1
     store = client.app.state.store
     completed = store.create("completed-source", source_title="Report salvato")
     store.update(completed.id, state=JobState.PROCESSING)
@@ -815,6 +816,11 @@ def test_exports_require_completion_and_queued_job_can_be_cancelled(client):
 @pytest.mark.parametrize("single_segment", [False, True])
 def test_historical_json_requires_reanalysis_before_any_external_work(client, monkeypatch, single_segment):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    report.analysis_profile = 1
+    report.interventions = []
+    report.speech_blocks = []
+    report.boundaries = []
+    report.audio_boundary_version = None
     if single_segment:
         report.interventions = [Intervention(
             id="i001", start_seconds=0, end_seconds=report.duration_seconds, tipo="intervento",

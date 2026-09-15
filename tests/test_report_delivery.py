@@ -17,7 +17,7 @@ from app.jobs import JobState, JobStore
 from app.main import build_services
 from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 from app.web import router
-from report_delivery_support import assert_http_exports, assert_report_delivery
+from report_delivery_support import TranscriptLeakAudit, assert_http_exports, assert_report_delivery
 import test_live_bunny as live_bunny
 
 
@@ -155,6 +155,23 @@ def _timed_private_transcription():
     return TranscriptionResult(text="", segments=segments, audio_seconds=3720, provider="assemblyai")
 
 
+def _timed_short_transcription():
+    segments = []
+    for number in range(100):
+        words = [TranscriptWord(
+            text=f"brief{number:03d}{index:02d}",
+            start_seconds=number * 37.2 + index * 1.8,
+            end_seconds=number * 37.2 + index * 1.8 + .7,
+            diarization_label="A", confidence=.99,
+        ) for index in range(20)]
+        segments.append(TranscriptSegment(
+            start_seconds=number * 37.2, end_seconds=(number + 1) * 37.2,
+            text=" ".join(word.text for word in words), words=words,
+            diarization_label="A", source_utterance_id=f"short-{number}",
+        ))
+    return TranscriptionResult(text="", segments=segments, audio_seconds=3720, provider="assemblyai")
+
+
 def _live_privacy_case(tmp_path, monkeypatch, report, *, private="TEST_PRIVATE_PASSWORD"):
     """Real acceptance/store/auth/downloads; replace only remote work."""
     workspace = tmp_path / "media"
@@ -208,6 +225,55 @@ def test_live_audit_rejects_one_segment_or_substantial_excerpt(tmp_path, monkeyp
     assert "spoken" not in (captured.out + captured.err + caplog.text).casefold()
 
 
+@pytest.mark.parametrize("excerpt", [
+    "whole_transcript", "normalized_cross_segment", "empty_segments", "chronological_segments",
+])
+def test_live_audit_rejects_substantial_cross_segment_excerpts(
+    tmp_path, monkeypatch, caplog, capsys, excerpt,
+):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    settings, services, transcription, downloads = _live_privacy_case(tmp_path, monkeypatch, report)
+    transcription.segments = _timed_short_transcription().segments
+    words = [word.text for segment in transcription.segments for word in segment.words]
+    assert len(transcription.segments) == 100 and len(words) == 2000
+    assert all(len(segment.words) == 20 for segment in transcription.segments)
+    if excerpt == "whole_transcript":
+        report.synopsis = " ".join(words)
+    else:
+        # Forty consecutive words span three individually sub-threshold segments.
+        report.synopsis = "Sintesi: " + ",\n\t".join(word.upper() for word in words[990:1030])
+        if excerpt == "empty_segments":
+            for index in (51, 50):
+                transcription.segments.insert(index, TranscriptSegment(
+                    start_seconds=index * 37.2, end_seconds=index * 37.2,
+                    text="  \n", words=[], diarization_label="A",
+                ))
+        elif excerpt == "chronological_segments":
+            transcription.segments.reverse()
+    _assert_static_live_rejection(settings, monkeypatch)
+    assert services.store.list_completed() == []
+    assert downloads == []
+    captured = capsys.readouterr()
+    assert "brief" not in (captured.out + captured.err + caplog.text).casefold()
+
+
+def test_transcript_audits_do_not_join_unrelated_runs_or_reorder_equal_start_segments():
+    segments = _timed_short_transcription().segments[:2]
+    segments[1].start_seconds = segments[0].start_seconds
+    combined = " ".join(segment.text for segment in segments)
+    first, second = TranscriptLeakAudit(), TranscriptLeakAudit()
+    for audit, segment in zip((first, second), segments, strict=True):
+        audit.observe(TranscriptionResult(text="", segments=[segment], audio_seconds=3720))
+        audit.assert_absent(combined)
+    # Equal start times preserve the source's supplied order, not reversed order.
+    joined = TranscriptLeakAudit()
+    joined.observe(TranscriptionResult(text="", segments=segments, audio_seconds=3720))
+    with pytest.raises(AssertionError, match="Transient transcript excerpt in report"):
+        joined.assert_absent(combined)
+    joined.assert_absent(" ".join(segment.text for segment in reversed(segments)))
+    assert all(isinstance(window, bytes) and len(window) == 32 for window in joined._windows)
+
+
 @pytest.mark.parametrize("private", ['PRIVATE_SECRET_"quoted"', "PRIVATE_SECRET_new\nline", 'PRIVATE_SECRET_é🔒\x01'],
                          ids=["quoted", "newline", "unicode_control"])
 @pytest.mark.parametrize("location", ["persisted_only", "exported_evidence"])
@@ -243,9 +309,12 @@ def test_live_audit_rejects_noncompact_or_contradictory_boundary_evidence(tmp_pa
     assert downloads == []
 
 
-def test_live_audit_allows_actual_five_plus_five_boundary_words(tmp_path, monkeypatch):
+@pytest.mark.parametrize("short_segments", [False, True])
+def test_live_audit_allows_actual_five_plus_five_boundary_words(tmp_path, monkeypatch, short_segments):
     report = AcademyReport.model_validate_json(FIXTURE.read_text())
     settings, services, transcription, downloads = _live_privacy_case(tmp_path, monkeypatch, report)
+    if short_segments:
+        transcription.segments = _timed_short_transcription().segments
     words = [word for segment in transcription.segments for word in segment.words]
     for evidence in report.boundaries:
         evidence.words_before = [word.text for word in words

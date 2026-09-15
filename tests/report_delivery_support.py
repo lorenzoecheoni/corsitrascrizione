@@ -31,16 +31,17 @@ def assert_private_values_absent(value, private_values):
             raise AssertionError("Private value in report")
 
 
-def _transcript_windows(text):
+def _transcript_windows(texts):
     # A fixed 32-word window detects substantial excerpts despite punctuation,
     # spacing, case or Unicode presentation changes; 5+5 proof words stay below
     # the threshold. Only SHA-256 fingerprints survive source observation.
     words = deque(maxlen=32)
-    normalized = unicodedata.normalize("NFKC", text).casefold()
-    for match in re.finditer(r"[^\W_]+", normalized):
-        words.append(match.group())
-        if len(words) == 32:
-            yield hashlib.sha256("\0".join(words).encode("utf-8")).digest()
+    for text in texts:
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+        for match in re.finditer(r"[^\W_]+", normalized):
+            words.append(match.group())
+            if len(words) == 32:
+                yield hashlib.sha256("\0".join(words).encode("utf-8")).digest()
 
 
 class TranscriptLeakAudit:
@@ -48,12 +49,15 @@ class TranscriptLeakAudit:
         self._windows = set()
 
     def observe(self, transcription):
-        for segment in transcription.segments:
-            self._windows.update(_transcript_windows(segment.text))
+        # Stable chronological order retains source order for equal timestamps.
+        # One local rolling window includes both within-segment and cross-segment
+        # excerpts, skips empty text, and never carries tokens into another run.
+        segments = sorted(transcription.segments, key=lambda segment: segment.start_seconds)
+        self._windows.update(_transcript_windows(segment.text for segment in segments))
 
     def assert_absent(self, value):
         for text in decoded_strings(value):
-            if any(window in self._windows for window in _transcript_windows(text)):
+            if any(window in self._windows for window in _transcript_windows((text,))):
                 raise AssertionError("Transient transcript excerpt in report")
 
 

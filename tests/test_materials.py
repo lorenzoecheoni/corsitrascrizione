@@ -140,6 +140,25 @@ def test_matching_uses_both_token_overlap_and_sequence_similarity():
     assert result[0].page == 1
 
 
+def test_matching_accepts_exact_point_fifty_five_despite_weighted_float_roundoff():
+    from difflib import SequenceMatcher
+    text, candidate = "a b c", "c b a ddddddddddddd"
+    jaccard = len(set(text.split()) & set(candidate.split())) / len(set(text.split()) | set(candidate.split()))
+    sequence = SequenceMatcher(None, text, candidate).ratio()
+    assert (jaccard, sequence) == (.75, .25)
+    assert .6 * jaccard + .4 * sequence == .5499999999999999
+    result = match_slides_to_material(
+        [slide(text)], ReportMaterial(titolo=TITLE, url=URL), [DeckPage(1, candidate)])
+    assert result[0].page == 1
+
+
+@pytest.mark.parametrize("score,accepted", [(.5499999999999999, True), (.55, True),
+                                            (.55 - 1e-14, False), (.54999999, False)])
+def test_score_floor_tolerance_only_covers_float_roundoff(score, accepted):
+    from app.materials import _score_at_least_floor
+    assert _score_at_least_floor(score) is accepted
+
+
 def test_page_order_is_chronological_stable_and_never_falls_back_to_worse_match():
     observed = [slide("Decisioni", time=20), slide("Premesse", time=10),
                 slide("Premesse", time=30), slide("Decisioni", time=40)]
@@ -494,6 +513,125 @@ def write_disguised_pdf_contents(path, *, count=1, stream_bytes=32, codec="/Flat
         page[NameObject("/Contents")] = writer._add_object(ArrayObject([reference])) if indirect_array else reference
     writer.write(path)
     return path
+
+
+def write_object_stream_pdf(path, *, count=12, stream_bytes=9 * 1024 * 1024 + 22,
+                            rooted=True, direct_references=False, subtype="", cyclic=False):
+    """Valid PDF 1.5 xref/object streams; each container holds two small objects.
+
+    Padding compresses well but must count against the decoded byte budget.
+    Containers are indexed by xref entries, not necessarily trailer-reachable.
+    """
+    import zlib
+    data = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    containers = list(range(6, 6 + count))
+    first_embedded = 6 + count
+    xref_number = first_embedded + 2 * count
+    program = b"BT /F1 12 Tf 10 10 Td (safe) Tj ET"
+
+    def add(number, body):
+        offsets[number] = len(data)
+        data.extend(f"{number} 0 obj\n".encode() + body + b"\nendobj\n")
+
+    probe = b""
+    if rooted:
+        probe += b"/Probe [" + b" ".join(f"{i} 0 R".encode() for i in range(first_embedded, xref_number)) + b"]"
+    if direct_references:
+        probe += b"/Containers [" + b" ".join(f"{i} 0 R {i} 0 R".encode() for i in containers) + b"]"
+    add(1, b"<< /Type /Catalog /Pages 2 0 R " + probe + b" >>")
+    add(2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>")
+    add(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
+           b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>")
+    add(4, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    add(5, f"<< /Length {len(program)} >>\nstream\n".encode() + program + b"\nendstream")
+    for index, number in enumerate(containers):
+        embedded = first_embedded + 2 * index
+        body = f"<< /Next {embedded} 0 R >>".encode() if cyclic else b"<< /Value 0 >>"
+        header = f"{embedded} 0 {embedded + 1} {len(body) + 1} ".encode()
+        decoded = (header + body + b" << /Value 1 >>").ljust(stream_bytes, b" ")
+        assert len(decoded) == stream_bytes
+        compressed = zlib.compress(decoded)
+        add(number, f"<< /Type /ObjStm /N 2 /First {len(header)} /Filter /FlateDecode "
+            f"{subtype} /Length {len(compressed)} >>\nstream\n".encode() + compressed + b"\nendstream")
+    xref_offset = len(data)
+    offsets[xref_number] = xref_offset
+    entries = bytearray(b"\x00\x00\x00\x00\x00\xff\xff")
+    for number in range(1, xref_number + 1):
+        if first_embedded <= number < xref_number:
+            index, position = divmod(number - first_embedded, 2)
+            entries.extend(b"\x02" + containers[index].to_bytes(4, "big") + position.to_bytes(2, "big"))
+        else:
+            entries.extend(b"\x01" + offsets[number].to_bytes(4, "big") + b"\x00\x00")
+    add(xref_number, f"<< /Type /XRef /Size {xref_number + 1} /Root 1 0 R "
+        f"/W [1 4 2] /Length {len(entries)} >>\nstream\n".encode() + entries + b"\nendstream")
+    data.extend(f"startxref\n{xref_offset}\n%%EOF\n".encode())
+    path.write_bytes(data)
+    return path
+
+
+@pytest.mark.parametrize("rooted", [True, False])
+def test_pdf_object_streams_cannot_bypass_cumulative_100_mib_budget(tmp_path, rooted):
+    # Production-scale probe: 12 * 9,437,206 = 113,246,472 decoded bytes,
+    # despite a ~112 KiB PDF and each container below the 10 MiB stream cap.
+    deck = write_object_stream_pdf(tmp_path / "object-stream-budget.pdf", rooted=rooted)
+    assert deck.stat().st_size < 120 * 1024
+    with pytest.raises(MaterialError, match="^MATERIALE_NON_RAGGIUNGIBILE$"):
+        extract_deck_pages(deck)
+    assert list(tmp_path.iterdir()) == [deck]
+
+
+def test_pdf_object_stream_budget_is_checked_before_page_extraction(tmp_path, monkeypatch):
+    import app.materials as module
+    from pypdf._page import PageObject
+    deck = write_object_stream_pdf(tmp_path / "before-extraction.pdf", count=3, stream_bytes=80,
+                                   rooted=False, subtype="/Subtype /Image")
+    monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", 200)
+    def forbidden_extract(*args, **kwargs):
+        raise AssertionError("Unaccounted object stream reached extraction")
+    monkeypatch.setattr(PageObject, "extract_text", forbidden_extract)
+    with pytest.raises(MaterialError):
+        module._pdf_pages(deck)
+
+
+def test_pdf_object_streams_count_once_across_xref_and_trailer_with_cycles(tmp_path, monkeypatch):
+    import app.materials as module
+    from pypdf import PdfReader
+    deck = write_object_stream_pdf(tmp_path / "shared-objects.pdf", count=2, stream_bytes=80,
+                                   direct_references=True, cyclic=True)
+    # Both members in each stream share one container; direct duplicate
+    # container refs and self-references must not double count or loop.
+    reader = PdfReader(deck, strict=True)
+    assert len(reader.xref_objStm) == 4
+    assert len({value[0] for value in reader.xref_objStm.values()}) == 2
+    monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", 200)
+    assert module._pdf_pages(deck)[0].text.strip() == "safe"
+
+
+@pytest.mark.parametrize("extra_byte", [0, 1])
+def test_pdf_object_and_content_streams_share_one_inclusive_budget(tmp_path, monkeypatch, extra_byte):
+    import app.materials as module
+    deck = write_object_stream_pdf(tmp_path / "combined-budget.pdf", count=2, stream_bytes=80,
+                                   direct_references=True)
+    budget = 160 + len(b"BT /F1 12 Tf 10 10 Td (safe) Tj ET")
+    monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", budget - extra_byte)
+    if extra_byte:
+        with pytest.raises(MaterialError):
+            module._pdf_pages(deck)
+    else:
+        assert module._pdf_pages(deck)[0].text.strip() == "safe"
+
+
+@pytest.mark.parametrize("table", [{1: (1, 0)}, {1: (2, 0), 2: (1, 0)},
+                                    {1: (999, 0)}, {1: (6, -1)}, None])
+def test_pdf_invalid_or_cyclic_object_stream_tables_fail_closed_without_resolution(table):
+    from types import SimpleNamespace
+    from app.materials import _pdf_object_streams
+    # No get_object API: resolution itself would fail this test. Cycle/nesting
+    # and unknown table shapes must be rejected before pypdf can recurse.
+    reader = SimpleNamespace(xref_objStm=table, xref={0: {1: 10, 2: 20, 6: 60}})
+    with pytest.raises(MaterialError):
+        tuple(_pdf_object_streams(reader))
 
 
 def test_disguised_pdf_contents_cannot_bypass_100_mib_decoded_limit(tmp_path):

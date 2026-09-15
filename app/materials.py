@@ -406,6 +406,36 @@ def _reject_pdf_external_decoder(*args, **kwargs):
     raise MaterialError()
 
 
+def _pdf_object_streams(reader):
+    """Enumerate containers that resolving pypdf's compressed xrefs can decode.
+
+    Containers are not normally trailer-reachable. Object streams cannot
+    themselves be compressed objects (PDF 1.5); reject nested/cyclic tables
+    before resolving any container. Unknown reader table shapes fail closed.
+    """
+    from pypdf.generic import IndirectObject, StreamObject
+    table = getattr(reader, "xref_objStm", None)
+    xref = getattr(reader, "xref", None)
+    if not isinstance(table, dict) or not isinstance(xref, dict) or len(table) > 100_000:
+        raise MaterialError()
+    direct = xref.get(0, {})
+    containers = set()
+    for member, entry in table.items():
+        if (not isinstance(member, int) or member <= 0
+                or not isinstance(entry, (tuple, list)) or len(entry) != 2):
+            raise MaterialError()
+        number, index = entry
+        if (not isinstance(number, int) or number <= 0 or not isinstance(index, int) or index < 0
+                or number in table or number not in direct):
+            raise MaterialError()
+        containers.add(number)
+    for number in sorted(containers):
+        obj = IndirectObject(number, 0, reader).get_object()
+        if not isinstance(obj, StreamObject) or obj.get("/Type") != "/ObjStm":
+            raise MaterialError()
+        yield obj
+
+
 def _pdf_content_stream_ids(reader) -> set[int]:
     """Resolve page/font text streams by role, not their declared /Subtype."""
     from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NullObject, StreamObject
@@ -490,12 +520,36 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
             raise MaterialError() from None
         if reader.is_encrypted:
             raise MaterialError()
+        decoded_bytes = 0
+        decoded_streams: set[int] = set()
+
+        def account_stream(obj):
+            nonlocal decoded_bytes
+            if "/F" in obj:
+                raise MaterialError()
+            if id(obj) in decoded_streams:
+                return
+            codecs = obj.get("/Filter")
+            codecs = [] if codecs is None else codecs if isinstance(codecs, ArrayObject) else [codecs]
+            if any(item not in {"/FlateDecode", "/Fl", "/LZWDecode", "/LZW", "/ASCII85Decode", "/A85",
+                                "/ASCIIHexDecode", "/AHx", "/RunLengthDecode", "/RL"} for item in codecs):
+                raise MaterialError()
+            data = obj.get_data()
+            decoded_bytes += len(data)
+            if len(data) > MAX_XML_BYTES or decoded_bytes > MAX_UNCOMPRESSED_BYTES:
+                raise MaterialError()
+            decoded_streams.add(id(obj))
+
+        containers = []
+        for obj in _pdf_object_streams(reader):
+            # /Subtype /Image cannot exempt an object-stream container.
+            account_stream(obj)
+            containers.append(obj)
         if not 1 <= len(reader.pages) <= MAX_PAGES:
             raise MaterialError()
         content_streams = _pdf_content_stream_ids(reader)
-        stack = [(reader.trailer, 0)]
+        stack = [(reader.trailer, 0), *((obj, 0) for obj in containers)]
         visited: set[tuple[int, int]] = set()
-        decoded_bytes = 0
         steps = 0
         while stack:
             obj, depth = stack.pop()
@@ -517,15 +571,7 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
                     # Image decoding is unnecessary; avoid optional external
                     # codecs. All text/font/form streams have bounded decoding.
                     if id(obj) in content_streams or obj.get("/Subtype") != "/Image":
-                        filters = obj.get("/Filter")
-                        filters = [] if filters is None else filters if isinstance(filters, ArrayObject) else [filters]
-                        if any(item not in {"/FlateDecode", "/Fl", "/LZWDecode", "/LZW", "/ASCII85Decode", "/A85",
-                                            "/ASCIIHexDecode", "/AHx", "/RunLengthDecode", "/RL"} for item in filters):
-                            raise MaterialError()
-                        data = obj.get_data()
-                        decoded_bytes += len(data)
-                        if len(data) > MAX_XML_BYTES or decoded_bytes > MAX_UNCOMPRESSED_BYTES:
-                            raise MaterialError()
+                        account_stream(obj)
                 stack.extend((child, depth + 1) for child in obj.values())
             elif isinstance(obj, ArrayObject):
                 stack.extend((child, depth + 1) for child in obj)
@@ -589,6 +635,11 @@ def _margin_at_least_tenth(best: float, runner_up: float) -> bool:
     return margin >= .10 or math.isclose(margin, .10, rel_tol=0, abs_tol=math.ulp(1.0))
 
 
+def _score_at_least_floor(score: float) -> bool:
+    # Use the same one-ulp allowance as the margin, for weighted-sum roundoff.
+    return score >= .55 or math.isclose(score, .55, rel_tol=0, abs_tol=math.ulp(1.0))
+
+
 def _match_materials(
     slides: Sequence[SlideChange], decks: Sequence[tuple[ReportMaterial, Sequence[DeckPage]]],
     cancellation_event: Event | None = None,
@@ -619,7 +670,7 @@ def _match_materials(
             continue
         score, index, material, page = scores[0]
         runner_up = scores[1][0] if len(scores) > 1 else 0.0
-        if (score >= .55 and _margin_at_least_tenth(score, runner_up)
+        if (_score_at_least_floor(score) and _margin_at_least_tenth(score, runner_up)
                 and title_counts[material.titolo] == 1 and page.number >= last_page.get(index, 0)):
             output[slide_index] = slide.model_copy(update={"material_title": material.titolo, "page": page.number})
             last_page[index] = page.number

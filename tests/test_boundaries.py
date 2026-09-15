@@ -260,3 +260,63 @@ def test_completeness_rejects_words_on_a_generated_pause_side(boundary_index, wo
     setattr(report.boundaries[boundary_index], words_field, ["inventata"] * 5)
 
     assert not has_complete_boundary_evidence(report)
+
+
+@pytest.mark.parametrize("end,start,silences,expected,rule", [
+    (540.2, 543, [SilenceInterval(540.3, 542.9)], 541, "long_pause"),
+    (540.1, 541.5, [SilenceInterval(540.2, 541.4)], 541, "short_pause"),
+    (540.4, 541, [], 540, "no_pause"),
+])
+def test_chapters_in_same_block_share_audio_cut_and_origin_without_pause(end, start, silences, expected, rule):
+    groups = [
+        replace(group(0, end), block_id="b001", chapter_number=1, chapters_in_block=2,
+                boundary_reason="inizio_blocco"),
+        replace(group(start, 1080), block_id="b001", chapter_number=2, chapters_in_block=2,
+                boundary_reason="slide_e_tema", slide_hint_seconds=545),
+    ]
+    result = align_intervention_boundaries(1080, groups, silences)
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, expected), (expected, 1080)]
+    assert len(result.blocks) == 1
+    assert (result.blocks[0].start_seconds, result.blocks[0].end_seconds) == (0, 1080)
+    assert result.interventions[1].boundary_origin.model_dump() == {
+        "motivo_editoriale": "slide_e_tema", "regola_audio": rule, "slide_indizio_seconds": 545,
+    }
+
+
+def test_bunny_fractional_duration_floors_export_and_terminal_provider_rounding():
+    original = group(0, 5789.496)
+    result = align_intervention_boundaries(5789.248, [original], [])
+    assert result.interventions[-1].end_seconds == 5789
+    assert original.segments[-1].words[-1].end_seconds == 5789.496
+    assert has_complete_boundary_evidence(report_for(result, 5789.248))
+    rounded_up = align_intervention_boundaries(5789.9, [group(0, 5789.496)], [])
+    assert rounded_up.interventions[-1].end_seconds == 5789
+    assert has_complete_boundary_evidence(report_for(rounded_up, 5789.9))
+
+
+@pytest.mark.parametrize("changes", [
+    {"chapter_number": 3}, {"chapters_in_block": 3}, {"block_id": "b002"},
+])
+def test_block_alignment_rejects_invalid_child_partition(changes):
+    first = replace(group(0, 540), block_id="b001", chapter_number=1, chapters_in_block=2)
+    second = replace(group(540, 1080), block_id="b001", chapter_number=2, chapters_in_block=2)
+    with pytest.raises(ValueError, match="blocch"):
+        align_intervention_boundaries(1080, [first, replace(second, **changes)], [])
+
+
+def test_completeness_rejects_slide_origin_after_floored_bunny_end():
+    planned = replace(group(0, 539), block_id="b001", chapter_number=1,
+                      chapters_in_block=1, boundary_reason="inizio_blocco")
+    result = align_intervention_boundaries(540.9, [planned], [])
+    report = report_for(result, 540.9)
+    report.interventions[0].boundary_origin.slide_indizio_seconds = 540.5
+    assert not has_complete_boundary_evidence(report)
+
+
+def test_short_pause_adds_half_measured_duration_to_last_word():
+    # The detected silence can begin before the provider's last word ends.
+    # Anchor the half-pause rule to that last word, not the detector midpoint.
+    result = align_intervention_boundaries(
+        40, [group(0, 20.4), group(22, 39)], [SilenceInterval(19.1, 21)],
+    )
+    assert result.boundaries[0].boundary_seconds == 21

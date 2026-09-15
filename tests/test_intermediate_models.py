@@ -3,7 +3,11 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
-from app.intermediate_models import IntermediateReportV11
+from app.intermediate_models import (
+    IntermediateCostV11,
+    IntermediateReportV11,
+    IntermediateSpeechBlockV11,
+)
 
 
 def valid_payload():
@@ -17,19 +21,84 @@ def valid_payload():
         }],
         "video": [{
             "chiave": "v1", "guid": "7f254c4d-fe34-4fd3-a4cf-cda4f447e438",
-            "titolo_bunny": "Governance", "durata_secondi": 60, "ordine": 1,
+            "titolo_bunny": "Governance", "durata_secondi": 600, "ordine": 1,
             "lingua": "italiano", "sinossi": "Sintesi.",
             "interventi": [{
-                "id": "v1-i001", "inizio": "0:00:00", "fine": "0:01:00",
+                "id": "v1-i001", "inizio": "0:00:00", "fine": "0:10:00",
                 "tipo": "intervento", "relatori": ["Gaetano De Vito"],
                 "titolo": "Apertura", "sintesi": "La governance viene introdotta.",
                 "punti_chiave": ["Organi", "Deleghe", "Controlli"],
                 "accesso": "pubblico", "confidenza": .9,
+                "blocco": "b001", "capitolo_numero": 1, "capitoli_blocco": 1,
+                "confine_inizio": {
+                    "motivo_editoriale": "inizio_blocco", "regola_audio": "no_pause",
+                },
             }],
+            "blocchi_parlato": [{
+                "id": "b001", "inizio": "0:00:00", "fine": "0:10:00",
+                "tipo": "intervento", "relatori": ["Gaetano De Vito"],
+                "titolo": "Apertura", "sinossi": "La governance viene introdotta.",
+            }],
+            "costo_stimato": {
+                "valuta": "USD", "minimo": .4, "massimo": .7, "banda_bunny": .01,
+                "trascrizione": .3, "analisi": .09, "criterio": "Stima applicativa.",
+            },
             "slide": [], "materiali": [],
         }],
         "verifiche_richieste": [],
     }
+
+
+def test_v11_retains_factual_blocks_and_cost_contract():
+    model = IntermediateReportV11.model_validate(valid_payload())
+
+    assert model.video[0].blocchi_parlato == [
+        IntermediateSpeechBlockV11(
+            id="b001", inizio="0:00:00", fine="0:10:00", tipo="intervento",
+            relatori=["Gaetano De Vito"], titolo="Apertura",
+            sinossi="La governance viene introdotta.",
+        )
+    ]
+    assert model.video[0].costo_stimato == IntermediateCostV11(
+        minimo=.4, massimo=.7, banda_bunny=.01, trascrizione=.3, analisi=.09,
+        criterio="Stima applicativa.",
+    )
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda data: data["video"][0]["interventi"][0].pop("blocco"),
+    lambda data: data["video"][0]["blocchi_parlato"][0].update(fine="0:10:01"),
+    lambda data: data["video"][0]["blocchi_parlato"].append(
+        deepcopy(data["video"][0]["blocchi_parlato"][0])
+    ),
+    lambda data: data["video"][0]["interventi"][0].update(fine="0:07:59"),
+])
+def test_v11_rejects_incomplete_or_incoherent_granular_contract(mutation):
+    data = valid_payload()
+    mutation(data)
+
+    with pytest.raises(ValidationError):
+        IntermediateReportV11.model_validate(data)
+
+
+def test_v11_requires_pause_or_logistics_to_explain_a_gap_between_blocks():
+    data = valid_payload()
+    video = data["video"][0]
+    video["durata_secondi"] = 1000
+    second_chapter = deepcopy(video["interventi"][0])
+    second_chapter.update(
+        id="v1-i002", inizio="0:10:01", fine="0:16:40", accesso="iscritti",
+        blocco="b002", confine_inizio={
+            "motivo_editoriale": "inizio_blocco", "regola_audio": "no_pause",
+        },
+    )
+    second_block = deepcopy(video["blocchi_parlato"][0])
+    second_block.update(id="b002", inizio="0:10:01", fine="0:16:40")
+    video["interventi"].append(second_chapter)
+    video["blocchi_parlato"].append(second_block)
+
+    with pytest.raises(ValidationError):
+        IntermediateReportV11.model_validate(data)
 
 
 def test_v11_round_trips_exact_contract():
@@ -137,6 +206,8 @@ def test_v11_material_requires_exactly_one_source(sources):
 @pytest.mark.parametrize("start,end", [(10, 20), (0, 5)])
 def test_v11_represents_timeline_gaps_and_overlaps(start, end):
     data = valid_payload()
+    data["video"][0].pop("costo_stimato")
+    data["video"][0]["blocchi_parlato"] = []
     first = data["video"][0]["interventi"][0]
     first.update(inizio="0:00:00", fine="0:00:10")
     second = deepcopy(first)

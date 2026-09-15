@@ -13,6 +13,9 @@ UnitConfidence = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 InterventionKind = Literal[
     "intervento", "saluti", "logistica", "domande", "pausa", "cambio_relatore"
 ]
+BoundaryReason = Literal[
+    "inizio_blocco", "cambio_tema", "slide_e_tema", "cambio_relatore"
+]
 GENERIC_INTERVENTION_SPEAKER = re.compile(
     r"^(?:relatore|speaker)(?:[\s_-]*\d+)?$", re.IGNORECASE
 )
@@ -73,6 +76,44 @@ class SlideChange(ReportModel):
     title: str | None = None
     visible_content: list[str] = Field(default_factory=list)
     confidence: Confidence
+    material_title: str | None = None
+    page: int | None = Field(default=None, ge=1)
+
+
+class ChapterBoundaryOrigin(ReportModel):
+    motivo_editoriale: BoundaryReason
+    regola_audio: Literal["long_pause", "short_pause", "no_pause"]
+    slide_indizio_seconds: Nonnegative | None = None
+
+
+class SpeechBlock(ReportModel):
+    id: str
+    start_seconds: Nonnegative
+    end_seconds: Nonnegative
+    tipo: InterventionKind
+    relatori: list[str] = Field(default_factory=list)
+    titolo: str
+    sinossi: str
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> "SpeechBlock":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("fine deve essere successiva a inizio")
+        return self
+
+
+class ReportMaterial(ReportModel):
+    titolo: str
+    relatore: str | None = None
+    url: str | None = None
+    file: str | None = None
+    pagine: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> "ReportMaterial":
+        if (self.url is None) == (self.file is None):
+            raise ValueError("un materiale richiede esattamente una sorgente")
+        return self
 
 
 class Intervention(ReportModel):
@@ -91,6 +132,10 @@ class Intervention(ReportModel):
     sintesi: str
     punti_chiave: list[str] = Field(default_factory=list)
     confidenza: UnitConfidence
+    block_id: str | None = None
+    chapter_number: int | None = Field(default=None, ge=1)
+    chapters_in_block: int | None = Field(default=None, ge=1)
+    boundary_origin: ChapterBoundaryOrigin | None = None
 
     @field_validator("start_seconds", "end_seconds", mode="before")
     @classmethod
@@ -228,6 +273,10 @@ class AcademyContent(ReportModel):
     uncertainties: list[str]
     interventions: list[Intervention] = Field(default_factory=list)
     boundaries: list[BoundaryEvidence] = Field(default_factory=list)
+    speech_blocks: list[SpeechBlock] = Field(default_factory=list)
+    materials: list[ReportMaterial] = Field(default_factory=list)
+    material_failures: list[str] = Field(default_factory=list)
+    analysis_profile: Literal[1, 2] = 1
     # Application-owned provenance; old stored JSON has no audio verification.
     audio_boundary_version: Annotated[int, Field(strict=True, ge=1, le=1)] | None = None
 

@@ -15,6 +15,42 @@ def load_report() -> AcademyReport:
     return AcademyReport.model_validate(data)
 
 
+def test_report_models_retain_blocks_chapter_origin_and_material_page():
+    from app.models import ChapterBoundaryOrigin, ReportMaterial, SpeechBlock
+
+    origin = ChapterBoundaryOrigin(
+        motivo_editoriale="slide_e_tema",
+        regola_audio="short_pause",
+        slide_indizio_seconds=1369,
+    )
+    chapter = Intervention(
+        id="i001", start_seconds=1369, end_seconds=1931, tipo="intervento",
+        relatori=["Furio D’Andrea"], titolo="Governance delle holding",
+        sintesi="Il capitolo illustra poteri, assemblea e direttive.",
+        punti_chiave=["Poteri", "Assemblea", "Direttive"], confidenza=.9,
+    ).model_copy(update={
+        "block_id": "b003", "chapter_number": 2, "chapters_in_block": 4,
+        "boundary_origin": origin,
+    })
+    block = SpeechBlock(
+        id="b003", start_seconds=862, end_seconds=3135, tipo="intervento",
+        relatori=["Furio D’Andrea"], titolo="Governance delle holding",
+        sinossi="Il blocco tratta poteri, assemblea e direttive.",
+    )
+    material = ReportMaterial(
+        titolo="Slide · Furio D’Andrea", relatore="Furio D’Andrea",
+        url="https://www.assoholding.it/materiali/furio.pptx", pagine=18,
+    )
+    report = load_report().model_copy(update={
+        "interventions": [chapter], "speech_blocks": [block], "materials": [material],
+        "analysis_profile": 2,
+    })
+
+    assert report.interventions[0].boundary_origin == origin
+    assert report.speech_blocks[0].id == "b003"
+    assert report.materials[0].pagine == 18
+
+
 def test_report_fixture_covers_requested_text_report() -> None:
     report = load_report()
     assert len(report.speakers) == 3
@@ -22,10 +58,16 @@ def test_report_fixture_covers_requested_text_report() -> None:
     assert report.slides[0].timestamp_seconds == 95
     assert set(report.model_dump()) == {
         "title", "duration_seconds", "detected_language", "synopsis",
-        "speakers", "slides", "uncertainties", "interventions", "boundaries", "audio_boundary_version", "cost", "bunny_title", "usage",
+        "speakers", "slides", "uncertainties", "interventions", "boundaries",
+        "speech_blocks", "materials", "material_failures", "analysis_profile",
+        "audio_boundary_version", "cost", "bunny_title", "usage",
     }
     assert report.interventions == []
     assert report.boundaries == []
+    assert report.speech_blocks == []
+    assert report.materials == []
+    assert report.material_failures == []
+    assert report.analysis_profile == 1
     assert report.audio_boundary_version is None
 
 

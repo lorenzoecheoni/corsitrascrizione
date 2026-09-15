@@ -87,6 +87,19 @@ Academy. Le nuove informazioni sono additive. I report già archiviati
 continuano a essere leggibili; per ottenere blocchi e capitoli un vecchio
 video deve essere rianalizzato.
 
+### Durata autorevole
+
+`video[].durata_secondi` deriva esclusivamente da `length` restituito dalla
+libreria Bunny. Durate lette da FFmpeg, playlist, traccia audio o provider di
+trascrizione servono soltanto alla diagnostica e non possono sostituirla. Il
+contratto Academy usa secondi interi: il tool applica una sola normalizzazione
+conservativa al secondo intero senza mai arrotondare oltre la durata Bunny e
+usa lo stesso valore come limite massimo di blocchi, capitoli e slide.
+
+Nessun `fine` può superare `durata_secondi`. Una discrepanza sub-secondo, come
+248 millisecondi aggiuntivi misurati nella traccia audio, viene assorbita dal
+clamp finale e non modifica la durata ufficiale esportata.
+
 ### Blocchi di parlato
 
 Ogni video aggiunge `blocchi_parlato`, in ordine cronologico. Un blocco è una
@@ -102,7 +115,7 @@ Esempio:
   "inizio": "0:14:22",
   "fine": "0:52:15",
   "tipo": "intervento",
-  "relatori": ["Furio d'Andrea"],
+  "relatori": ["Furio D’Andrea"],
   "titolo": "Governance delle holding",
   "sinossi": "Il blocco affronta poteri societari, decisioni assembleari e direttive della holding."
 }
@@ -134,7 +147,7 @@ Esempio:
   "inizio": "0:22:49",
   "fine": "0:32:11",
   "tipo": "intervento",
-  "relatori": ["Furio d'Andrea"],
+  "relatori": ["Furio D’Andrea"],
   "titolo": "Le decisioni assembleari",
   "sinossi": "Il capitolo esamina competenze dei soci, quorum e modalità decisionali alternative.",
   "confine_inizio": {
@@ -178,10 +191,15 @@ diventa mai un file.
 Per il video Governance il registro iniziale userà gli URL ufficiali già
 presenti nell'import Academy esistente:
 
-- Furio d'Andrea:
+- Furio D’Andrea:
   `https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx`;
 - Luigi Morra:
   `https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx`.
+
+I titoli destinati alla piattaforma sono rispettivamente
+`Slide · Furio D’Andrea` e `Slide · Luigi Morra`. L'etichetta dell'inventario
+può servire a trovare la sorgente, ma non viene copiata automaticamente come
+titolo pubblico.
 
 Il registro locale è una fonte curata per i corsi già migrati; per i corsi
 successivi prevalgono URL o hyperlink presenti nel foglio inventario.
@@ -233,6 +251,58 @@ secondo le regole editoriali già definite.
 
 Il motore non taglia mai a forza soltanto per rispettare la durata.
 
+### Copertura temporale e accesso
+
+I capitoli collegati allo stesso blocco formano una partizione completa del
+blocco: il primo inizia con il blocco, l'ultimo finisce con il blocco e ogni
+fine interna coincide con l'inizio successivo. Non sono ammessi buchi o
+sovrapposizioni all'interno del blocco.
+
+Fra due blocchi un intervallo è ammesso solo quando la timeline lo dichiara
+esplicitamente come `logistica` o `pausa`. Un intervallo non classificato
+produce `TEMPI_INCOERENTI`, quindi rende il report `da_verificare`.
+
+Nell'intero report esiste esattamente un capitolo didattico con
+`accesso: "pubblico"`. Deve essere di tipo `intervento`, durare da 8 a 15
+minuti e non contenere soltanto saluti. Tutti gli altri capitoli e segmenti
+hanno `accesso: "iscritti"`. Il capitolo pubblico è il candidato unico per
+anteprima gratuita e hero; il report non assegna `pubblico` a un ripiego fuori
+misura.
+
+### Identificatori e ripetibilità
+
+Gli identificatori vengono assegnati soltanto dopo la normalizzazione finale
+della timeline, in ordine cronologico e con tie-break deterministici:
+`v1-b001` per i blocchi e `v1-i001` per i segmenti/capitoli. Configurazione del
+modello, prompt, soglie, ordinamenti e scelta fra candidati equivalenti sono
+versionati e deterministici.
+
+Due analisi complete dello stesso GUID e della stessa revisione Bunny, con la
+stessa versione del motore, devono produrre gli stessi identificatori, lo
+stesso numero di capitoli e confini che differiscono al massimo di un secondo.
+Il collaudo esegue realmente entrambe le analisi e confronta i JSON
+normalizzati; il requisito non viene affidato soltanto a test sintetici.
+
+### Costo nel JSON
+
+Ogni elemento di `video` aggiunge `costo_stimato`, derivato dallo stesso
+`CostEstimate` salvato dal lavoro:
+
+```json
+{
+  "valuta": "USD",
+  "minimo": 0.31,
+  "massimo": 0.45,
+  "banda_bunny": 0.02,
+  "trascrizione": 0.25,
+  "analisi": 0.07,
+  "criterio": "Stima da contatori API disponibili; non è una fattura."
+}
+```
+
+Gli importi sono stime, non valori di fatturazione, ma il JSON deve consentire
+di leggerli senza accedere al pannello del tool.
+
 ## Confini audio
 
 Restano valide le regole già concordate:
@@ -271,6 +341,12 @@ La riconciliazione segue criteri deterministici:
 Quando una persona ha sia una qualifica professionale sia una funzione nel
 video, il ruolo le conserva entrambe in forma leggibile, per esempio
 `Avvocato; moderatore`.
+
+Per ogni persona riconosciuta nel Registro il report usa sia il nome canonico
+del Registro sia il relativo `slug`; lo slug non viene ricostruito dal nome.
+Nel video Governance, in particolare, la voce è `Furio D’Andrea` con apostrofo
+tipografico e `slug: "furio-dandrea"`. Tutti i riferimenti interni usano la
+stessa grafia per evitare la creazione di doppioni durante l'import.
 
 ## Recupero e analisi dei materiali
 
@@ -324,6 +400,10 @@ Oltre ai codici già esistenti vengono introdotti:
 accessibili. Un'etichetta priva di sorgente non viene emessa come materiale e
 genera lo stesso avviso con messaggio esplicito “sorgente reale assente”.
 
+`INTERVENTO_LUNGO` non è mai critico e non blocca stato, download o import: lo
+schema Academy tollera capitoli fino a 40 minuti e la decisione di un eventuale
+taglio manuale resta al destinatario del report.
+
 ## Sicurezza e persistenza
 
 - Video, audio, trascrizione parola-per-parola, fotogrammi e deck restano
@@ -345,7 +425,7 @@ Lo sviluppo procede per test-first:
 4. fallback `INTERVENTO_LUNGO` quando non esiste una chiusura valida;
 5. slide usata come indizio ma confine collocato sul silenzio vicino;
 6. sinossi distinta per ogni capitolo;
-7. alias onorifici di Furio d'Andrea, Luigi Morra e Antonio Sibilia ricondotti
+7. alias onorifici di Furio D’Andrea, Luigi Morra e Antonio Sibilia ricondotti
    a cinque persone totali nel video di riferimento;
 8. caso omonimo che resta separato e genera `ALIAS_RELATORE_AMBIGUO`;
 9. cella con hyperlink Google conservata come URL reale;
@@ -353,7 +433,13 @@ Lo sviluppo procede per test-first:
 11. PPTX e PDF sintetici con associazione pagina verificata;
 12. pagina ambigua che genera `SLIDE_NON_ABBINATA`;
 13. serializzazione e validazione dell'intero report intermedio;
-14. assenza di artefatti temporanei dopo successo, errore e cancellazione.
+14. durata Bunny conservata e clamp di tutti i tempi al suo secondo finale;
+15. un solo accesso pubblico, didattico e compreso fra 8 e 15 minuti;
+16. copertura completa di ogni blocco e classificazione degli intervalli fra
+    blocchi;
+17. costo stimato serializzato nel JSON;
+18. stabilità di identificatori e confini su due analisi equivalenti;
+19. assenza di artefatti temporanei dopo successo, errore e cancellazione.
 
 ## Collaudo sul video Governance
 
@@ -361,17 +447,21 @@ Dopo i test locali e la pubblicazione:
 
 1. rianalizzare il GUID `7f254c4d-fe34-4fd3-a4cf-cda4f447e438`;
 2. verificare che le persone siano esattamente Vincenzo Manfredi, Gaetano De
-   Vito, Furio d'Andrea, Antonio Sibilia e Luigi Morra;
+   Vito, Furio D’Andrea, Antonio Sibilia e Luigi Morra, con nomi e slug del
+   Registro;
 3. verificare che nessun intervento usi `Avvocato`, `Dottor` o altri alias;
-4. verificare che il blocco di Furio d'Andrea resti visibile come blocco lungo
+4. verificare che il blocco di Furio D’Andrea resti visibile come blocco lungo
    e produca capitoli distinti;
 5. verificare una struttura attesa di circa 10–12 capitoli, preferibilmente da
    8–10 minuti, senza trasformare questa quantità in un vincolo artificiale;
-6. verificare URL reali per i deck di Furio d'Andrea e Luigi Morra;
+6. verificare URL reali per i deck di Furio D’Andrea e Luigi Morra;
 7. verificare `materiale` e `pagina` sulle slide abbinate;
 8. verificare tutti i `CONFINE` e l'origine dei tagli;
 9. validare gli export JSON, Markdown e testo;
-10. lasciare invariati sia il corso pubblicato sia la bozza
+10. eseguire una seconda analisi completa con la stessa versione del motore e
+    verificare stessi identificatori e confini entro un secondo;
+11. verificare un solo capitolo pubblico da 8–15 minuti e il costo nel JSON;
+12. lasciare invariati sia il corso pubblicato sia la bozza
     `/academy/governance-holding-report-15-09/`.
 
 Il nuovo report servirà per creare una terza versione Academy e confrontare le
@@ -386,12 +476,20 @@ Il lavoro è accettato quando:
 - ogni capitolo riferisce il proprio blocco e ha una sinossi specifica;
 - ogni taglio interno ha motivazione editoriale, regola audio e verifica
   contestuale;
+- la durata esportata proviene da Bunny e nessun tempo la supera;
+- ogni blocco è coperto integralmente dai propri capitoli e ogni intervallo fra
+  blocchi è dichiarato come logistica o pausa;
 - i capitoli sono normalmente 8–15 minuti, con preferenza 8–10 e nessun taglio
   forzato;
 - i capitoli sopra 20 minuti hanno `INTERVENTO_LUNGO`;
-- il video Governance espone cinque persone canoniche senza alias onorifici;
+- esiste esattamente un capitolo pubblico didattico da 8–15 minuti;
+- il video Governance espone cinque persone canoniche senza alias onorifici,
+  con nomi e slug del Registro;
 - nessun materiale fittizio viene esportato;
 - le slide abbinate espongono materiale reale e pagina;
+- il costo stimato è presente nel JSON;
+- due analisi equivalenti mantengono identificatori uguali e confini entro un
+  secondo;
 - l'elaborazione reale del video Governance termina con successo e gli export
   risultano validi e scaricabili;
 - nessun corso Academy esistente viene modificato.

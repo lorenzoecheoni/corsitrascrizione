@@ -127,14 +127,19 @@ livello fattuale che consente di ricostruire il webinar originale.
 ### Capitoli/interventi granulari
 
 La lista `interventi` continua a essere la linea del tempo operativa usata per
-creare le lezioni. Ogni elemento aggiunge:
+creare le lezioni. Ogni elemento parlato aggiunge:
 
 - `blocco`: identificativo del blocco di origine;
 - `capitolo_numero`: posizione del capitolo nel blocco;
 - `capitoli_blocco`: numero totale di capitoli del blocco;
-- `sinossi`: descrizione specifica del capitolo, non copia della sinossi del
+- `sintesi`: sinossi specifica del capitolo, non copia della sinossi del
   blocco;
 - `confine_inizio`, assente soltanto sul primo elemento assoluto.
+
+I segmenti di gap `pausa` e `logistica` collocati fra due blocchi non hanno un
+blocco di parlato di origine: per questi soli tipi `blocco`,
+`capitolo_numero` e `capitoli_blocco` sono assenti. Restano comunque elementi
+espliciti della timeline e partecipano alle verifiche `CONFINE`.
 
 Esempio:
 
@@ -149,7 +154,7 @@ Esempio:
   "tipo": "intervento",
   "relatori": ["Furio D’Andrea"],
   "titolo": "Le decisioni assembleari",
-  "sinossi": "Il capitolo esamina competenze dei soci, quorum e modalità decisionali alternative.",
+  "sintesi": "Il capitolo esamina competenze dei soci, quorum e modalità decisionali alternative.",
   "confine_inizio": {
     "motivo_editoriale": "slide_e_tema",
     "regola_audio": "short_pause",
@@ -473,7 +478,8 @@ riferimento per i corsi successivi.
 Il lavoro è accettato quando:
 
 - il report conserva sia i blocchi fattuali sia i capitoli editoriali;
-- ogni capitolo riferisce il proprio blocco e ha una sinossi specifica;
+- ogni capitolo riferisce il proprio blocco e ha una `sintesi` specifica che
+  costituisce la sinossi editoriale del capitolo;
 - ogni taglio interno ha motivazione editoriale, regola audio e verifica
   contestuale;
 - la durata esportata proviene da Bunny e nessun tempo la supera;

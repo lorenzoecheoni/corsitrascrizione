@@ -462,6 +462,38 @@ def test_narrative_matcher_does_not_corrupt_names_identifiers_or_sentence_bounda
         ) == text
 
 
+@pytest.mark.parametrize("text", [
+    "mario morra", "mArIo MORRA", "fabio d’andrea", "fAbIo D’ANDREA",
+    "Morra2", "_Morra", "Morra\u0301",
+])
+def test_narrative_surname_alias_protection_is_case_and_unicode_independent(
+    text: str,
+) -> None:
+    assert reporting.correct_speaker_name_mentions(
+        text,
+        ["Luigi Morra", "Furio D’Andrea"],
+        {"morra": "Luigi Morra", "d andrea": "Furio D’Andrea"},
+    ) == text
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("morra", "Luigi Morra"),
+    ("MORRA", "Luigi Morra"),
+    ("D'Andrea", "Furio D’Andrea"),
+    ("d ’ andrea", "Furio D’Andrea"),
+    ("intervento di morra", "intervento di Luigi Morra"),
+    ("con d ’ andrea", "con Furio D’Andrea"),
+])
+def test_truly_bare_surname_aliases_still_rewrite(
+    text: str, expected: str,
+) -> None:
+    assert reporting.correct_speaker_name_mentions(
+        text,
+        ["Luigi Morra", "Furio D’Andrea"],
+        {"morra": "Luigi Morra", "d andrea": "Furio D’Andrea"},
+    ) == expected
+
+
 def test_ambiguous_aliases_are_not_rewritten_in_narrative_text() -> None:
     assert reporting.correct_speaker_name_mentions(
         "Dott. Morra e Morra",

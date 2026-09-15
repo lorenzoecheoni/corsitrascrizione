@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 from uuid import UUID
 import re
+import unicodedata
 
 from app import academy_registry
 from app.academy_registry import (
@@ -26,6 +27,12 @@ _SAFE_NAME_SEPARATOR = re.compile(r"^[\s'’\-]{0,4}$")
 _HONORIFIC_SEPARATOR = re.compile(r"^\s{0,1}\.\s{0,2}$")
 _NAME_CONTEXT_SEPARATOR = re.compile(r"^[\s.'’\-]{1,4}$")
 _HONORIFIC_ABBREVIATION_KEYS = {"avv", "dott", "prof"}
+_STANDALONE_ALIAS_CONNECTORS = {
+    "a", "ad", "ai", "al", "agli", "alla", "alle", "allo",
+    "con", "da", "dai", "dal", "dagli", "dalla", "dalle", "dallo",
+    "di", "dei", "del", "degli", "della", "delle", "dello",
+    "e", "ed", "fra", "o", "od", "per", "su", "tra",
+}
 _VIDEO_ROLE_KEYS = {"moderatore", "moderatrice"}
 _SURNAME_PARTICLES = {
     "d", "da", "dal", "dalla", "dalle", "de", "dei", "del", "della",
@@ -79,9 +86,15 @@ def _is_safe_name_separator(separator: str, previous_word: str) -> bool:
 
 
 def _has_unicode_word_boundaries(value: str, start: int, end: int) -> bool:
+    def continues_word(character: str) -> bool:
+        return bool(
+            _WORD_CHARACTER.fullmatch(character)
+            or unicodedata.category(character).startswith("M")
+        )
+
     return not (
-        (start > 0 and _WORD_CHARACTER.fullmatch(value[start - 1]))
-        or (end < len(value) and _WORD_CHARACTER.fullmatch(value[end]))
+        (start > 0 and continues_word(value[start - 1]))
+        or (end < len(value) and continues_word(value[end]))
     )
 
 
@@ -94,26 +107,16 @@ def _is_surname_only_alias(alias_key: str, target: str) -> bool:
     )
 
 
-def _has_capitalized_name_context(
-    value: str, words: Sequence[re.Match[str]], start_index: int, end_index: int,
+def _has_full_name_context(
+    value: str, words: Sequence[re.Match[str]], start_index: int,
 ) -> bool:
-    neighbours = []
-    if start_index > 0:
-        previous = words[start_index - 1]
-        neighbours.append((
-            previous,
-            value[previous.end():words[start_index].start()],
-        ))
-    if end_index + 1 < len(words):
-        following = words[end_index + 1]
-        neighbours.append((
-            following,
-            value[words[end_index].end():following.start()],
-        ))
-    return any(
-        word.group()[0].isupper()
-        and _NAME_CONTEXT_SEPARATOR.fullmatch(separator)
-        for word, separator in neighbours
+    if start_index == 0:
+        return False
+    previous = words[start_index - 1]
+    separator = value[previous.end():words[start_index].start()]
+    return bool(
+        _NAME_CONTEXT_SEPARATOR.fullmatch(separator)
+        and _name_key(previous.group()) not in _STANDALONE_ALIAS_CONNECTORS
     )
 
 
@@ -161,8 +164,8 @@ def correct_speaker_name_mentions(
                 and _has_unicode_word_boundaries(value, start, end)
                 and not (
                     _is_surname_only_alias(alias_key, target)
-                    and _has_capitalized_name_context(
-                        value, words, start_index, end_index,
+                    and _has_full_name_context(
+                        value, words, start_index,
                     )
                 )
             ):
@@ -293,63 +296,88 @@ def _canonical_identity(
     return parsed.name, len(candidates) > 1
 
 
-def _role_rank(role: str | None, *, honorific: bool = False) -> int:
-    if role is None:
-        return 0
-    if honorific:
-        return 2
-    return 1 if _name_key(role) == "relatore" else 3
+@dataclass
+class _RoleState:
+    professional: str | None = None
+    professional_rank: int = 0
+    professional_organization: bool = False
+    video: str | None = None
+    video_organization: bool = False
 
 
-def _adds_compatible_organization(current: str | None, candidate: str | None) -> bool:
-    if current is None or candidate is None or _ASSOHOLDING_ROLE.fullmatch(current):
-        return False
-    match = _ASSOHOLDING_ROLE.fullmatch(candidate)
-    return bool(
-        match and _name_key(match.group("role")) == _name_key(current)
-    )
+def _add_professional_role(
+    state: _RoleState, role: str, rank: int, organization: bool,
+) -> None:
+    if rank > state.professional_rank:
+        state.professional = role
+        state.professional_rank = rank
+        state.professional_organization = organization
+    elif (
+        rank == state.professional_rank
+        and state.professional is not None
+        and _name_key(role) == _name_key(state.professional)
+    ):
+        state.professional_organization |= organization
 
 
-def _combined_professional_and_video_role(
-    current: str | None, candidate: str | None,
-) -> str | None:
-    if current is None or candidate is None:
-        return None
-    current_match = _ASSOHOLDING_ROLE.fullmatch(current)
-    candidate_match = _ASSOHOLDING_ROLE.fullmatch(candidate)
-    current_role = current_match.group("role") if current_match else current
-    candidate_role = candidate_match.group("role") if candidate_match else candidate
-    parts = []
-    seen = set()
-    for role in (*current_role.split(";"), *candidate_role.split(";")):
-        role = role.strip()
-        key = _name_key(role)
-        if key and key != "relatore" and key not in seen:
-            seen.add(key)
-            parts.append(role)
-    professional = [role for role in parts if _name_key(role) not in _VIDEO_ROLE_KEYS]
-    video = [role for role in parts if _name_key(role) in _VIDEO_ROLE_KEYS]
-    if len(professional) != 1 or len(video) != 1:
-        return None
-    organization = (
-        " di Assoholding" if current_match or candidate_match else ""
-    )
-    return f"{professional[0]}; {video[0]}{organization}"
-
-
-def _occurrence_role(
-    occurrence: _SpeakerOccurrence, honorific: str | None,
-) -> tuple[str | None, int]:
-    explicit = occurrence.role
-    if explicit is None:
-        return honorific, _role_rank(honorific, honorific=honorific is not None)
-    if _name_key(explicit) == "relatore" and honorific is not None:
-        return honorific, _role_rank(honorific, honorific=True)
+def _role_state(occurrence: _SpeakerOccurrence, honorific: str | None) -> _RoleState:
+    state = _RoleState()
     if honorific is not None:
-        combined = _combined_professional_and_video_role(honorific, explicit)
-        if combined is not None:
-            return combined, _role_rank(combined)
-    return explicit, _role_rank(explicit)
+        _add_professional_role(state, honorific, 2, False)
+    if occurrence.role is None:
+        return state
+
+    organization_match = _ASSOHOLDING_ROLE.fullmatch(occurrence.role)
+    role_text = (
+        organization_match.group("role")
+        if organization_match is not None else occurrence.role
+    )
+    has_organization = organization_match is not None
+    for part in role_text.split(";"):
+        role = part.strip()
+        key = _name_key(role)
+        if not key:
+            continue
+        if key in _VIDEO_ROLE_KEYS:
+            if state.video is None:
+                state.video = role
+                state.video_organization = has_organization
+            elif key == _name_key(state.video):
+                state.video_organization |= has_organization
+            continue
+        rank = 1 if key == "relatore" else 3
+        _add_professional_role(state, role, rank, has_organization)
+    return state
+
+
+def _merge_role_states(current: _RoleState, candidate: _RoleState) -> None:
+    if candidate.professional is not None:
+        _add_professional_role(
+            current, candidate.professional, candidate.professional_rank,
+            candidate.professional_organization,
+        )
+    if candidate.video is not None:
+        if current.video is None:
+            current.video = candidate.video
+            current.video_organization = candidate.video_organization
+        elif _name_key(current.video) == _name_key(candidate.video):
+            current.video_organization |= candidate.video_organization
+
+
+def _render_role_state(state: _RoleState) -> str | None:
+    professional = (
+        state.professional
+        if state.professional_rank > 1 or state.video is None else None
+    )
+    parts = [part for part in (professional, state.video) if part is not None]
+    if not parts:
+        return None
+    has_organization = (
+        (professional is not None and state.professional_organization)
+        or (state.video is not None and state.video_organization)
+    )
+    suffix = " di Assoholding" if has_organization else ""
+    return f"{'; '.join(parts)}{suffix}"
 
 
 def _deduplicated_names(names: Iterable[str], canonical_by_key: dict[str, str]) -> list[str]:
@@ -407,13 +435,13 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
     canonical_names = list(dict.fromkeys(canonical_by_key.values()))
     merged: dict[str, ReconciledSpeaker] = {}
     evidence_keys: dict[str, set[tuple[str, float | None, str]]] = {}
-    role_ranks: dict[str, int] = {}
+    role_states: dict[str, _RoleState] = {}
     for occurrence, canonical in occurrence_identities:
         parsed = parse_speaker_identity(occurrence.raw_name)
-        role, role_rank = _occurrence_role(occurrence, parsed.honorific)
+        role_state = _role_state(occurrence, parsed.honorific)
         speaker = ReconciledSpeaker(
             display_name=canonical,
-            role=role,
+            role=None,
             confidence=occurrence.confidence,
             evidence=[evidence.model_copy(deep=True) for evidence in occurrence.evidence],
             origins=[] if occurrence.origin == "profile" else [occurrence.origin],
@@ -429,7 +457,7 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         key = _name_key(speaker.display_name)
         if key not in merged:
             merged[key] = speaker
-            role_ranks[key] = role_rank
+            role_states[key] = role_state
             evidence_keys[key] = {
                 (evidence.kind, evidence.timestamp_seconds, evidence.note)
                 for evidence in speaker.evidence
@@ -438,17 +466,7 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         current = merged[key]
         if _CONFIDENCE_RANK[speaker.confidence] > _CONFIDENCE_RANK[current.confidence]:
             current.confidence = speaker.confidence
-        combined_role = _combined_professional_and_video_role(
-            current.role, speaker.role,
-        )
-        if combined_role is not None:
-            current.role = combined_role
-            role_ranks[key] = 3
-        elif role_rank > role_ranks[key]:
-            current.role = speaker.role
-            role_ranks[key] = role_rank
-        elif _adds_compatible_organization(current.role, speaker.role):
-            current.role = speaker.role
+        _merge_role_states(role_states[key], role_state)
         for evidence in speaker.evidence:
             evidence_key = (evidence.kind, evidence.timestamp_seconds, evidence.note)
             if evidence_key not in evidence_keys[key]:
@@ -457,6 +475,8 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         for origin in speaker.origins:
             if origin not in current.origins:
                 current.origins.append(origin)
+    for key, speaker in merged.items():
+        speaker.role = _render_role_state(role_states[key])
     return SpeakerReconciliation(list(merged.values()), canonical_by_key, ambiguous_aliases)
 
 

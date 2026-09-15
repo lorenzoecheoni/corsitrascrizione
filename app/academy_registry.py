@@ -11,15 +11,22 @@ _HONORIFIC = re.compile(
     r"professoressa|professore|prof\.?)\s+",
     re.IGNORECASE,
 )
+_SPACED_DOTTED_INITIAL = re.compile(
+    r"(?<![a-z])(?P<initial>[a-z])\s+\.(?=\s*[a-z])",
+)
+_IDENTITY_KEY_TOKEN = re.compile(r"[a-z]\.(?=\s*[a-z])|[a-z]+")
 
 
 def person_key(value: str) -> str:
-    """Return the accent-, punctuation- and spacing-insensitive identity key."""
+    """Normalize identity text while preserving a single-letter dotted initial."""
     folded = "".join(
         character for character in unicodedata.normalize("NFKD", value.casefold())
         if not unicodedata.combining(character)
     )
-    return " ".join(re.findall(r"[a-z]+", folded))
+    folded = _SPACED_DOTTED_INITIAL.sub(
+        lambda match: f"{match.group('initial')}.", folded,
+    )
+    return " ".join(_IDENTITY_KEY_TOKEN.findall(folded))
 
 
 @dataclass(frozen=True)

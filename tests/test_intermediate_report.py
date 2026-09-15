@@ -1,4 +1,5 @@
 import json
+from itertools import permutations
 from pathlib import Path
 import socket
 import threading
@@ -793,6 +794,43 @@ def test_organization_qualification_combines_with_compatible_video_role() -> Non
     assert speaker.organizzazione == "Assoholding"
 
 
+@pytest.mark.parametrize("professional_role,expected_organization", [
+    ("Commercialista", None),
+    ("Commercialista di Assoholding", "Assoholding"),
+])
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+def test_role_specificity_is_independent_from_evidence_order(
+    professional_role: str, expected_organization: str | None,
+    order: tuple[int, int, int],
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    profiles = [
+        SpeakerProfile(
+            id="luigi-fallback", display_name="Dottor Morra", role="Relatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Titolo onorifico."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+        SpeakerProfile(
+            id="luigi-professional", display_name="Luigi Morra",
+            role=professional_role, confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica specifica."}],
+        ),
+    ]
+    report.speakers = [profiles[index] for index in order]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Commercialista; moderatore"
+    assert speaker.organizzazione == expected_organization
+
+
 def test_honorific_remains_fallback_and_incompatible_specific_role_keeps_first() -> None:
     report = make_report([
         make_intervention(0, 600, relatori=["Dott. Antonio Sibilia"]),
@@ -876,6 +914,39 @@ def test_unresolved_case_and_punctuation_variants_share_one_stable_display() -> 
         "L'alias relatore Morra corrisponde a più persone: "
         "mantenere l'identità separata fino alla verifica nel Registro."
     ]
+
+
+def test_dotted_initial_stays_distinct_from_apostrophe_surname_variants() -> None:
+    names = [
+        "Furio D’Andrea", "Domenico Andrea", "Dott. D. Andrea",
+        "DOTT. d .   ANDREA", "D'Andrea", "D ’ Andrea",
+    ]
+    report = make_report([
+        make_intervention(index * 120, (index + 1) * 120, relatori=[name])
+        for index, name in enumerate(names)
+    ])
+    report.speakers = []
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [(speaker.nome, speaker.slug) for speaker in result.relatori] == [
+        ("Furio D’Andrea", "furio-dandrea"),
+        ("Domenico Andrea", None),
+        ("D. Andrea", None),
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Furio D’Andrea"], ["Domenico Andrea"], ["D. Andrea"],
+        ["D. Andrea"], ["Furio D’Andrea"], ["Furio D’Andrea"],
+    ]
+    assert all(
+        check.codice != "ALIAS_RELATORE_AMBIGUO" or "D. Andrea" not in check.messaggio
+        for check in result.verifiche_richieste
+    )
+    assert any(
+        check.codice == "RELATORE_NON_NEL_REGISTRO"
+        and "D. Andrea" in check.messaggio
+        for check in result.verifiche_richieste
+    )
 
 
 def test_resolved_material_alias_rewrites_title_and_speaker_with_complete_map() -> None:

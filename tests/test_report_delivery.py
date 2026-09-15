@@ -15,6 +15,7 @@ from app.intermediate_report import build_intermediate_report
 from app.models import AcademyReport
 from app.jobs import JobState, JobStore
 from app.main import build_services
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 from app.web import router
 from report_delivery_support import assert_http_exports, assert_report_delivery
 import test_live_bunny as live_bunny
@@ -135,3 +136,161 @@ def test_live_bunny_acceptance_path_uses_real_store_and_downloads_offline(tmp_pa
         live_bunny.test_real_bunny_video_produces_valid_report(settings, monkeypatch)
         completed = services.store.list_completed()
         assert len(completed) == 1 and completed[0].report == report
+
+
+def _timed_private_transcription():
+    segments = []
+    for number in range(2):
+        words = [TranscriptWord(
+            text=f"spoken{number}{index:04d}",
+            start_seconds=number * 1860 + index * .93,
+            end_seconds=number * 1860 + index * .93 + .7,
+            diarization_label="A", confidence=.99,
+        ) for index in range(2000)]
+        segments.append(TranscriptSegment(
+            start_seconds=number * 1860, end_seconds=(number + 1) * 1860,
+            text=" ".join(word.text for word in words), words=words,
+            diarization_label="A", source_utterance_id=f"synthetic-{number}",
+        ))
+    return TranscriptionResult(text="", segments=segments, audio_seconds=3720, provider="assemblyai")
+
+
+def _live_privacy_case(tmp_path, monkeypatch, report, *, private="TEST_PRIVATE_PASSWORD"):
+    """Real acceptance/store/auth/downloads; replace only remote work."""
+    workspace = tmp_path / "media"
+    workspace.mkdir()
+    settings = Settings(_env_file=None, bunny_library_id=123, bunny_stream_api_key="test-only",
+        bunny_cdn_hostname="cdn.example.invalid", openai_api_key="test-only",
+        app_password=private, database_path=str(tmp_path / "reports.sqlite3"),
+        temp_root=str(workspace), assemblyai_api_key=None)
+    services = build_services(settings)
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title=report.title, duration_seconds=3720)
+    transcription = _timed_private_transcription()
+    monkeypatch.setattr(services.bunny, "get_metadata", lambda _: metadata)
+    monkeypatch.setattr(services.analyzer, "analyze", lambda *args, **kwargs: report)
+    # analyze_fast delegates to analyze, which the live audit wraps at runtime.
+    monkeypatch.setattr(services.pipeline, "run", lambda source, progress:
+        services.analyzer.analyze_fast(metadata, transcription, [], silence_intervals=[]))
+    monkeypatch.setattr(live_bunny, "build_services", lambda _: services)
+    monkeypatch.setenv("BUNNY_SAMPLE_VIDEO_URL", f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    downloads = []
+
+    def observe_client(app):
+        client = TestClient(app)
+        client.event_hooks["response"].append(lambda response: downloads.append(
+            (response.status_code, response.headers.get("content-type", ""))))
+        return client
+
+    monkeypatch.setattr(live_bunny, "TestClient", observe_client)
+    return settings, services, transcription, downloads
+
+
+def _assert_static_live_rejection(settings, monkeypatch):
+    with pytest.raises(pytest.fail.Exception) as caught:
+        live_bunny.test_real_bunny_video_produces_valid_report(settings, monkeypatch)
+    assert str(caught.value) == "Live analysis failed; inspect only sanitized application diagnostics"
+    assert caught.value.pytrace is False
+
+
+@pytest.mark.parametrize("excerpt", ["whole_segment", "reformatted_window"])
+def test_live_audit_rejects_one_segment_or_substantial_excerpt(tmp_path, monkeypatch, caplog, capsys, excerpt):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    settings, services, transcription, downloads = _live_privacy_case(tmp_path, monkeypatch, report)
+    if excerpt == "whole_segment":
+        report.synopsis = transcription.segments[0].text
+    else:
+        report.synopsis = "Sintesi: " + ",\n".join(
+            word.text.upper() for word in transcription.segments[1].words[700:764])
+    _assert_static_live_rejection(settings, monkeypatch)
+    assert services.store.list_completed() == []
+    assert downloads == []
+    captured = capsys.readouterr()
+    assert "spoken" not in (captured.out + captured.err + caplog.text).casefold()
+
+
+@pytest.mark.parametrize("private", ['PRIVATE_SECRET_"quoted"', "PRIVATE_SECRET_new\nline", 'PRIVATE_SECRET_é🔒\x01'],
+                         ids=["quoted", "newline", "unicode_control"])
+@pytest.mark.parametrize("location", ["persisted_only", "exported_evidence"])
+def test_live_audit_rejects_escaped_secrets_in_decoded_json(
+    tmp_path, monkeypatch, caplog, capsys, private, location,
+):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    if location == "persisted_only":
+        report.uncertainties.append(private)
+    else:
+        report.speakers[0].evidence[0].note = private
+    settings, services, _, downloads = _live_privacy_case(tmp_path, monkeypatch, report, private=private)
+    _assert_static_live_rejection(settings, monkeypatch)
+    assert services.store.list_completed() == []
+    assert downloads == []
+    captured = capsys.readouterr()
+    output = captured.out + captured.err + caplog.text
+    assert "PRIVATE_SECRET_" not in output
+    assert private not in output
+    assert json.dumps(private)[1:-1] not in output
+
+
+@pytest.mark.parametrize("mutation", ["whole_segment_as_word", "contradictory_audio_rule"])
+def test_live_audit_rejects_noncompact_or_contradictory_boundary_evidence(tmp_path, monkeypatch, mutation):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    settings, services, transcription, downloads = _live_privacy_case(tmp_path, monkeypatch, report)
+    if mutation == "whole_segment_as_word":
+        report.boundaries[0].words_before[0] = transcription.segments[0].text
+    else:
+        report.boundaries[0].rule = "long_pause"
+    _assert_static_live_rejection(settings, monkeypatch)
+    assert services.store.list_completed() == []
+    assert downloads == []
+
+
+def test_live_audit_allows_actual_five_plus_five_boundary_words(tmp_path, monkeypatch):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    settings, services, transcription, downloads = _live_privacy_case(tmp_path, monkeypatch, report)
+    words = [word for segment in transcription.segments for word in segment.words]
+    for evidence in report.boundaries:
+        evidence.words_before = [word.text for word in words
+                                 if word.end_seconds <= evidence.boundary_seconds][-5:]
+        evidence.words_after = [word.text for word in words
+                                if word.start_seconds >= evidence.boundary_seconds][:5]
+    live_bunny.test_real_bunny_video_produces_valid_report(settings, monkeypatch)
+    assert services.store.list_completed()[0].report == report
+    assert [status for status, _ in downloads] == [200, 200, 200, 200]
+    assert {media_type.split(";")[0] for _, media_type in downloads} == {
+        "application/json", "text/markdown", "text/plain",
+    }
+
+
+@pytest.mark.parametrize("mutation", ["two_thousand_words", "multiple_words", "long_token",
+    "long_side", "control_character", "punctuation_only", "short_without_pause", "rule"])
+def test_boundary_compactness_does_not_depend_on_transcript_leak_detection(mutation):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    boundary = report.boundaries[0]
+    if mutation == "two_thousand_words":
+        boundary.words_before[0] = " ".join(["unrelated"] * 2000)
+    elif mutation == "multiple_words":
+        boundary.words_before[0] = "three actual words"
+    elif mutation == "long_token":
+        boundary.words_before[0] = "x" * 256
+    elif mutation == "long_side":
+        boundary.words_before = ["x" * 64] * 5
+    elif mutation == "control_character":
+        boundary.words_before[0] = "hidden\x01control"
+    elif mutation == "punctuation_only":
+        boundary.words_before[0] = "----"
+    elif mutation == "short_without_pause":
+        boundary.words_before.pop()
+    else:
+        boundary.rule = "long_pause"
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title=report.title, duration_seconds=3720)
+    with pytest.raises((AssertionError, ValueError)):
+        assert_report_delivery(report, metadata)
+
+
+@pytest.mark.parametrize("word_count", [0, 1, 4])
+def test_compact_boundary_pause_semantics_remain_exportable(word_count):
+    report = AcademyReport.model_validate_json(FIXTURE.read_text())
+    report.boundaries[0].words_before = report.boundaries[0].words_before[:word_count]
+    report.boundaries[0].pause_before = True
+    metadata = BunnyVideoMetadata(video_id=VIDEO_ID, title=report.title, duration_seconds=3720)
+    bodies = assert_report_delivery(report, metadata)
+    assert all("(pausa)" in body for body in bodies.values())

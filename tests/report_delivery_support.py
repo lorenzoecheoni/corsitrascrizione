@@ -1,11 +1,60 @@
 """Shared offline/live acceptance checks; never write or print report content."""
 
+from collections import deque
+import hashlib
 import json
 import math
+import re
+import unicodedata
 
 from app.intermediate_models import IntermediateReportV11
 from app.intermediate_report import build_intermediate_report
 from app.reporting import render_markdown, render_text
+
+
+def decoded_strings(value):
+    """Walk decoded JSON values; serialized escaping is not a privacy boundary."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from decoded_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from decoded_strings(child)
+
+
+def assert_private_values_absent(value, private_values):
+    secrets = tuple(private for private in private_values if private)
+    for text in decoded_strings(value):
+        if any(private in text for private in secrets):
+            raise AssertionError("Private value in report")
+
+
+def _transcript_windows(text):
+    # A fixed 32-word window detects substantial excerpts despite punctuation,
+    # spacing, case or Unicode presentation changes; 5+5 proof words stay below
+    # the threshold. Only SHA-256 fingerprints survive source observation.
+    words = deque(maxlen=32)
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    for match in re.finditer(r"[^\W_]+", normalized):
+        words.append(match.group())
+        if len(words) == 32:
+            yield hashlib.sha256("\0".join(words).encode("utf-8")).digest()
+
+
+class TranscriptLeakAudit:
+    def __init__(self):
+        self._windows = set()
+
+    def observe(self, transcription):
+        for segment in transcription.segments:
+            self._windows.update(_transcript_windows(segment.text))
+
+    def assert_absent(self, value):
+        for text in decoded_strings(value):
+            if any(window in self._windows for window in _transcript_windows(text)):
+                raise AssertionError("Transient transcript excerpt in report")
 
 
 def assert_no_transient_fields(value):
@@ -20,6 +69,20 @@ def assert_no_transient_fields(value):
     elif isinstance(value, list):
         for child in value:
             assert_no_transient_fields(child)
+
+
+def _assert_compact_boundary_side(words, pause):
+    # Storage uses an empty list plus pause=True for the exported '(pausa)'
+    # sentinel. Fewer than five words also require that explicit pause flag.
+    if (type(pause) is not bool or not isinstance(words, list) or len(words) > 5
+            or (len(words) < 5 and not pause)):
+        raise AssertionError("Invalid compact boundary word count")
+    if any(not isinstance(word, str) or not 1 <= len(word) <= 64
+           or not word.isprintable() or any(character.isspace() for character in word)
+           or not any(character.isalnum() for character in word) for word in words):
+        raise AssertionError("Boundary evidence must contain individual bounded words")
+    if len(" ".join(words)) > 240:
+        raise AssertionError("Boundary excerpt exceeds compact character limit")
 
 
 def assert_granular_analysis(report, bunny_duration):
@@ -67,6 +130,12 @@ def assert_granular_analysis(report, bunny_duration):
             for item in report.boundaries] == [
         (left.id, right.id, left.end_seconds) for left, right in zip(chapters, chapters[1:])
     ]
+    for evidence, following in zip(report.boundaries, chapters[1:], strict=True):
+        _assert_compact_boundary_side(evidence.words_before, evidence.pause_before)
+        _assert_compact_boundary_side(evidence.words_after, evidence.pause_after)
+        if (following.boundary_origin is not None
+                and following.boundary_origin.regola_audio != evidence.rule):
+            raise AssertionError("Chapter origin contradicts its boundary audio rule")
     assert all(0 <= slide.timestamp_seconds <= end for slide in report.slides)
     assert all(0 <= evidence.timestamp_seconds <= end
                for speaker in report.speakers for evidence in speaker.evidence
@@ -74,9 +143,12 @@ def assert_granular_analysis(report, bunny_duration):
     assert_no_transient_fields(json.loads(report.model_dump_json()))
 
 
-def assert_report_delivery(report, metadata, *, private_values=()):
+def assert_report_delivery(report, metadata, *, private_values=(), transcript_audit=None):
     assert_granular_analysis(report, metadata.duration_seconds)
     snapshot = report.model_dump_json()
+    assert_private_values_absent(json.loads(snapshot), private_values)
+    if transcript_audit is not None:
+        transcript_audit.assert_absent(json.loads(snapshot))
     exported = build_intermediate_report(report, metadata.video_id)
     serialized = exported.model_dump_json(by_alias=True, exclude_none=True)
     assert IntermediateReportV11.model_validate_json(serialized) == exported
@@ -111,21 +183,24 @@ def assert_report_delivery(report, metadata, *, private_values=()):
             assert section in bodies[extension]
         assert all(item.id in bodies[extension] for item in [*video.blocchi_parlato, *video.interventi])
     assert_no_transient_fields(json.loads(serialized))
-    for private in private_values:
-        if private:
-            assert private not in snapshot
-            assert all(private not in body for body in bodies.values())
+    assert_private_values_absent([json.loads(serialized), bodies["md"], bodies["txt"]], private_values)
+    if transcript_audit is not None:
+        transcript_audit.assert_absent([json.loads(serialized), bodies["md"], bodies["txt"]])
     assert report.model_dump_json() == snapshot
     return bodies
 
 
-def assert_http_exports(client, job_id, bodies):
+def assert_http_exports(client, job_id, bodies, *, private_values=(), transcript_audit=None):
     for extension, media_type in (("json", "application/json"), ("md", "text/markdown"),
                                   ("txt", "text/plain")):
         response = client.get(f"/jobs/{job_id}/report.{extension}")
         assert response.status_code == 200
         assert response.headers["content-type"].startswith(media_type)
         assert "attachment" in response.headers["content-disposition"]
+        decoded = response.json() if extension == "json" else response.text
+        assert_private_values_absent(decoded, private_values)
+        if transcript_audit is not None:
+            transcript_audit.assert_absent(decoded)
         if extension == "json":
             assert response.json() == json.loads(bodies[extension])
             assert client.get(f"/jobs/{job_id}/report.json").content == response.content

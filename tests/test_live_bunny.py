@@ -1,5 +1,6 @@
 """Explicitly opt-in paid integration test. Never publish live inputs or output."""
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -14,7 +15,9 @@ from app.jobs import JobState
 from app.logging_config import configure_logging
 from app.main import build_services, create_app
 from app.models import AcademyReport
-from report_delivery_support import assert_http_exports, assert_report_delivery
+from report_delivery_support import (
+    TranscriptLeakAudit, assert_http_exports, assert_private_values_absent, assert_report_delivery,
+)
 
 
 @pytest.fixture
@@ -48,16 +51,18 @@ def test_real_bunny_video_produces_valid_report(live_settings, monkeypatch):
                           live_settings.bunny_stream_api_key, live_settings.bunny_token_auth_key,
                           live_settings.app_password, live_settings.temp_root]
         analyze = services.analyzer.analyze
+        transcript_audit = TranscriptLeakAudit()
 
         def audit_transient_input(metadata, transcription, *args, **kwargs):
-            private_values.append(" ".join(segment.text for segment in transcription.segments))
+            transcript_audit.observe(transcription)
             return analyze(metadata, transcription, *args, **kwargs)
 
         monkeypatch.setattr(services.analyzer, "analyze", audit_transient_input)
         report = services.pipeline.run(source, lambda percent, message: None)
         validated = AcademyReport.model_validate_json(report.model_dump_json())
         assert list(Path(live_settings.temp_root).iterdir()) == []
-        bodies = assert_report_delivery(validated, metadata, private_values=private_values)
+        bodies = assert_report_delivery(validated, metadata, private_values=private_values,
+                                        transcript_audit=transcript_audit)
 
         canonical_source = (
             f"https://iframe.mediadelivery.net/embed/{live_settings.bunny_library_id}/{reference.video_id}"
@@ -70,14 +75,18 @@ def test_real_bunny_video_produces_valid_report(live_settings, monkeypatch):
             persisted, = database.execute(
                 "SELECT report_json FROM jobs WHERE id = ?", (str(job.id),),
             ).fetchone()
+        assert_private_values_absent(json.loads(persisted), private_values)
+        transcript_audit.assert_absent(json.loads(persisted))
         restored = AcademyReport.model_validate_json(persisted)
         assert restored == validated
-        assert assert_report_delivery(restored, metadata, private_values=private_values) == bodies
+        assert assert_report_delivery(restored, metadata, private_values=private_values,
+                                      transcript_audit=transcript_audit) == bodies
         monkeypatch.setattr("app.main.build_services", lambda _: services)
         app = create_app(live_settings)
         with TestClient(app) as client:
             client.cookies.set(SESSION_COOKIE, issue_session(app.state.session_key))
-            assert_http_exports(client, job.id, bodies)
+            assert_http_exports(client, job.id, bodies, private_values=private_values,
+                                transcript_audit=transcript_audit)
         assert services.store.get(job.id).report == validated
     except Exception:
         raise pytest.fail.Exception(

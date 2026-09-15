@@ -20,6 +20,11 @@ _ASSOHOLDING_ROLE = re.compile(
     r"^(?P<role>.*?)\s+di\s+(?:ass holding|asso holding|assholding|assoholding)\s*$",
     re.IGNORECASE,
 )
+_TEXT_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
+_SAFE_NAME_SEPARATOR = re.compile(r"^[\s.'’\-]{0,4}$")
+_VIDEO_ROLE_KEYS = {"moderatore", "moderatrice"}
+
+
 @dataclass
 class ReconciledSpeaker:
     display_name: str
@@ -38,19 +43,6 @@ class SpeakerReconciliation:
 
 def _name_key(value: str) -> str:
     return person_key(value)
-
-
-def _name_pattern(value: str) -> re.Pattern[str] | None:
-    tokens = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:['’][A-Za-zÀ-ÖØ-öø-ÿ]+)?", value)
-    if len(tokens) < 2:
-        return None
-    def token_pattern(token: str) -> str:
-        return r"['’]".join(re.escape(part) for part in re.split(r"['’]", token))
-
-    surname = r"\s+".join(
-        token_pattern(token) for token in tokens[1:]
-    )
-    return re.compile(rf"\b[A-Za-zÀ-ÖØ-öø-ÿ]+\s+{surname}\b", re.IGNORECASE)
 
 
 def canonical_speaker_name_map(names: Sequence[str]) -> dict[str, str]:
@@ -72,35 +64,54 @@ def correct_speaker_name_mentions(
     value: str,
     canonical_names: Sequence[str],
     canonical_by_key: dict[str, str] | None = None,
+    *,
+    ambiguous_aliases: Sequence[str] = (),
 ) -> str:
-    """Correct exact normalized names and explicit aliases in narrative text."""
-    corrected = value
+    """Rewrite resolved normalized alias spans without crossing prose punctuation."""
     name_map = canonical_by_key or canonical_speaker_name_map(canonical_names)
-    replacements: dict[str, str] = {}
-    for canonical in canonical_names:
-        person = find_registry_person(canonical)
-        allowed_keys = (
-            set(person.identity_keys) if person is not None else {_name_key(canonical)}
-        )
-        allowed_keys.update(
-            key for key, target in name_map.items() if target == canonical
-        )
-        pattern = _name_pattern(canonical)
-        if pattern is None:
+    canonical_keys = {_name_key(name) for name in canonical_names}
+    ambiguous_keys = {_name_key(name) for name in ambiguous_aliases}
+    resolved_aliases = {
+        key: target
+        for key, target in name_map.items()
+        if key and _name_key(target) in canonical_keys
+        and _name_key(target) not in ambiguous_keys
+    }
+    if not resolved_aliases:
+        return value
+
+    words = list(_TEXT_WORD.finditer(value))
+    max_tokens = max(len(key.split()) for key in resolved_aliases)
+    replacements: list[tuple[int, int, str]] = []
+    start_index = 0
+    while start_index < len(words):
+        normalized_tokens: list[str] = []
+        best: tuple[int, str] | None = None
+        for end_index in range(start_index, min(len(words), start_index + max_tokens)):
+            if end_index > start_index:
+                separator = value[words[end_index - 1].end():words[end_index].start()]
+                if _SAFE_NAME_SEPARATOR.fullmatch(separator) is None:
+                    break
+            normalized_tokens.append(_name_key(words[end_index].group()))
+            target = resolved_aliases.get(" ".join(normalized_tokens))
+            if target is not None:
+                best = end_index, target
+        if best is None:
+            start_index += 1
             continue
+        end_index, target = best
+        replacements.append((words[start_index].start(), words[end_index].end(), target))
+        start_index = end_index + 1
 
-        def replace(match: re.Match[str]) -> str:
-            key = _name_key(match.group())
-            if key not in allowed_keys:
-                return match.group()
-            placeholder = f"\x00speaker-{len(replacements)}\x00"
-            replacements[placeholder] = name_map.get(key, canonical)
-            return placeholder
-
-        corrected = pattern.sub(replace, corrected)
-    for placeholder, target in replacements.items():
-        corrected = corrected.replace(placeholder, target)
-    return corrected
+    if not replacements:
+        return value
+    pieces = []
+    cursor = 0
+    for start, end, target in replacements:
+        pieces.extend((value[cursor:start], target))
+        cursor = end
+    pieces.append(value[cursor:])
+    return "".join(pieces)
 
 
 def _name_origins(evidence: Sequence[Evidence]) -> list[str]:
@@ -153,17 +164,34 @@ def _is_generic_name(value: str) -> bool:
     return bool(GENERIC_SPEAKER_LABEL.fullmatch(value.strip()))
 
 
+def _proper_suffix_keys(identity_key: str) -> tuple[str, ...]:
+    tokens = identity_key.split()
+    return tuple(" ".join(tokens[index:]) for index in range(1, len(tokens)))
+
+
 def _report_people(occurrences: Sequence[_SpeakerOccurrence]) -> dict[str, str]:
-    registry_surnames = {
-        person.surname_key for person in academy_registry.REGISTRY_PEOPLE
+    possible_surnames = {
+        suffix
+        for person in academy_registry.REGISTRY_PEOPLE
+        for suffix in _proper_suffix_keys(_name_key(person.nome))
     }
+    possible_surnames.update(
+        suffix
+        for occurrence in occurrences
+        if parse_speaker_identity(occurrence.raw_name).honorific is None
+        for suffix in _proper_suffix_keys(
+            _name_key(parse_speaker_identity(occurrence.raw_name).name)
+        )
+    )
     people: dict[str, str] = {}
     for occurrence in occurrences:
         parsed = parse_speaker_identity(occurrence.raw_name)
         key = _name_key(parsed.name)
         if not key or _is_generic_name(parsed.name) or find_registry_person(parsed.name):
             continue
-        if key in registry_surnames or len(key.split()) < 2:
+        if len(key.split()) < 2:
+            continue
+        if parsed.honorific is not None and key in possible_surnames:
             continue
         people.setdefault(key, parsed.name)
     return people
@@ -171,15 +199,16 @@ def _report_people(occurrences: Sequence[_SpeakerOccurrence]) -> dict[str, str]:
 
 def _surname_candidates(report_people: dict[str, str]) -> dict[str, list[tuple[str, str]]]:
     candidates: dict[str, list[tuple[str, str]]] = {}
-    for person in academy_registry.REGISTRY_PEOPLE:
-        candidates.setdefault(person.surname_key, []).append(
-            (_name_key(person.nome), person.nome)
-        )
-    for key, name in report_people.items():
-        surname = " ".join(key.split()[1:])
+    people = [
+        (_name_key(person.nome), person.nome)
+        for person in academy_registry.REGISTRY_PEOPLE
+    ]
+    people.extend(report_people.items())
+    for key, name in people:
         candidate = (key, name)
-        if candidate not in candidates.setdefault(surname, []):
-            candidates[surname].append(candidate)
+        for surname in _proper_suffix_keys(key):
+            if candidate not in candidates.setdefault(surname, []):
+                candidates[surname].append(candidate)
     return candidates
 
 
@@ -218,6 +247,30 @@ def _adds_compatible_organization(current: str | None, candidate: str | None) ->
     )
 
 
+def _combined_professional_and_video_role(
+    current: str | None, candidate: str | None,
+) -> str | None:
+    if (
+        current is None or candidate is None
+        or _ASSOHOLDING_ROLE.fullmatch(current)
+        or _ASSOHOLDING_ROLE.fullmatch(candidate)
+    ):
+        return None
+    parts = []
+    seen = set()
+    for role in (*current.split(";"), *candidate.split(";")):
+        role = role.strip()
+        key = _name_key(role)
+        if key and key != "relatore" and key not in seen:
+            seen.add(key)
+            parts.append(role)
+    professional = [role for role in parts if _name_key(role) not in _VIDEO_ROLE_KEYS]
+    video = [role for role in parts if _name_key(role) in _VIDEO_ROLE_KEYS]
+    if len(professional) != 1 or len(video) != 1:
+        return None
+    return f"{professional[0]}; {video[0]}"
+
+
 def _deduplicated_names(names: Iterable[str], canonical_by_key: dict[str, str]) -> list[str]:
     result = []
     seen = set()
@@ -244,6 +297,8 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
     surname_candidates = _surname_candidates(report_people)
     canonical_by_key: dict[str, str] = {}
     ambiguous_aliases: list[str] = []
+    ambiguous_keys: set[str] = set()
+    stable_display_by_key: dict[str, str] = {}
     occurrence_identities: list[tuple[_SpeakerOccurrence, str]] = []
     for occurrence in occurrences:
         parsed = parse_speaker_identity(occurrence.raw_name)
@@ -254,12 +309,18 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         canonical, ambiguous = _canonical_identity(
             occurrence.raw_name, report_people, surname_candidates,
         )
+        canonical = stable_display_by_key.setdefault(_name_key(canonical), canonical)
         canonical_by_key[_name_key(occurrence.raw_name)] = canonical
         if not ambiguous:
             canonical_by_key.setdefault(_name_key(parsed.name), canonical)
-        elif parsed.name not in ambiguous_aliases:
-            ambiguous_aliases.append(parsed.name)
+        elif _name_key(canonical) not in ambiguous_keys:
+            ambiguous_keys.add(_name_key(canonical))
+            ambiguous_aliases.append(canonical)
         canonical_by_key.setdefault(_name_key(canonical), canonical)
+        registry_person = find_registry_person(canonical)
+        if registry_person is not None:
+            for alias_key in registry_person.identity_keys:
+                canonical_by_key.setdefault(alias_key, canonical)
         occurrence_identities.append((occurrence, canonical))
 
     canonical_names = list(dict.fromkeys(canonical_by_key.values()))
@@ -280,6 +341,7 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         for evidence in speaker.evidence:
             evidence.note = correct_speaker_name_mentions(
                 evidence.note, canonical_names, canonical_by_key,
+                ambiguous_aliases=ambiguous_aliases,
             )
         for origin in _name_origins(speaker.evidence):
             if origin not in speaker.origins:
@@ -296,11 +358,17 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         current = merged[key]
         if _CONFIDENCE_RANK[speaker.confidence] > _CONFIDENCE_RANK[current.confidence]:
             current.confidence = speaker.confidence
-        if role_rank > role_ranks[key] or _adds_compatible_organization(
-            current.role, speaker.role,
-        ):
+        combined_role = (
+            _combined_professional_and_video_role(current.role, speaker.role)
+            if role_rank == role_ranks[key] == 3 else None
+        )
+        if role_rank > role_ranks[key]:
             current.role = speaker.role
             role_ranks[key] = role_rank
+        elif _adds_compatible_organization(current.role, speaker.role):
+            current.role = speaker.role
+        elif combined_role is not None:
+            current.role = combined_role
         for evidence in speaker.evidence:
             evidence_key = (evidence.kind, evidence.timestamp_seconds, evidence.note)
             if evidence_key not in evidence_keys[key]:
@@ -333,6 +401,7 @@ def build_video_report_payload(report: AcademyReport, guid: UUID) -> dict:
     canonical_by_key = reconciliation.canonical_by_key
     corrected = lambda value: correct_speaker_name_mentions(
         value, canonical_names, canonical_by_key,
+        ambiguous_aliases=reconciliation.ambiguous_aliases,
     )
     speakers = []
     for speaker in unique_speakers:
@@ -424,6 +493,7 @@ def render_markdown(report: AcademyReport) -> str:
     canonical_by_key = reconciliation.canonical_by_key
     corrected = lambda value: correct_speaker_name_mentions(
         value, canonical_names, canonical_by_key,
+        ambiguous_aliases=reconciliation.ambiguous_aliases,
     )
     lines = [
         f"# {corrected(report.title)}",

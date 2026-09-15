@@ -311,6 +311,73 @@ def test_reconciliation_map_covers_block_and_material_speaker_references() -> No
     assert reconciliation.speakers[1].origins == ["inventario"]
 
 
+@pytest.mark.parametrize(("full_names", "alias", "unresolved"), [
+    (("Luigi Morra", "Maria Elena Morra"), "Dottor Morra", "Morra"),
+    (("Elena Morra", "Maria Elena Morra"), "Dottor Morra", "Morra"),
+    (("Maria De Rossi", "Giulia De Rossi"), "Dottor De Rossi", "De Rossi"),
+])
+def test_surname_suffix_collision_with_multiple_given_names_stays_ambiguous(
+    full_names: tuple[str, str], alias: str, unresolved: str,
+) -> None:
+    report = load_report()
+    report.speakers = []
+    report.interventions = [
+        Intervention(
+            id=f"i{index}", start_seconds=index * 600, end_seconds=(index + 1) * 600,
+            tipo="intervento", relatori=[name], titolo="Governance",
+            sintesi="Governance.", punti_chiave=["Organi", "Deleghe", "Controlli"],
+            confidenza=.9,
+        )
+        for index, name in enumerate((*full_names, alias))
+    ]
+
+    reconciliation = reporting.reconcile_speakers_detailed(report)
+
+    assert [speaker.display_name for speaker in reconciliation.speakers] == [
+        *full_names, unresolved,
+    ]
+    assert reconciliation.ambiguous_aliases == [unresolved]
+
+
+def test_normalized_alias_matching_is_bounded_accent_insensitive_and_apostrophe_safe() -> None:
+    aliases = {
+        "dott morra": "Luigi Morra",
+        "morra": "Luigi Morra",
+        "jose nunez": "José Núñez",
+        "fulvio d andrea": "Furio D’Andrea",
+    }
+    canonical = ["Luigi Morra", "José Núñez", "Furio D’Andrea"]
+
+    assert reporting.correct_speaker_name_mentions(
+        "Dott. Morra e Morra", canonical, aliases,
+    ) == "Luigi Morra e Luigi Morra"
+    assert reporting.correct_speaker_name_mentions(
+        "Jose Nunez", canonical, aliases,
+    ) == "José Núñez"
+    assert reporting.correct_speaker_name_mentions(
+        "Fulvio D ' Andrea", canonical, aliases,
+    ) == "Furio D’Andrea"
+    assert reporting.correct_speaker_name_mentions(
+        "Fulvio D ’ Andrea", canonical, aliases,
+    ) == "Furio D’Andrea"
+    assert reporting.correct_speaker_name_mentions(
+        "Morradale preMorra DAndrea", canonical, aliases,
+    ) == "Morradale preMorra DAndrea"
+    widely_separated = "Fulvio" + " " * 20 + "D'Andrea"
+    assert reporting.correct_speaker_name_mentions(
+        widely_separated, canonical, aliases,
+    ) == widely_separated
+
+
+def test_ambiguous_aliases_are_not_rewritten_in_narrative_text() -> None:
+    assert reporting.correct_speaker_name_mentions(
+        "Dott. Morra e Morra",
+        ["Luigi Morra", "Mario Morra", "Morra"],
+        {"dott morra": "Morra", "morra": "Morra"},
+        ambiguous_aliases=["Morra"],
+    ) == "Dott. Morra e Morra"
+
+
 def test_exports_include_named_intervention_speakers_missing_from_profiles() -> None:
     report = load_report()
     report.speakers = report.speakers[:1]

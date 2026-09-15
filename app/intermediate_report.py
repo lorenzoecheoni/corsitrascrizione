@@ -458,6 +458,7 @@ def build_intermediate_report(
     canonical_by_key = reconciliation.canonical_by_key
     corrected = lambda value: correct_speaker_name_mentions(
         value, canonical_names, canonical_by_key,
+        ambiguous_aliases=reconciliation.ambiguous_aliases,
     )
 
     for material in report.materials:

@@ -689,6 +689,60 @@ def test_compatible_explicit_role_keeps_its_evidenced_organization() -> None:
     assert speaker.organizzazione == "Assoholding"
 
 
+def test_professional_qualification_and_moderator_role_are_preserved_separately() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Furio d'Andrea"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio-generic", display_name="Furio d'Andrea",
+            role="Relatore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Presentazione."}],
+        ),
+        SpeakerProfile(
+            id="furio-video", display_name="Furio D’Andrea",
+            role="moderatore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+        SpeakerProfile(
+            id="furio-professional", display_name="Furio D’Andrea",
+            role="Avvocato", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica professionale."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione is None
+
+
+def test_honorific_remains_fallback_and_incompatible_specific_role_keeps_first() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Dott. Antonio Sibilia"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="antonio-first", display_name="Dott. Antonio Sibilia",
+            role="Amministratore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Prima qualifica."}],
+        ),
+        SpeakerProfile(
+            id="antonio-conflict", display_name="Antonio Sibilia",
+            role="Sindaco", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Seconda qualifica."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Amministratore"
+
+    report.speakers = []
+    fallback = build_intermediate_report(report, TARGET_GUID).relatori[0]
+    assert fallback.ruolo == "Dott."
+
+
 def test_surname_only_alias_stays_unresolved_when_report_contains_a_collision() -> None:
     report = make_report([
         make_intervention(0, 120, relatori=["Luigi Morra"]),
@@ -715,6 +769,54 @@ def test_surname_only_alias_stays_unresolved_when_report_contains_a_collision() 
     ]
     assert len(warnings) == 1
     assert "Morra" in warnings[0].messaggio
+
+
+def test_unresolved_case_and_punctuation_variants_share_one_stable_display() -> None:
+    names = [
+        "Luigi Morra", "Mario Morra", "Dottor Morra", "Dott. MORRA",
+        "Rossi", "ROSSI",
+    ]
+    report = make_report([
+        make_intervention(index * 120, (index + 1) * 120, relatori=[name])
+        for index, name in enumerate(names)
+    ])
+    report.speakers = []
+
+    reconciliation = intermediate_report.reconcile_speakers_detailed(report)
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert reconciliation.ambiguous_aliases == ["Morra"]
+    assert [speaker.nome for speaker in result.relatori] == [
+        "Luigi Morra", "Mario Morra", "Morra", "Rossi",
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Luigi Morra"], ["Mario Morra"], ["Morra"], ["Morra"],
+        ["Rossi"], ["Rossi"],
+    ]
+    assert [
+        warning.messaggio for warning in result.verifiche_richieste
+        if warning.codice == "ALIAS_RELATORE_AMBIGUO"
+    ] == [
+        "L'alias relatore Morra corrisponde a più persone: "
+        "mantenere l'identità separata fino alla verifica nel Registro."
+    ]
+
+
+def test_resolved_material_alias_rewrites_title_and_speaker_with_complete_map() -> None:
+    from app.models import ReportMaterial
+
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = []
+    report.materials = [ReportMaterial(
+        titolo="Slide · Dott. Morra", relatore="Dott. Morra", file="morra.pptx",
+    )]
+
+    material = build_intermediate_report(report, TARGET_GUID).video[0].materiali[0]
+
+    assert material.titolo == "Slide · Luigi Morra"
+    assert material.relatore == "Luigi Morra"
 
 
 def test_granular_export_rewrites_block_chapter_slide_and_material_references() -> None:

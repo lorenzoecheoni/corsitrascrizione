@@ -381,7 +381,9 @@ def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
     )
 
     def fail_boundary(*_args, **_kwargs):
-        raise AnalysisError("boundaries", stage="boundary")
+        raise AnalysisError(
+            "boundaries", stage="boundary", detail_code="alignment_overlap",
+        )
 
     components.pipeline.analyzer.analyze = fail_boundary
 
@@ -392,6 +394,7 @@ def test_boundary_failure_has_fixed_text_and_safe_log_code(components, caplog):
     assert str(caught.value) == "Verifica audio dei confini non riuscita; riprova"
     assert "boundaries" in caplog.text
     assert "'phase': 'boundary'" in caplog.text
+    assert "'detail_code': 'alignment_overlap'" in caplog.text
     assert sentinel not in str(caught.value) + caplog.text
 
 

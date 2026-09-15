@@ -76,6 +76,7 @@ class AnalysisError(Exception):
         self, code: str, *, status_code: int | None = None,
         retry_after_seconds: float | None = None,
         stage: AnalysisStage = "consolidation",
+        detail_code: str | None = None,
     ) -> None:
         if stage not in {"visual", "window", "consolidation", "boundary"}:
             raise ValueError("Fase di analisi non valida")
@@ -84,7 +85,28 @@ class AnalysisError(Exception):
         self.code = code
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
+        self.detail_code = detail_code
         self.retryable = code in {"timeout", "rate_limit", "server"}
+
+
+_BOUNDARY_DETAIL_BY_MESSAGE = {
+    "La partizione degli interventi non è valida": "materialize_length",
+    "La partizione degli interventi deve includere ogni segmento": "materialize_empty",
+    "La partizione degli interventi deve essere ordinata, completa e univoca": "materialize_indexes",
+    "La partizione ha un margine di finestra irrisolto": "materialize_margin",
+    "La partizione contiene etichette vocali non appartenenti ai segmenti": "materialize_labels",
+    "La partizione divide una utterance sorgente in gruppi incompatibili": "materialize_source_conflict",
+    "La partizione richiede almeno un secondo": "alignment_invalid",
+    "La partizione parlata non può dichiarare una pausa": "alignment_word_evidence",
+    "La partizione contiene un segmento vuoto o invertito": "alignment_word_evidence",
+    "La partizione contiene una parola vuota": "alignment_word_evidence",
+    "La partizione parlata richiede evidenze parola per parola": "alignment_word_evidence",
+    "La partizione divide una stessa utterance sorgente": "alignment_source_split",
+    "La partizione contiene tempi vocali non validi": "alignment_speech_timing",
+    "La partizione contiene parlato sovrapposto non separabile": "alignment_overlap",
+    "La partizione non ammette un confine intero senza segmenti vuoti": "alignment_quantization",
+    "La partizione non ha confini adiacenti con prova completa": "alignment_incomplete",
+}
 
 
 def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
@@ -172,7 +194,7 @@ def _window_payload(window, hints: Sequence[str], previous_context: dict | None 
         payload["previous_context"] = previous_context
     base_payload = json.dumps(payload, ensure_ascii=False)
     if len(base_payload) > MAX_WINDOW_CHARS:
-        raise AnalysisError("boundaries", stage="boundary")
+        raise AnalysisError("boundaries", stage="boundary", detail_code="window_payload")
     cleaned = list(dict.fromkeys(
         name.strip()[:120] for name in hints[:20]
         if isinstance(name, str) and name.strip()
@@ -411,6 +433,7 @@ class OpenAIAnalyzer:
                 if partition_error and validation_error_code == "boundaries":
                     raise AnalysisError(
                         validation_error_code, stage=validation_error_stage or stage,
+                        detail_code="window_contract",
                     ) from None
                 raise AnalysisError("response", stage=stage) from None
             except (ValueError, TypeError, AttributeError, KeyError):
@@ -433,16 +456,25 @@ class OpenAIAnalyzer:
                     continue
                 raise AnalysisError(
                     validation_error_code, stage=validation_error_stage or stage,
+                    detail_code=(
+                        "window_contract" if validation_error_code == "boundaries" else None
+                    ),
                 )
             if attempts >= 3:
                 raise AnalysisError(
                     validation_error_code, stage=validation_error_stage or stage,
+                    detail_code=(
+                        "window_contract" if validation_error_code == "boundaries" else None
+                    ),
                 )
             # The repair contains no repeated transcript, images or metadata.
             payload = json.dumps({"errors": errors, "previous_json": data}, ensure_ascii=False)
             if len(payload) > max_repair_chars:
                 raise AnalysisError(
                     validation_error_code, stage=validation_error_stage or stage,
+                    detail_code=(
+                        "window_contract" if validation_error_code == "boundaries" else None
+                    ),
                 ) from None
             instructions = REPAIR_PROMPT
             repair_used = True
@@ -480,7 +512,9 @@ class OpenAIAnalyzer:
             try:
                 context = previous_window_context(previous_window, analyses[-1]) if previous_window else None
             except (AttributeError, IndexError, TypeError, ValueError):
-                raise AnalysisError("boundaries", stage="boundary") from None
+                raise AnalysisError(
+                    "boundaries", stage="boundary", detail_code="window_context",
+                ) from None
             analyses.append(self._structured(
                 text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
                 payload=_window_payload(window, speaker_name_hints, context),
@@ -504,8 +538,13 @@ class OpenAIAnalyzer:
                 _supported_window_speaker_names(analyses),
                 silence_intervals,
             )
-        except (AttributeError, TypeError, ValueError):
-            raise AnalysisError("boundaries", stage="boundary") from None
+        except (AttributeError, TypeError, ValueError) as exc:
+            detail_code = _BOUNDARY_DETAIL_BY_MESSAGE.get(
+                str(exc), "materialize_unknown",
+            )
+            raise AnalysisError(
+                "boundaries", stage="boundary", detail_code=detail_code,
+            ) from None
         try:
             payload = build_consolidation_payload(metadata, analyses, slides)
         except ValueError:

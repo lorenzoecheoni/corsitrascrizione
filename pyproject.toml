@@ -15,6 +15,7 @@ dependencies = [
   "pillow>=11,<13",
   "imagehash>=4.3,<5",
   "pydantic-settings>=2.10,<3",
+  "pypdf>=6,<7",
   "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
 ]

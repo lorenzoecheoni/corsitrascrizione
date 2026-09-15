@@ -1,7 +1,26 @@
+from collections.abc import Sequence
+import re
 from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def parse_material_allowed_hosts(value: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize exact DNS hostnames; never interpret URLs, ports or wildcards."""
+    entries = value.split(",") if isinstance(value, str) else value
+    hosts = []
+    for entry in entries:
+        host = entry.strip().lower()
+        if not host:
+            continue
+        if len(host) > 253 or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", host
+        ):
+            raise ValueError("Host materiali non valido")
+        if host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
 
 
 class Settings(BaseSettings):
@@ -22,6 +41,16 @@ class Settings(BaseSettings):
     media_runtime_seconds: float = Field(default=21600, gt=0, allow_inf_nan=False)
     media_inactivity_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
     media_max_workspace_bytes: int = Field(default=2_000_000_000, gt=0)
+    material_allowed_hosts: str = "www.assoholding.it"
+
+    @field_validator("material_allowed_hosts")
+    @classmethod
+    def validate_material_hosts(cls, value: str) -> str:
+        return ",".join(parse_material_allowed_hosts(value))
+
+    @property
+    def parsed_material_allowed_hosts(self) -> tuple[str, ...]:
+        return parse_material_allowed_hosts(self.material_allowed_hosts)
 
     @field_validator("assemblyai_api_key", "google_service_account_json", mode="before")
     @classmethod

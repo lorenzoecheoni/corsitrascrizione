@@ -130,6 +130,11 @@ def _people(value: str) -> list[str]:
 
 
 def _materials(value: str) -> list[str]:
+    source = value.strip()
+    if not source:
+        return []
+    if material_declaration_failure_reason(source) is None:
+        return [source]
     parts = re.split(r"[\n;]+", value)
     return list(dict.fromkeys(part.strip() for part in parts if part.strip()))
 

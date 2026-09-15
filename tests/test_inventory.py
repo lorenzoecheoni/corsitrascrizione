@@ -568,6 +568,87 @@ def test_authenticated_fetch_retains_material_cell_hyperlink() -> None:
     assert "textFormatRuns" in requests[0].url.params["fields"]
 
 
+def test_authenticated_material_url_with_semicolon_is_one_exact_context_candidate() -> None:
+    from app.inventory import inventory_context_for_video
+
+    url = "https://example.test/download?token=abc;def"
+
+    def handle(request: httpx.Request):
+        return httpx.Response(200, json=_grid_sheet_payload(material_cell={
+            "formattedValue": "Slide",
+            "hyperlink": url,
+        }), request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == [f"Slide | {url}"]
+    context = inventory_context_for_video(
+        courses, UUID("00000000-0000-0000-0000-000000000001"),
+        "Corso con hyperlink",
+    )
+    assert context.material_sources == (f"Slide | {url}",)
+    assert context.material_failures == ()
+
+
+def test_standalone_material_url_with_semicolon_is_one_exact_context_candidate() -> None:
+    from app.inventory import inventory_context_for_video
+
+    url = "https://example.test/files;version=2/download"
+    source = (
+        "Titolo,Relatore,Materiali,Link\n"
+        f"Corso standalone,Persona,{url},bunny\n"
+    )
+
+    def handle(request: httpx.Request):
+        return httpx.Response(200, text=source, request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],),
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == [url]
+    context = inventory_context_for_video(
+        courses, UUID("00000000-0000-0000-0000-000000000001"),
+        "Corso standalone",
+    )
+    assert context.material_sources == (f"download | {url}",)
+    assert context.material_failures == ()
+
+
+def test_legacy_material_cell_still_splits_semicolon_separated_bare_labels() -> None:
+    source = (
+        "Titolo,Relatore,Materiali,Link\n"
+        'Corso legacy,Persona,"Slide A; Slide B",bunny\n'
+    )
+
+    def handle(request: httpx.Request):
+        return httpx.Response(200, text=source, request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],),
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == ["Slide A", "Slide B"]
+
+
 def test_authenticated_fetch_uses_one_unambiguous_rich_text_link() -> None:
     def handle(request: httpx.Request):
         return httpx.Response(200, json=_grid_sheet_payload(material_cell={

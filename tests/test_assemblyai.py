@@ -45,6 +45,34 @@ def test_assemblyai_preserves_ordered_word_timing_in_memory():
     ]
 
 
+@pytest.mark.parametrize("word_speaker", [None, "missing"])
+def test_assemblyai_uses_utterance_speaker_when_optional_word_speaker_is_absent(word_speaker):
+    from app.assemblyai import AssemblyAITranscriber
+
+    raw_word = word("Governance", 500, 1500)
+    if word_speaker == "missing":
+        raw_word.pop("speaker")
+    else:
+        raw_word["speaker"] = word_speaker
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 3,
+        "language_code": "it",
+        "text": "Governance.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 500,
+            "end": 1500,
+            "text": "Governance.",
+            "words": [raw_word],
+        }],
+    }, 3)
+
+    assert result.original_segments[0].diarization_label == "assembly:A"
+    assert result.original_segments[0].words[0].diarization_label == "assembly:A"
+
+
 def test_assemblyai_accepts_overlapping_words_and_expands_segment_to_word_evidence():
     from app.assemblyai import AssemblyAITranscriber
 

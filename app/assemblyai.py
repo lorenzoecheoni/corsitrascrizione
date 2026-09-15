@@ -171,7 +171,7 @@ class AssemblyAITranscriber:
             for word_index, raw_word in enumerate(raw_words, start=1):
                 try:
                     word_text = raw_word["text"]
-                    word_speaker = raw_word["speaker"]
+                    word_speaker = raw_word.get("speaker")
                     word_start = float(raw_word["start"]) / 1000
                     word_end = float(raw_word["end"]) / 1000
                     confidence = float(raw_word["confidence"])
@@ -188,7 +188,13 @@ class AssemblyAITranscriber:
                 )
                 if (
                     not isinstance(word_text, str) or not word_text.strip()
-                    or not isinstance(word_speaker, str) or word_speaker.strip() != speaker.strip()
+                    or (
+                        word_speaker is not None
+                        and (
+                            not isinstance(word_speaker, str)
+                            or word_speaker.strip() != speaker.strip()
+                        )
+                    )
                     or not math.isfinite(word_start) or not math.isfinite(word_end)
                     or not math.isfinite(confidence)
                     or word_start < 0

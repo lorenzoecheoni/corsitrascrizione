@@ -21,7 +21,7 @@ from app.config import Settings
 
 _job_id: ContextVar[str | None] = ContextVar("log_job_id", default=None)
 _lock = RLock()
-_PHASES = {"validation", "metadata", "media", "transcription", "analysis", "boundary", "report", "http"}
+_PHASES = {"validation", "metadata", "media", "transcription", "analysis", "materials", "boundary", "report", "http"}
 _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protected_video",
           "unsupported_duration", "media_decode", "transcription", "analysis", "temporary_failure",
           "analysis_rate_limit",
@@ -29,7 +29,7 @@ _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protect
           "analysis_visual_rate_limit", "analysis_window_rate_limit", "analysis_consolidation_rate_limit",
           "boundaries",
           "timeout", "transport", "remote_response", "invalid_request", "unauthorized",
-          "log_suppressed"}
+          "log_suppressed", "MATERIALE_NON_RAGGIUNGIBILE"}
 _DETAIL_CODES = {
     "window_payload", "window_context", "window_contract",
     "materialize_length", "materialize_empty", "materialize_indexes",

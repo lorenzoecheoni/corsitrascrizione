@@ -171,6 +171,10 @@ def _download_https(
                 if not location or hop == 5:
                     raise MaterialError()
                 url = urljoin(url, location)
+                if urlsplit(url).query or urlsplit(url).fragment:
+                    # The public source must not silently resolve to a signed
+                    # location whose identity cannot be safely persisted.
+                    raise MaterialError()
                 connection.close()
                 connection = None
                 continue
@@ -822,7 +826,7 @@ class MaterialProcessor:
                     decks.append((material, pages))
             except CancelledError:
                 raise
-            except Exception:
+            except (MaterialError, OSError):
                 failures.append(_FAILURE)
         failures.extend(_FAILURE for count in Counter(material.titolo for material, _ in decks).values() if count > 1)
         matched = _match_in_workspace(slides, decks, workspace, cancellation_event)

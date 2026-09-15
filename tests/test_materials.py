@@ -274,6 +274,16 @@ def test_redirect_to_forbidden_target_cleans_download(tmp_path, target):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("suffix", ["?token=PRIVATE", "#PRIVATE"])
+def test_sensitive_redirect_cannot_promote_public_source(tmp_path, suffix):
+    with pytest.raises(MaterialError):
+        download(URL, tmp_path / "deck", [
+            Response(302, headers={"location": "/signed.pptx" + suffix}),
+            Response(chunks=[b"PRIVATE-DECK"]),
+        ])
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_redirect_dns_rebinding_is_rejected(tmp_path):
     answers = iter([PUBLIC, "127.0.0.1"])
     def rebinding(host, port, **kwargs):

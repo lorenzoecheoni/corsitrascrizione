@@ -25,6 +25,7 @@ from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
 from app.material_registry import AnalysisInventoryContext
+from app.materials import MaterialProcessor
 from app.pipeline import AnalysisPipeline
 from app.selection import ConfirmationStore
 from app.transcription import OpenAITranscriber
@@ -71,9 +72,6 @@ def build_services(settings: Settings) -> Services:
             inventory.fetch(), metadata.video_id, metadata.title,
         )
 
-    def speaker_hint_provider(metadata):
-        return inventory_context_provider(metadata).speaker_hints
-
     assemblyai = None
     if settings.assemblyai_api_key:
         base_url = (
@@ -85,7 +83,8 @@ def build_services(settings: Settings) -> Services:
     pipeline = AnalysisPipeline(
         settings, bunny, media, transcriber, analyzer,
         fast_transcriber=assemblyai,
-        speaker_hint_provider=speaker_hint_provider,
+        context_provider=inventory_context_provider,
+        material_processor=MaterialProcessor(settings.parsed_material_allowed_hosts),
     )
     store = JobStore(settings.database_path)
     runner = SingleWorkerRunner(store, pipeline.run)

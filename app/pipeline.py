@@ -6,17 +6,21 @@ from concurrent.futures import CancelledError, FIRST_EXCEPTION, ThreadPoolExecut
 from pathlib import Path
 from threading import Event
 from time import monotonic
+from urllib.parse import urlsplit
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
 from app.boundaries import has_complete_boundary_evidence
 from app.assemblyai import AssemblyAITranscriber, WordEvidenceError
 from app.bunny import (BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError,
-                       BunnyPlaybackError, BunnyReadinessError, parse_bunny_url, read_metadata)
+                       BunnyPlaybackError, BunnyReadinessError, BunnyVideoMetadata, parse_bunny_url, read_metadata)
 from app.config import Settings
 from app.costs import estimate_cost
 from app.jobs import JobCancelled
+from app.inventory import InventoryError
 from app.logging_config import log_event
 from app.media import FFmpegProcessor, MediaError, MediaProtectedError, SilenceEvidenceError, temporary_workspace
+from app.material_registry import AnalysisInventoryContext
+from app.materials import MaterialAnalysis, MaterialError, MaterialProcessor
 from app.models import AcademyReport, APIUsage, ProviderUsage
 from app.transcription import OpenAITranscriber, TranscriptionError
 
@@ -89,6 +93,8 @@ class AnalysisPipeline:
         transcriber: OpenAITranscriber, analyzer: OpenAIAnalyzer,
         *, fast_transcriber: AssemblyAITranscriber | None = None,
         speaker_hint_provider: Callable[[object], Sequence[str]] | None = None,
+        context_provider: Callable[[BunnyVideoMetadata], AnalysisInventoryContext] | None = None,
+        material_processor: MaterialProcessor | None = None,
         temp_root: Path | None = None,
     ) -> None:
         self.settings = settings
@@ -98,6 +104,8 @@ class AnalysisPipeline:
         self.fast_transcriber = fast_transcriber
         self.analyzer = analyzer
         self.speaker_hint_provider = speaker_hint_provider
+        self.context_provider = context_provider
+        self.material_processor = material_processor
         self.temp_root = temp_root if temp_root is not None else settings.temp_root
 
     def _run_fast_media_and_transcription(
@@ -159,9 +167,9 @@ class AnalysisPipeline:
         phase = "validation"
         started = monotonic()
 
-        def next_phase(value: str) -> None:
+        def next_phase(value: str, *, error_code: str = "ok") -> None:
             nonlocal phase, started
-            log_event(phase, elapsed_seconds=monotonic() - started)
+            log_event(phase, elapsed_seconds=monotonic() - started, error_code=error_code)
             phase, started = value, monotonic()
 
         def check_cancelled() -> None:
@@ -182,10 +190,22 @@ class AnalysisPipeline:
             next_phase("metadata")
             metadata = read_metadata(self.bunny, str(ref.video_id), event)
             progress(5, "Metadati letti")
+            context = AnalysisInventoryContext((), ())
+            material_failures: list[str] = []
             speaker_name_hints: Sequence[str] = ()
-            if self.speaker_hint_provider is not None:
+            if self.context_provider is not None:
+                try:
+                    context = self.context_provider(metadata)
+                except InventoryError:
+                    material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                check_cancelled()
+                speaker_name_hints = context.speaker_hints
+                material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in context.material_failures)
+            elif self.speaker_hint_provider is not None:
                 try:
                     speaker_name_hints = self.speaker_hint_provider(metadata)
+                except CancelledError:
+                    raise
                 except Exception:
                     # Inventory names improve spelling only; the report must
                     # remain available when the optional sheet cannot be read.
@@ -250,14 +270,45 @@ class AnalysisPipeline:
                         media.silence_intervals if media.silence_measured else None
                     ),
                 }
-                if self.speaker_hint_provider is not None:
+                if self.context_provider is not None or self.speaker_hint_provider is not None:
                     analysis_options["speaker_name_hints"] = speaker_name_hints
                 content = analyze(metadata, transcript, media.frame_candidates, **analysis_options)
-                progress(92, "Preparazione del report")
-                next_phase("report")
+                progress(92, "Verifica dei materiali del corso")
+                next_phase("materials")
+                # AI output cannot promote materials or create verified links.
+                slides = [slide.model_copy(update={"material_title": None, "page": None})
+                          for slide in content.slides]
+                material_analysis = MaterialAnalysis((), tuple(slides), ())
+                if self.material_processor is not None:
+                    try:
+                        material_analysis = self.material_processor.process(
+                            context.material_sources, slides, workspace, event,
+                        )
+                    except MaterialError:
+                        material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                check_cancelled()
+                materials = []
+                for material in material_analysis.materials:
+                    if material.url is not None:
+                        url = urlsplit(material.url)
+                        if url.query or url.fragment or url.username is not None or url.password is not None:
+                            # Removing a signed query would invent an unverified
+                            # URL. Omit this material and its links instead.
+                            material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                            continue
+                    materials.append(material)
+                material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in material_analysis.failures)
+                verified_titles = {material.titolo for material in materials}
+                slides = [original.model_copy(update={
+                    "material_title": matched.material_title if matched.material_title in verified_titles else None,
+                    "page": matched.page if matched.material_title in verified_titles else None,
+                }) for original, matched in zip(slides, material_analysis.slides, strict=True)]
+                progress(96, "Preparazione del report")
+                next_phase("report", error_code="MATERIALE_NON_RAGGIUNGIBILE" if material_failures else "ok")
                 usage = APIUsage(transcription=transcript.usage,
                                  responses=getattr(content, "usage", ProviderUsage()))
-                report = AcademyReport(**content.model_dump(exclude={"usage"}), bunny_title=metadata.title,
+                report = AcademyReport(**content.model_dump(exclude={"usage", "materials", "material_failures", "slides"}),
+                    materials=materials, material_failures=material_failures, slides=slides, bunny_title=metadata.title,
                     usage=usage, cost=estimate_cost(
                         metadata.duration_seconds, media.downloaded_bytes, usage=usage,
                         transcription_provider=transcript.provider,

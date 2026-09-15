@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 from uuid import UUID, uuid4
 import re
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 import pytest
@@ -104,6 +105,67 @@ def test_profile2_downloads_use_only_saved_data_without_network_or_writes(client
         assert response.status_code == 200
         assert "v1-b001" in response.text and "pagina 2" in response.text
     assert store.get(job.id).model_dump_json() == before
+
+
+@pytest.mark.parametrize("directory", ["material-library", "workspace", "media-archive"])
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+@pytest.mark.parametrize("extension", ["json", "md", "txt"])
+def test_real_processed_archived_material_remains_downloadable(client, monkeypatch, directory, absolute, extension):
+    from app.material_registry import AnalysisInventoryContext
+    from app.materials import MaterialProcessor
+    from app.media import temporary_workspace
+    from app.pipeline import _verified_material_result
+    from test_materials import write_test_pptx
+
+    # Put an archive outside OS scratch roots so absolute and relative paths
+    # exercise directory-name validation independently of root exclusions.
+    with TemporaryDirectory(prefix="durable-archive-", dir=Path.cwd()) as archive:
+        source = Path(archive) / "archive" / directory / "Slide · Furio D’Andrea.pptx"
+        source.parent.mkdir(parents=True)
+        write_test_pptx(source, [["Introduzione"], ["Deleghe", "Poteri e deleghe"]])
+        stored_source = str(source if absolute else source.relative_to(Path.cwd()))
+        report = governance_report()
+        snapshot = tuple(slide.model_dump_json() for slide in report.slides)
+        with temporary_workspace(root=Path(archive)) as workspace:
+            analysis = MaterialProcessor().process([stored_source], report.slides, workspace)
+            verified = _verified_material_result(
+                AnalysisInventoryContext((), (stored_source,)), analysis, snapshot,
+                workspace, ("www.assoholding.it",),
+            )
+        assert not verified.failures
+        assert len(verified.materials) == 1
+        assert verified.materials[0].file == stored_source
+        assert verified.materials[0].titolo == "Slide · Furio D'Andrea"
+        assert verified.slides[0].material_title == "Slide · Furio D'Andrea"
+        assert verified.slides[0].page == 2
+        report.materials = list(verified.materials)
+        report.slides = list(verified.slides)
+        report.material_failures = list(verified.failures)
+        store = client.app.state.store
+        job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+        store.update(job.id, state=JobState.PROCESSING)
+        store.update(job.id, state=JobState.COMPLETED, report=report)
+        before = store.get(job.id).model_dump_json()
+        source.unlink()  # Persisted exports must not need to reopen the archive.
+        client.app.state.inventory = client.app.state.bunny = _ForbiddenProvider()
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Persisted downloads must not access material sources")
+        with monkeypatch.context() as offline:
+            offline.setattr("socket.socket.connect", forbidden)
+            offline.setattr("socket.getaddrinfo", forbidden)
+            for method in ("resolve", "is_file", "stat"):
+                offline.setattr(Path, method, forbidden)
+            response = client.get(f"/jobs/{job.id}/report.{extension}")
+            assert response.status_code == 200
+            assert "Slide · Furio D'Andrea" in response.text
+            if extension == "json":
+                video = response.json()["video"][0]
+                assert video["materiali"][0]["file"] == stored_source
+                assert video["materiali"][0]["pagine"] == 2
+                assert video["slide"][0]["pagina"] == 2
+            else:
+                assert "pagina 2" in response.text
+        assert store.get(job.id).model_dump_json() == before
 
 
 def test_legacy_even_with_audio_provenance_requires_granular_reanalysis(client):

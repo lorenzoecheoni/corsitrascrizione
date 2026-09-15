@@ -179,8 +179,11 @@ def _persisted_file_source(source: str) -> str:
     if lowered.startswith(("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/",
                            "/private/var/folders/", "/dev/", "/proc/", "/sys/")):
         raise ValueError()
+    # app.media/app.materials create these directories with tempfile's eight-
+    # character suffix. A prefix alone (e.g. material-library), workspace, or
+    # a repository directory name is not evidence of an ephemeral source.
     if any(re.fullmatch(
-        r"(?:\.worktrees|\.superpowers|workspaces?|(?:workspace|bunny-video|material|material-match|deck-pages|media|split)-.+)",
+        r"(?:bunny-video|material|material-match|deck-pages|media|split)-[a-z0-9_]{8}",
         part, re.IGNORECASE,
     ) for part in parts[:-1]):
         raise ValueError()

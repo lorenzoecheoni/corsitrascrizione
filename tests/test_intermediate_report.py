@@ -2,6 +2,7 @@ import json
 from itertools import permutations
 from pathlib import Path
 import socket
+import tempfile
 from uuid import UUID
 
 import pytest
@@ -129,6 +130,53 @@ def test_profile2_accepts_supported_persisted_material_sources_without_accessing
     result = build_intermediate_report(report, TARGET_GUID)
     assert getattr(result.video[0].materiali[0], field) == expected
     assert result.video[0].slide[0].pagina == 2
+
+
+@pytest.mark.parametrize("directory", [
+    "archive/material-library", "archive/workspace", "archive/media-archive",
+    "archive/workspaces", "archive/.worktrees", "archive/.superpowers",
+    "archive/material-match-guides", "archive/deck-pages-reference", "archive/split-collections",
+    "archive/bunny-video-archive", "archive/material-random", "archive/workspace-a1b2c3d4",
+])
+@pytest.mark.parametrize("root", ["", "/data/"])
+def test_durable_archive_names_are_not_scratch_evidence(monkeypatch, directory, root):
+    report = governance_report()
+    source = f"{root}{directory}/Furio D'Andrea.pptx"
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": source})
+    before = report.model_dump_json()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Archived material checks must not access filesystem or network")
+    with monkeypatch.context() as offline:
+        offline.setattr("socket.socket.connect", forbidden)
+        offline.setattr("socket.getaddrinfo", forbidden)
+        for method in ("resolve", "is_file", "stat"):
+            offline.setattr(Path, method, forbidden)
+        result = build_intermediate_report(report, TARGET_GUID)
+    assert result.video[0].materiali[0].file == source
+    assert result.video[0].slide[0].pagina == 2
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("prefix", ["bunny-video-", "material-", "material-match-", "deck-pages-", "media-", "split-"])
+def test_actual_generated_scratch_names_are_rejected_even_outside_os_scratch_roots(monkeypatch, prefix):
+    # Same tempfile API and prefixes used by app.media/app.materials, not a
+    # handwritten example that might cease to match their generated paths.
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        scratch_name = Path(directory).name
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={
+        "url": None, "file": f"/data/{scratch_name}/PRIVATE_SOURCE_SENTINEL.pptx",
+    })
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Scratch rejection must be syntactic only")
+    with monkeypatch.context() as offline:
+        offline.setattr("socket.socket.connect", forbidden)
+        offline.setattr("socket.getaddrinfo", forbidden)
+        for method in ("resolve", "is_file", "stat"):
+            offline.setattr(Path, method, forbidden)
+        with pytest.raises(ValueError) as caught:
+            build_intermediate_report(report, TARGET_GUID)
+    assert "PRIVATE_SOURCE_SENTINEL" not in str(caught.value)
 
 
 def test_intermediate_json_exposes_blocks_chapters_cost_and_one_public_preview():

@@ -327,13 +327,38 @@ def test_terminal_word_in_bunny_fractional_tail_preserves_raw_evidence(duration,
     assert result == align_intervention_boundaries(duration, [original], [])
 
 
-def test_terminal_word_start_outside_raw_bunny_is_rejected_even_with_earlier_speech():
-    source = group(0, 1080).segments[0]
-    outside_word = TranscriptWord(text="Fuori.", start_seconds=1080.95,
-                                  end_seconds=1081.1, diarization_label="A", confidence=.9)
-    source = source.model_copy(update={"words": [*source.words, outside_word], "end_seconds": 1081.1})
+def test_terminal_word_after_raw_bunny_is_accepted_with_earlier_speech_and_tolerated_skew():
+    source = group(0, 5788).segments[0]
+    terminal_word = TranscriptWord(text="Conclusione.", start_seconds=5789.3,
+                                   end_seconds=5789.496, diarization_label="A", confidence=.9)
+    source = source.model_copy(update={"words": [*source.words, terminal_word], "end_seconds": 5789.496})
+    original = replace(group(0, 5788), segments=(source,), block_id="b001",
+                       chapter_number=1, chapters_in_block=1)
+    before = source.model_dump()
+
+    result = align_intervention_boundaries(5789.248, [original], [])
+
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, 5789)]
+    assert [(block.start_seconds, block.end_seconds) for block in result.blocks] == [(0, 5789)]
+    assert source.model_dump() == before
+    assert source.words[-1] is terminal_word
+    assert (terminal_word.start_seconds, terminal_word.end_seconds) == (5789.3, 5789.496)
+    assert has_complete_boundary_evidence(report_for(result, 5789.248))
+    assert result == align_intervention_boundaries(5789.248, [original], [])
+
+
+def test_terminal_group_after_fractional_bunny_end_without_earlier_speech_is_rejected():
     with pytest.raises(ValueError, match="tempi vocali"):
-        align_intervention_boundaries(1080.9, [replace(group(0, 1080), segments=(source,))], [])
+        align_intervention_boundaries(5789.248, [group(0, 5788), group(5789.3, 5789.496)], [])
+
+
+def test_terminal_provider_skew_above_one_second_is_rejected_despite_earlier_speech():
+    source = group(0, 5788).segments[0]
+    terminal_word = TranscriptWord(text="Conclusione.", start_seconds=5789.3,
+                                   end_seconds=5790.3, diarization_label="A", confidence=.9)
+    source = source.model_copy(update={"words": [*source.words, terminal_word], "end_seconds": 5790.3})
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(5789.248, [replace(group(0, 5788), segments=(source,))], [])
 
 
 def test_standalone_terminal_subsecond_group_cannot_collapse_exported_interval():

@@ -717,6 +717,82 @@ def test_professional_qualification_and_moderator_role_are_preserved_separately(
     assert speaker.organizzazione is None
 
 
+def test_honorific_qualification_beats_generic_explicit_role_after_alias_merge() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Dottor Morra", role="Relatore", confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Presentazione."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.nome == "Luigi Morra"
+    assert speaker.ruolo == "Dottor"
+
+
+def test_honorific_qualification_combines_with_explicit_video_role() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Avvocato Luigi Morra", role="moderatore",
+        confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione is None
+
+
+def test_honorific_qualification_combines_with_video_role_from_separate_evidence() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="luigi-qualification", display_name="Dottor Morra", role="Relatore",
+            confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica esplicita."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Dottor; moderatore"
+
+
+def test_organization_qualification_combines_with_compatible_video_role() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="luigi-professional", display_name="Luigi Morra",
+            role="Avvocato di Assoholding", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica esplicita."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione == "Assoholding"
+
+
 def test_honorific_remains_fallback_and_incompatible_specific_role_keeps_first() -> None:
     report = make_report([
         make_intervention(0, 600, relatori=["Dott. Antonio Sibilia"]),

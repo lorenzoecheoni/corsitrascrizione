@@ -21,8 +21,16 @@ _ASSOHOLDING_ROLE = re.compile(
     re.IGNORECASE,
 )
 _TEXT_WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
-_SAFE_NAME_SEPARATOR = re.compile(r"^[\s.'’\-]{0,4}$")
+_WORD_CHARACTER = re.compile(r"\w", re.UNICODE)
+_SAFE_NAME_SEPARATOR = re.compile(r"^[\s'’\-]{0,4}$")
+_HONORIFIC_SEPARATOR = re.compile(r"^\s{0,1}\.\s{0,2}$")
+_NAME_CONTEXT_SEPARATOR = re.compile(r"^[\s.'’\-]{1,4}$")
+_HONORIFIC_ABBREVIATION_KEYS = {"avv", "dott", "prof"}
 _VIDEO_ROLE_KEYS = {"moderatore", "moderatrice"}
+_SURNAME_PARTICLES = {
+    "d", "da", "dal", "dalla", "dalle", "de", "dei", "del", "della",
+    "delle", "dello", "degli", "di",
+}
 
 
 @dataclass
@@ -60,6 +68,55 @@ def canonical_speaker_name_map(names: Sequence[str]) -> dict[str, str]:
     return canonical
 
 
+def _is_safe_name_separator(separator: str, previous_word: str) -> bool:
+    return bool(
+        _SAFE_NAME_SEPARATOR.fullmatch(separator)
+        or (
+            _name_key(previous_word) in _HONORIFIC_ABBREVIATION_KEYS
+            and _HONORIFIC_SEPARATOR.fullmatch(separator)
+        )
+    )
+
+
+def _has_unicode_word_boundaries(value: str, start: int, end: int) -> bool:
+    return not (
+        (start > 0 and _WORD_CHARACTER.fullmatch(value[start - 1]))
+        or (end < len(value) and _WORD_CHARACTER.fullmatch(value[end]))
+    )
+
+
+def _is_surname_only_alias(alias_key: str, target: str) -> bool:
+    alias_tokens = alias_key.split()
+    target_tokens = _name_key(target).split()
+    return (
+        len(alias_tokens) < len(target_tokens)
+        and target_tokens[-len(alias_tokens):] == alias_tokens
+    )
+
+
+def _has_capitalized_name_context(
+    value: str, words: Sequence[re.Match[str]], start_index: int, end_index: int,
+) -> bool:
+    neighbours = []
+    if start_index > 0:
+        previous = words[start_index - 1]
+        neighbours.append((
+            previous,
+            value[previous.end():words[start_index].start()],
+        ))
+    if end_index + 1 < len(words):
+        following = words[end_index + 1]
+        neighbours.append((
+            following,
+            value[words[end_index].end():following.start()],
+        ))
+    return any(
+        word.group()[0].isupper()
+        and _NAME_CONTEXT_SEPARATOR.fullmatch(separator)
+        for word, separator in neighbours
+    )
+
+
 def correct_speaker_name_mentions(
     value: str,
     canonical_names: Sequence[str],
@@ -86,20 +143,34 @@ def correct_speaker_name_mentions(
     start_index = 0
     while start_index < len(words):
         normalized_tokens: list[str] = []
-        best: tuple[int, str] | None = None
+        best: tuple[int, str, str] | None = None
         for end_index in range(start_index, min(len(words), start_index + max_tokens)):
             if end_index > start_index:
                 separator = value[words[end_index - 1].end():words[end_index].start()]
-                if _SAFE_NAME_SEPARATOR.fullmatch(separator) is None:
+                if not _is_safe_name_separator(
+                    separator, words[end_index - 1].group(),
+                ):
                     break
             normalized_tokens.append(_name_key(words[end_index].group()))
-            target = resolved_aliases.get(" ".join(normalized_tokens))
-            if target is not None:
-                best = end_index, target
+            alias_key = " ".join(normalized_tokens)
+            target = resolved_aliases.get(alias_key)
+            start = words[start_index].start()
+            end = words[end_index].end()
+            if (
+                target is not None
+                and _has_unicode_word_boundaries(value, start, end)
+                and not (
+                    _is_surname_only_alias(alias_key, target)
+                    and _has_capitalized_name_context(
+                        value, words, start_index, end_index,
+                    )
+                )
+            ):
+                best = end_index, target, alias_key
         if best is None:
             start_index += 1
             continue
-        end_index, target = best
+        end_index, target, _ = best
         replacements.append((words[start_index].start(), words[end_index].end(), target))
         start_index = end_index + 1
 
@@ -169,29 +240,21 @@ def _proper_suffix_keys(identity_key: str) -> tuple[str, ...]:
     return tuple(" ".join(tokens[index:]) for index in range(1, len(tokens)))
 
 
-def _report_people(occurrences: Sequence[_SpeakerOccurrence]) -> dict[str, str]:
-    possible_surnames = {
-        suffix
-        for person in academy_registry.REGISTRY_PEOPLE
-        for suffix in _proper_suffix_keys(_name_key(person.nome))
-    }
-    possible_surnames.update(
-        suffix
-        for occurrence in occurrences
-        if parse_speaker_identity(occurrence.raw_name).honorific is None
-        for suffix in _proper_suffix_keys(
-            _name_key(parse_speaker_identity(occurrence.raw_name).name)
-        )
+def _is_incomplete_surname_alias(identity_key: str) -> bool:
+    tokens = identity_key.split()
+    return len(tokens) == 1 or (
+        len(tokens) > 1 and tokens[0] in _SURNAME_PARTICLES
     )
+
+
+def _report_people(occurrences: Sequence[_SpeakerOccurrence]) -> dict[str, str]:
     people: dict[str, str] = {}
     for occurrence in occurrences:
         parsed = parse_speaker_identity(occurrence.raw_name)
         key = _name_key(parsed.name)
         if not key or _is_generic_name(parsed.name) or find_registry_person(parsed.name):
             continue
-        if len(key.split()) < 2:
-            continue
-        if parsed.honorific is not None and key in possible_surnames:
+        if _is_incomplete_surname_alias(key):
             continue
         people.setdefault(key, parsed.name)
     return people
@@ -235,7 +298,7 @@ def _role_rank(role: str | None, *, honorific: bool = False) -> int:
         return 0
     if honorific:
         return 2
-    return 1 if role.casefold() == "relatore" else 3
+    return 1 if _name_key(role) == "relatore" else 3
 
 
 def _adds_compatible_organization(current: str | None, candidate: str | None) -> bool:
@@ -250,15 +313,15 @@ def _adds_compatible_organization(current: str | None, candidate: str | None) ->
 def _combined_professional_and_video_role(
     current: str | None, candidate: str | None,
 ) -> str | None:
-    if (
-        current is None or candidate is None
-        or _ASSOHOLDING_ROLE.fullmatch(current)
-        or _ASSOHOLDING_ROLE.fullmatch(candidate)
-    ):
+    if current is None or candidate is None:
         return None
+    current_match = _ASSOHOLDING_ROLE.fullmatch(current)
+    candidate_match = _ASSOHOLDING_ROLE.fullmatch(candidate)
+    current_role = current_match.group("role") if current_match else current
+    candidate_role = candidate_match.group("role") if candidate_match else candidate
     parts = []
     seen = set()
-    for role in (*current.split(";"), *candidate.split(";")):
+    for role in (*current_role.split(";"), *candidate_role.split(";")):
         role = role.strip()
         key = _name_key(role)
         if key and key != "relatore" and key not in seen:
@@ -268,7 +331,25 @@ def _combined_professional_and_video_role(
     video = [role for role in parts if _name_key(role) in _VIDEO_ROLE_KEYS]
     if len(professional) != 1 or len(video) != 1:
         return None
-    return f"{professional[0]}; {video[0]}"
+    organization = (
+        " di Assoholding" if current_match or candidate_match else ""
+    )
+    return f"{professional[0]}; {video[0]}{organization}"
+
+
+def _occurrence_role(
+    occurrence: _SpeakerOccurrence, honorific: str | None,
+) -> tuple[str | None, int]:
+    explicit = occurrence.role
+    if explicit is None:
+        return honorific, _role_rank(honorific, honorific=honorific is not None)
+    if _name_key(explicit) == "relatore" and honorific is not None:
+        return honorific, _role_rank(honorific, honorific=True)
+    if honorific is not None:
+        combined = _combined_professional_and_video_role(honorific, explicit)
+        if combined is not None:
+            return combined, _role_rank(combined)
+    return explicit, _role_rank(explicit)
 
 
 def _deduplicated_names(names: Iterable[str], canonical_by_key: dict[str, str]) -> list[str]:
@@ -329,8 +410,7 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
     role_ranks: dict[str, int] = {}
     for occurrence, canonical in occurrence_identities:
         parsed = parse_speaker_identity(occurrence.raw_name)
-        role = occurrence.role or parsed.honorific
-        role_rank = _role_rank(role, honorific=occurrence.role is None and role is not None)
+        role, role_rank = _occurrence_role(occurrence, parsed.honorific)
         speaker = ReconciledSpeaker(
             display_name=canonical,
             role=role,
@@ -358,17 +438,17 @@ def reconcile_speakers_detailed(report: AcademyReport) -> SpeakerReconciliation:
         current = merged[key]
         if _CONFIDENCE_RANK[speaker.confidence] > _CONFIDENCE_RANK[current.confidence]:
             current.confidence = speaker.confidence
-        combined_role = (
-            _combined_professional_and_video_role(current.role, speaker.role)
-            if role_rank == role_ranks[key] == 3 else None
+        combined_role = _combined_professional_and_video_role(
+            current.role, speaker.role,
         )
-        if role_rank > role_ranks[key]:
+        if combined_role is not None:
+            current.role = combined_role
+            role_ranks[key] = 3
+        elif role_rank > role_ranks[key]:
             current.role = speaker.role
             role_ranks[key] = role_rank
         elif _adds_compatible_organization(current.role, speaker.role):
             current.role = speaker.role
-        elif combined_role is not None:
-            current.role = combined_role
         for evidence in speaker.evidence:
             evidence_key = (evidence.kind, evidence.timestamp_seconds, evidence.note)
             if evidence_key not in evidence_keys[key]:

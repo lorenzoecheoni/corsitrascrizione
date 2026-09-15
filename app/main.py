@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
@@ -19,10 +20,11 @@ from app.bunny import BunnyClient
 from app.config import Settings
 from app.course_store import CourseStore
 from app.courses import CourseConfirmationStore
-from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient, speaker_hints_for_video
+from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient, inventory_context_for_video
 from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
+from app.material_registry import AnalysisInventoryContext
 from app.pipeline import AnalysisPipeline
 from app.selection import ConfirmationStore
 from app.transcription import OpenAITranscriber
@@ -44,6 +46,7 @@ class Services:
     store: JobStore
     runner: SingleWorkerRunner
     inventory: InventoryClient
+    inventory_context_provider: Callable[[object], AnalysisInventoryContext]
     course_store: CourseStore
     academy_generator: AcademyGenerator
 
@@ -63,10 +66,13 @@ def build_services(settings: Settings) -> Services:
         service_account_json=settings.google_service_account_json,
     )
 
-    def speaker_hint_provider(metadata):
-        return speaker_hints_for_video(
+    def inventory_context_provider(metadata) -> AnalysisInventoryContext:
+        return inventory_context_for_video(
             inventory.fetch(), metadata.video_id, metadata.title,
         )
+
+    def speaker_hint_provider(metadata):
+        return inventory_context_provider(metadata).speaker_hints
 
     assemblyai = None
     if settings.assemblyai_api_key:
@@ -87,7 +93,7 @@ def build_services(settings: Settings) -> Services:
     academy_generator = AcademyGenerator(openai)
     return Services(
         bunny, media, openai, transcriber, analyzer, assemblyai, pipeline,
-        store, runner, inventory, course_store, academy_generator,
+        store, runner, inventory, inventory_context_provider, course_store, academy_generator,
     )
 
 
@@ -126,6 +132,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.store = services.store
     app.state.runner = services.runner
     app.state.inventory = services.inventory
+    app.state.inventory_context_provider = services.inventory_context_provider
     app.state.course_store = services.course_store
     app.state.academy_generator = services.academy_generator
     app.state.csrf_token = secrets.token_urlsafe(32)

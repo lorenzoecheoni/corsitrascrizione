@@ -10,6 +10,7 @@ from app.inventory import (
     DEFAULT_INVENTORY_TABS,
     InventoryClient,
     InventoryCourse,
+    InventoryError,
     InventoryWriteUnavailable,
     normalize_title,
     material_sources_for_video,
@@ -108,10 +109,13 @@ def test_title_normalization_folds_prefixes_accents_and_punctuation(source, expe
     assert normalize_title(source) == expected
 
 
-def inventory_course(title, *, row=2, guid=None):
+def inventory_course(
+    title="Governance delle holding e conferimenti a realizzo controllato",
+    *, row=2, guid=None, materiali=None, speakers=None,
+):
     return InventoryCourse(
         id=f"0:{row}", foglio="Formazione", gid="0", posizione_foglio=0,
-        riga=row, titolo=title, relatori_attesi=[], materiali=[], link=None,
+        riga=row, titolo=title, relatori_attesi=speakers or [], materiali=materiali or [], link=None,
         colonna_link="D", guid_esplicito=guid,
     )
 
@@ -287,7 +291,6 @@ def test_material_sources_require_explicit_or_exact_video_match() -> None:
 
     assert material_sources_for_video(courses, target_id, "Governance delle holding") == [
         "Slide governance | https://example.test/governance.pdf",
-        "dispensa.pdf",
     ]
     assert material_sources_for_video(courses, other_id, "Governance holding simile") == []
 
@@ -317,9 +320,250 @@ def test_material_sources_follow_spreadsheet_order_when_input_is_shuffled() -> N
         ),
     ]
 
-    assert material_sources_for_video(courses, target_id, "Ignorato") == [
-        "primo.pdf", "secondo-a.pdf", "secondo-b.pdf", "terzo.pdf",
+    assert material_sources_for_video(courses, target_id, "Ignorato") == []
+
+
+def test_governance_guid_returns_curated_real_materials_before_sheet_labels() -> None:
+    sources = material_sources_for_video(
+        [inventory_course(materiali=["Slide Furio D'Andrea", "Slide Luigi Morra"])],
+        UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438"),
+        "Governance delle holding e conferimenti a realizzo controllato",
+    )
+
+    assert sources == [
+        "Slide · Furio D'Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
+        "Slide · Luigi Morra | https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx",
     ]
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Slide Furio d'Andrea", "Slide · Furio D’Andrea", "Slide Furio D ’ Andrea"],
+)
+def test_governance_material_title_variants_emit_canonical_ascii_title(label) -> None:
+    sources = material_sources_for_video(
+        [inventory_course(materiali=[label, label])],
+        UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438"),
+        "Governance delle holding e conferimenti a realizzo controllato",
+    )
+
+    assert sources[0].startswith("Slide · Furio D'Andrea | ")
+    assert len(sources) == 2
+
+
+def test_material_resolution_preserves_unrelated_explicit_url_and_deduplicates_by_url() -> None:
+    target_id = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+    external = "Slide · Persona | https://materials.example.test/deck.pdf"
+    courses = [
+        inventory_course(materiali=["Slide Luigi Morra", external]),
+        inventory_course(row=3, materiali=[external, "Etichetta senza sorgente"]),
+    ]
+
+    assert material_sources_for_video(courses, target_id, courses[0].titolo) == [
+        "Slide · Furio D'Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
+        "Slide · Luigi Morra | https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx",
+        external,
+    ]
+
+
+def test_non_curated_materials_require_an_http_url_or_existing_supported_file(tmp_path) -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    deck = tmp_path / "dispensa.pdf"
+    deck.write_bytes(b"%PDF-test")
+    course = inventory_course(
+        "Corso con materiali", guid=target_id,
+        materiali=[
+            "Etichetta soltanto",
+            "missing.pdf",
+            str(deck),
+            "Slide · Persona | https://materials.example.test/deck.pptx",
+        ],
+    )
+
+    assert material_sources_for_video([course], target_id, course.titolo) == [
+        str(deck),
+        "Slide · Persona | https://materials.example.test/deck.pptx",
+    ]
+
+
+def test_injected_network_reachability_omits_an_unavailable_explicit_url() -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    available = "https://materials.example.test/available.pdf"
+    unavailable = "https://materials.example.test/unavailable.pdf"
+    course = inventory_course(
+        "Corso con materiali", guid=target_id, materiali=[available, unavailable],
+    )
+
+    assert material_sources_for_video(
+        [course], target_id, course.titolo,
+        url_reachable=lambda url: url == available,
+    ) == [f"available.pdf | {available}"]
+
+
+def test_malformed_explicit_url_is_omitted_instead_of_breaking_resolution() -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    course = inventory_course(
+        "Corso con materiale invalido", guid=target_id,
+        materiali=["https://materials.example.test:not-a-port/deck.pdf"],
+    )
+
+    assert material_sources_for_video([course], target_id, course.titolo) == []
+
+
+@pytest.mark.parametrize(
+    ("url", "file"),
+    [(None, None), ("https://example.test/deck.pdf", "deck.pdf")],
+)
+def test_registry_material_requires_url_or_file_exclusively(url, file) -> None:
+    from app.material_registry import RegistryMaterial
+
+    with pytest.raises(ValueError, match="esattamente una sorgente"):
+        RegistryMaterial("Slide", url=url, file=file)
+
+
+def test_inventory_context_keeps_speakers_and_resolved_materials_together() -> None:
+    from app.inventory import AnalysisInventoryContext, inventory_context_for_video
+
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    course = inventory_course(
+        "Corso contestuale", guid=target_id, speakers=["Furio d'Andrea"],
+        materiali=["Slide · Furio D’Andrea | https://materials.example.test/deck.pdf"],
+    )
+
+    context = inventory_context_for_video([course], target_id, course.titolo)
+
+    assert context == AnalysisInventoryContext(
+        speaker_hints=("Furio d'Andrea",),
+        material_sources=(
+            "Slide · Furio D'Andrea | https://materials.example.test/deck.pdf",
+        ),
+    )
+
+
+def _grid_sheet_payload(*, material_cell) -> dict:
+    return {
+        "sheets": [{
+            "properties": {"sheetId": 0, "title": "Formazione"},
+            "data": [{"startRow": 0, "rowData": [
+                {"values": [
+                    {"formattedValue": "Titolo"},
+                    {"formattedValue": "Relatore"},
+                    {"formattedValue": "Materiali"},
+                    {"formattedValue": "Link"},
+                ]},
+                {"values": [
+                    {"formattedValue": "Corso con hyperlink"},
+                    {"formattedValue": "Persona"},
+                    material_cell,
+                    {"formattedValue": "bunny"},
+                ]},
+            ]}],
+        }],
+    }
+
+
+def test_authenticated_fetch_retains_material_cell_hyperlink() -> None:
+    requests = []
+
+    def handle(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(200, json=_grid_sheet_payload(material_cell={
+            "formattedValue": "Slide · Persona",
+            "hyperlink": "https://www.assoholding.it/deck.pdf",
+        }), request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == [
+        "Slide · Persona | https://www.assoholding.it/deck.pdf",
+    ]
+    assert requests[0].headers["authorization"] == "Bearer test-token"
+    assert requests[0].url.params["includeGridData"] == "true"
+    assert "formattedValue" in requests[0].url.params["fields"]
+    assert "textFormatRuns" in requests[0].url.params["fields"]
+
+
+def test_authenticated_fetch_uses_one_unambiguous_rich_text_link() -> None:
+    def handle(request: httpx.Request):
+        return httpx.Response(200, json=_grid_sheet_payload(material_cell={
+            "formattedValue": "Slide · Persona",
+            "textFormatRuns": [{
+                "startIndex": 0,
+                "format": {"link": {"uri": "https://www.assoholding.it/deck.pdf"}},
+            }],
+        }), request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == [
+        "Slide · Persona | https://www.assoholding.it/deck.pdf",
+    ]
+
+
+def test_authenticated_fetch_does_not_invent_a_source_for_ambiguous_rich_text_links() -> None:
+    def handle(request: httpx.Request):
+        return httpx.Response(200, json=_grid_sheet_payload(material_cell={
+            "formattedValue": "Slide Persona A e Persona B",
+            "textFormatRuns": [
+                {"startIndex": 0, "format": {"link": {"uri": "https://example.test/a.pdf"}}},
+                {"startIndex": 16, "format": {"link": {"uri": "https://example.test/b.pdf"}}},
+            ],
+        }), request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == ["Slide Persona A e Persona B"]
+    assert material_sources_for_video(
+        courses, UUID("00000000-0000-0000-0000-000000000001"),
+        "Corso con hyperlink",
+    ) == []
+
+
+def test_authenticated_fetch_failure_is_static_and_never_falls_back_to_csv() -> None:
+    requests = []
+
+    def handle(request: httpx.Request):
+        requests.append(request)
+        return httpx.Response(503, text="PRIVATE GOOGLE BODY", request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        with pytest.raises(InventoryError) as caught:
+            client.fetch()
+    finally:
+        client.close()
+
+    assert len(requests) == 1
+    assert "sheets.googleapis.com" in requests[0].url.host
+    assert "PRIVATE GOOGLE BODY" not in str(caught.value)
 
 
 def test_sheet_write_requires_optional_credentials(csv_by_gid):

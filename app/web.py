@@ -30,7 +30,13 @@ from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report as build_course_intermediate_report, sign_course_selection
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
 from app.intermediate_report import build_intermediate_report
-from app.inventory import InventoryError, material_sources_for_video, organize_catalog, propose_matches
+from app.inventory import (
+    InventoryError,
+    material_sources_for_video,
+    organize_catalog,
+    propose_matches,
+    raw_material_sources_for_video,
+)
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
@@ -730,7 +736,7 @@ def json_report(request: Request, job_id: str) -> Response:
         courses = request.app.state.inventory.fetch()
     except InventoryError:
         courses = []
-    material_sources = material_sources_for_video(
+    material_sources = raw_material_sources_for_video(
         courses, reference.video_id, job.report.bunny_title,
     )
     report = build_intermediate_report(

@@ -103,6 +103,32 @@ def test_assemblyai_accepts_overlapping_words_and_expands_segment_to_word_eviden
     ]
 
 
+def test_assemblyai_normalizes_provider_zero_duration_words_to_one_millisecond():
+    from app.assemblyai import AssemblyAITranscriber
+
+    result = AssemblyAITranscriber._parse_result({
+        "status": "completed",
+        "audio_duration": 3,
+        "language_code": "it",
+        "text": "Una parola breve.",
+        "utterances": [{
+            "speaker": "A",
+            "start": 500,
+            "end": 3000,
+            "text": "Una parola breve.",
+            "words": [
+                word("Una", 500, 800),
+                word("parola", 1000, 1000),
+                word("breve.", 3000, 3000),
+            ],
+        }],
+    }, 3)
+
+    words = result.original_segments[0].words
+    assert (words[1].start_seconds, words[1].end_seconds) == (1, 1.001)
+    assert (words[2].start_seconds, words[2].end_seconds) == (2.999, 3)
+
+
 def test_assemblyai_rejects_words_beyond_accepted_provider_duration():
     from app.assemblyai import AssemblyAITranscriber
     from app.transcription import TranscriptionError

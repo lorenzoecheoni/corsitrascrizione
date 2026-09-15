@@ -198,14 +198,27 @@ class AssemblyAITranscriber:
                     or not math.isfinite(word_start) or not math.isfinite(word_end)
                     or not math.isfinite(confidence)
                     or word_start < 0
+                    or word_end < word_start
                     or (word_end > provider_duration and not terminal_rounding)
                     or word_start < previous_start
                 ):
                     raise WordEvidenceError()
+                canonical_word_start = word_start
                 canonical_word_end = min(word_end, expected_duration)
+                # AssemblyAI can assign the same millisecond to both ends of a
+                # real token. Preserve the token as evidence with the smallest
+                # representable provider interval; whole-second report cuts do
+                # not change. At the exact media endpoint the millisecond must
+                # be placed immediately before it to remain on Bunny's timeline.
+                if word_end == word_start:
+                    if word_start < expected_duration:
+                        canonical_word_end = min(expected_duration, word_start + .001)
+                    elif word_start == expected_duration and expected_duration >= .001:
+                        canonical_word_start = expected_duration - .001
+                        canonical_word_end = expected_duration
                 try:
                     parsed_word = TranscriptWord(
-                        text=word_text.strip(), start_seconds=word_start,
+                        text=word_text.strip(), start_seconds=canonical_word_start,
                         end_seconds=canonical_word_end,
                         diarization_label=label, confidence=confidence,
                     )

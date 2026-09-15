@@ -163,12 +163,7 @@ def align_intervention_boundaries(
 
     words = [_group_words(group) for group in semantic_groups]
     extents = [_speech_extent(group_words) for group_words in words]
-    source_owners: dict[str, int] = {}
     for index, group in enumerate(semantic_groups):
-        for segment in group.segments:
-            source = segment.source_utterance_id
-            if source and source_owners.setdefault(source, index) != index:
-                raise ValueError("La partizione divide una stessa utterance sorgente")
         speech_start, speech_end = extents[index]
         is_terminal_group = index == len(semantic_groups) - 1
         # Only AssemblyAI's final rounding can exceed Bunny's source timeline,
@@ -196,7 +191,16 @@ def align_intervention_boundaries(
         lower = max((cuts[-1] if cuts else 0) + 1, nearest_second(previous_end))
         upper = min(duration - 1, nearest_second(extents[index + 1][1]) - 1, nearest_second(next_start))
         if semantic_groups[index + 1].tipo in {"saluti", "domande", "cambio_relatore"}:
-            upper = min(upper, math.ceil(next_start) - 1)
+            before_next_speech = math.ceil(next_start) - 1
+            # When the previous word ends exactly as moderator speech starts,
+            # no earlier whole second exists. The no-pause rule requires the
+            # coincident word edge instead of collapsing either segment.
+            if before_next_speech >= lower:
+                upper = min(upper, before_next_speech)
+            elif not next_start.is_integer() or lower != int(next_start):
+                raise ValueError(
+                    "La partizione non ammette un confine intero senza segmenti vuoti"
+                )
         silence = _matching_silence(previous_end, next_start, silence_intervals)
         rule = "no_pause" if silence is None else "short_pause"
         candidate = previous_end if silence is None else (silence.start_seconds + silence.end_seconds) / 2

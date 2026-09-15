@@ -190,7 +190,7 @@ def test_materialize_merges_shared_source_utterance_across_adjacent_windows():
     assert result.boundaries == []
 
 
-def test_materialize_rejects_shared_source_utterance_with_incompatible_types():
+def test_materialize_allows_semantic_types_inside_one_provider_utterance():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
 
     windows = split_transcript_windows([
@@ -205,11 +205,15 @@ def test_materialize_rejects_shared_source_utterance_with_incompatible_types():
         ],
     )]
 
-    with pytest.raises(ValueError, match="partizione"):
-        materialize_interventions(10, windows, analyses, {}, [])
+    result = materialize_interventions(10, windows, analyses, {}, [])
+
+    assert [item.tipo for item in result.interventions] == [
+        "intervento", "cambio_relatore",
+    ]
+    assert result.boundaries[0].boundary_seconds == 5
 
 
-def test_materialize_rejects_merge_that_would_absorb_a_distinct_utterance():
+def test_materialize_does_not_merge_distinct_groups_only_because_a_source_id_is_shared():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
 
     windows = split_transcript_windows([
@@ -222,8 +226,34 @@ def test_materialize_rejects_merge_that_would_absorb_a_distinct_utterance():
         interventions=[_draft([0]), _draft([1, 2], diarization_labels=[])],
     )]
 
-    with pytest.raises(ValueError, match="partizione"):
-        materialize_interventions(12, windows, analyses, {}, [])
+    result = materialize_interventions(12, windows, analyses, {}, [])
+
+    assert len(result.interventions) == 2
+    assert result.boundaries[0].boundary_seconds == 5
+
+
+def test_materialize_respects_explicit_separation_at_window_seam_inside_provider_utterance():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "Prima parte conclusa.", "u1"),
+        _spoken(600, 610, "assembly:A", "Nuovo tema.", "u1"),
+    ])
+    analyses = [
+        WindowAnalysis(
+            detected_language="it", synopsis_notes=[], speakers=[],
+            interventions=[_draft([0])],
+        ),
+        WindowAnalysis(
+            detected_language="it", synopsis_notes=[], speakers=[],
+            previous_continuity="separate", interventions=[_draft([0])],
+        ),
+    ]
+
+    result = materialize_interventions(610, windows, analyses, {}, [])
+
+    assert len(result.interventions) == 2
+    assert result.boundaries[0].boundary_seconds == 599
 
 
 def test_materialize_preserves_one_example_grouped_over_three_utterances():

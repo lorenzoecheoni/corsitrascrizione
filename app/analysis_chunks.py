@@ -325,14 +325,22 @@ def materialize_interventions(
                 if segment.source_utterance_id
             }
             shared_sources = previous_sources & current_sources
-            continues = bool(window_index and draft_index == 0 and analysis.previous_continuity == "continue")
-            if groups and (shared_sources or continues):
+            at_window_seam = bool(window_index and draft_index == 0)
+            continues = bool(at_window_seam and analysis.previous_continuity == "continue")
+            # A provider utterance is diarization evidence, not an editorial
+            # unit: AssemblyAI may keep one speaker in the same utterance for
+            # many minutes. Inside one window, or when the model explicitly
+            # marks a window seam as separate, preserve the semantic split.
+            # An unresolved artificial seam within the same source remains
+            # conservatively joined so we never create a cut without evidence.
+            unresolved_shared_seam = bool(
+                at_window_seam
+                and shared_sources
+                and analysis.previous_continuity not in {"continue", "separate"}
+            )
+            if groups and (continues or unresolved_shared_seam):
                 previous = groups[-1]
-                if (previous.tipo != current.tipo
-                        or (shared_sources and not continues and any(
-                            segment.source_utterance_id not in shared_sources
-                            for segment in current.segments
-                        ))):
+                if previous.tipo != current.tipo:
                     raise ValueError(
                         "La partizione divide una utterance sorgente in gruppi incompatibili"
                     )

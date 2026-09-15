@@ -186,7 +186,6 @@ def test_terminal_group_must_contain_speech_before_bunny_end():
     ([group(0, 10, ())], 10),
     ([group(0, 1), group(1, 1.2), group(1.2, 2)], 2),
     ([group(0, 10), group(9, 20)], 20),
-    ([group(0, 10, source="same"), group(11, 20, source="same")], 20),
     ([group(10, 20), group(0, 5)], 20),
     ([group(0, 10)], float("nan")),
     ([group(0, 10)], .1),

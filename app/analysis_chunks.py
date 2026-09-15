@@ -5,6 +5,7 @@ transcript text.
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
 import json
 import math
 from typing import Annotated, Literal, Mapping
@@ -341,18 +342,21 @@ def materialize_interventions(
             if groups and (continues or unresolved_shared_seam):
                 previous = groups[-1]
                 if previous.tipo != current.tipo:
-                    raise ValueError(
-                        "La partizione divide una utterance sorgente in gruppi incompatibili"
+                    # A continuity decision cannot erase an independently
+                    # classified moderator/logistics transition. Preserve both
+                    # and surface the contradiction through the standard low-
+                    # confidence verification instead of losing the report.
+                    groups.append(replace(current, confidenza=min(.7, current.confidenza)))
+                else:
+                    groups[-1] = SemanticIntervention(
+                        tipo=previous.tipo,
+                        relatori=tuple(dict.fromkeys((*previous.relatori, *current.relatori))),
+                        titolo=previous.titolo,
+                        sintesi=previous.sintesi,
+                        punti_chiave=previous.punti_chiave,
+                        confidenza=previous.confidenza,
+                        segments=(*previous.segments, *current.segments),
                     )
-                groups[-1] = SemanticIntervention(
-                    tipo=previous.tipo,
-                    relatori=tuple(dict.fromkeys((*previous.relatori, *current.relatori))),
-                    titolo=previous.titolo,
-                    sintesi=previous.sintesi,
-                    punti_chiave=previous.punti_chiave,
-                    confidenza=previous.confidenza,
-                    segments=(*previous.segments, *current.segments),
-                )
             else:
                 groups.append(current)
 

@@ -256,6 +256,36 @@ def test_materialize_respects_explicit_separation_at_window_seam_inside_provider
     assert result.boundaries[0].boundary_seconds == 599
 
 
+def test_materialize_keeps_conflicting_types_separate_and_marks_low_confidence():
+    from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
+
+    windows = split_transcript_windows([
+        _spoken(0, 599, "assembly:A", "Intervento concluso.", "u1"),
+        _spoken(600, 610, "assembly:A", "Passiamo oltre.", "u1"),
+    ])
+    analyses = [
+        WindowAnalysis(
+            detected_language="it", synopsis_notes=[], speakers=[],
+            interventions=[_draft([0])],
+        ),
+        WindowAnalysis(
+            detected_language="it", synopsis_notes=[], speakers=[],
+            previous_continuity="continue",
+            interventions=[_draft(
+                [0], tipo="cambio_relatore", punti_chiave=[], confidenza=.95,
+            )],
+        ),
+    ]
+
+    result = materialize_interventions(610, windows, analyses, {}, [])
+
+    assert [item.tipo for item in result.interventions] == [
+        "intervento", "cambio_relatore",
+    ]
+    assert result.interventions[1].confidenza == .7
+    assert result.boundaries[0].boundary_seconds == 599
+
+
 def test_materialize_preserves_one_example_grouped_over_three_utterances():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval

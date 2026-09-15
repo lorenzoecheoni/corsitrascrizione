@@ -29,7 +29,8 @@ VIDEO_ID = "00000000-0000-0000-0000-000000000001"
 SOURCE = f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}"
 
 
-@pytest.mark.parametrize("mode", ["success", "signed", "fetch_failure", "bug"])
+@pytest.mark.parametrize("mode", ["success", "signed", "fetch_failure", "bug",
+    "worker_fetch_bug", "worker_parse_bug", "worker_match_bug", "contract", "mutation"])
 def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkeypatch, caplog, mode):
     from app.materials import MaterialError, MaterialProcessor
     from app.media import AudioChunk, FrameCandidate, MediaArtifacts
@@ -91,6 +92,28 @@ def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkey
                 raise MaterialError() from RuntimeError("PRIVATE-RESPONSE")
             return deck
         app.state.pipeline.material_processor.fetcher = fetch
+        if mode.startswith("worker_"):
+            import app.materials as module
+            original_worker = module._run_worker
+            def worker(stage, *args, **kwargs):
+                if stage == mode.split("_")[1]:
+                    raise TypeError("PRIVATE-WORKER-DIAGNOSTIC")
+                return original_worker(stage, *args, **kwargs)
+            monkeypatch.setattr(module, "_run_worker", worker)
+            if mode == "worker_fetch_bug":
+                app.state.pipeline.material_processor.fetcher = module.fetch_deck
+        if mode in {"contract", "mutation"}:
+            from app.materials import MaterialAnalysis
+            original_process = app.state.pipeline.material_processor.process
+            def process(sources, slides, workspace, cancellation_event):
+                result = original_process(sources, slides, workspace, cancellation_event)
+                if mode == "contract":
+                    result.slides[0].page = 999
+                else:
+                    slides[0].visible_content.append("PRIVATE-DECK-TEXT")
+                    slides[0].title = "PRIVATE-DECK-TEXT"
+                return MaterialAnalysis(result.materials, result.slides, result.failures)
+            app.state.pipeline.material_processor.process = process
         with TestClient(app) as client:
             client.post("/login", data={"username": "team", "password": settings.app_password})
             preview = client.post("/preview", data={"source_url": SOURCE,
@@ -107,26 +130,37 @@ def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkey
                     break
                 sleep(.02)
             assert fetches == [True]
-            if mode == "bug":
+            if mode == "bug" or mode.startswith("worker_") or mode == "contract":
                 assert status["state"] == "failed" and status["report"] is None
                 assert status["progress"] < 100
             else:
                 assert status["state"] == "completed" and status["progress"] == 100
                 report = AcademyReport.model_validate(status["report"])
                 assert report.cost.estimated_high_usd > 0
-                if mode == "success":
+                if mode in {"success", "mutation"}:
                     assert report.materials[0].relatore == "Furio D'Andrea"
                     assert report.materials[0].url == source
                     assert report.slides[0].page == 2
+                    assert report.slides[0].title == "Decisioni assembleari"
+                    assert report.slides[0].visible_content == []
                 else:
                     assert report.materials == []
                     assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
                     assert report.slides[0].page is None
             assert list(workspace_root.iterdir()) == []
             for private in ("PRIVATE-DECK-TEXT", "PRIVATE-BUG-DIAGNOSTIC", "PRIVATE-TRANSCRIPT",
-                            "PRIVATE-RESPONSE", "SIGNED-SECRET"):
+                            "PRIVATE-RESPONSE", "PRIVATE-WORKER-DIAGNOSTIC", "SIGNED-SECRET"):
                 assert private not in json.dumps(status) + caplog.text
                 assert private.encode() not in database.read_bytes()
+            from app.jobs import JobStore
+            from uuid import UUID
+            reopened = JobStore(str(database))
+            try:
+                persisted = reopened.get(UUID(location.rsplit("/", 1)[1]))
+                assert persisted.state.value == status["state"]
+                assert (persisted.report.model_dump() if persisted.report else None) == status["report"]
+            finally:
+                reopened._connection.close()
     finally:
         app.state.runner.shutdown()
         app.state.store._connection.close()

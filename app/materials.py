@@ -33,6 +33,9 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 from uuid import UUID, uuid4
 from xml.etree import ElementTree
 from zipfile import ZipFile
+from zipfile import BadZipFile
+from pypdf.errors import PyPdfError
+from zlib import error as ZlibError
 
 from app.config import parse_material_allowed_hosts
 from app.material_registry import canonical_material_title, resolve_material_sources
@@ -53,6 +56,10 @@ MAX_RESULT_BYTES = 12 * MAX_TOTAL_TEXT
 MAX_ARCHIVE_ENTRIES = 10_000
 MAX_MATERIALS = 32
 _FAILURE = "MATERIALE_NON_RAGGIUNGIBILE"
+# Deliberately distinct from Python's untagged import/startup failure (exit 1).
+_WORKER_OPERATIONAL = 20
+_WORKER_INTERNAL = 21
+_WORKER_CANCELLED = 22
 _SLIDE_PATH = re.compile(r"ppt/slides/slide([1-9][0-9]*)\.xml\Z")
 _P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -64,6 +71,13 @@ class MaterialError(Exception):
 
     def __init__(self) -> None:
         super().__init__(_FAILURE)
+
+
+class MaterialInternalError(RuntimeError):
+    """Static internal-contract failure; never a nonfatal material warning."""
+
+    def __init__(self) -> None:
+        super().__init__("MATERIAL_INTERNAL_ERROR")
 
 
 @dataclass(frozen=True)
@@ -150,6 +164,7 @@ def _download_https(
     and never downloads an error or redirect response body.
     """
     created = False
+    completed = False
     connection = None
     deadline = monotonic() + DOWNLOAD_TIMEOUT_SECONDS
     try:
@@ -201,13 +216,14 @@ def _download_https(
                     output.write(chunk)
             if total == 0 or declared is not None and total != declared:
                 raise MaterialError()
+            completed = True
             return
         raise MaterialError()
-    except Exception:
-        if created:
-            destination.unlink(missing_ok=True)
+    except (MaterialError, OSError, http.client.HTTPException, ValueError):
         raise MaterialError() from None
     finally:
+        if created and not completed:
+            destination.unlink(missing_ok=True)
         if connection is not None:
             connection.close()
 
@@ -239,12 +255,16 @@ def _run_worker(
             except subprocess.TimeoutExpired:
                 continue
             check_cancelled(cancellation_event)
-            if code != 0 or monotonic() > deadline:
+            if monotonic() > deadline or code in (_WORKER_OPERATIONAL, -signal.SIGKILL, -signal.SIGXCPU, -signal.SIGXFSZ):
                 raise MaterialError()
+            if code == _WORKER_CANCELLED:
+                raise CancelledError() from None
+            if code != 0:
+                raise MaterialInternalError()
             return
     except CancelledError:
         raise
-    except Exception:
+    except OSError:
         raise MaterialError() from None
     finally:
         if process is not None:
@@ -263,6 +283,7 @@ def fetch_deck(
 ) -> Path:
     """Fetch into ``workspace``; caller owns the returned temporary file."""
     destination = Path(workspace) / f"material-{uuid4().hex}.deck"
+    completed = False
     try:
         hosts = parse_material_allowed_hosts(allowed_hosts)
         _validate_url(url, hosts)
@@ -270,13 +291,15 @@ def fetch_deck(
                     timeout=DOWNLOAD_TIMEOUT_SECONDS, cancellation_event=cancellation_event)
         if not destination.is_file() or not 0 < destination.stat().st_size <= MAX_DOWNLOAD_BYTES:
             raise MaterialError()
+        completed = True
         return destination
     except CancelledError:
-        destination.unlink(missing_ok=True)
         raise
-    except Exception:
-        destination.unlink(missing_ok=True)
+    except OSError:
         raise MaterialError() from None
+    finally:
+        if not completed:
+            destination.unlink(missing_ok=True)
 
 
 def _xml(data: bytes) -> ElementTree.Element:
@@ -533,7 +556,7 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
     with path.open("rb") as source:
         try:
             reader = pypdf.PdfReader(source, strict=True)
-        except Exception:
+        except PyPdfError:
             raise MaterialError() from None
         if reader.is_encrypted:
             raise MaterialError()
@@ -627,16 +650,16 @@ def extract_deck_pages(path: Path, *, cancellation_event: Event | None = None) -
                 raise MaterialError()
             records = json.loads(output.read_text(encoding="utf-8"))
             if not 1 <= len(records) <= MAX_PAGES:
-                raise MaterialError()
+                raise MaterialInternalError()
             pages = tuple(DeckPage(record["number"], record["text"]) for record in records)
             if (any(type(p.number) is not int or p.number < 1 or not isinstance(p.text, str)
                     or len(p.text) > MAX_PAGE_TEXT for p in pages)
                     or sum(len(p.text) for p in pages) > MAX_TOTAL_TEXT):
-                raise MaterialError()
+                raise MaterialInternalError()
             return pages
     except CancelledError:
         raise
-    except Exception:
+    except OSError:
         raise MaterialError() from None
 
 
@@ -734,13 +757,13 @@ def _match_in_workspace(slides, decks, workspace, cancellation_event) -> tuple[S
             valid = {(material.titolo, page.number) for material, pages in decks for page in pages
                      if title_counts[material.titolo] == 1}
             if len(links) != len(slides) or any(tuple(link) not in valid | {(None, None)} for link in links):
-                raise MaterialError()
+                raise MaterialInternalError()
             check_cancelled(cancellation_event)
             return tuple(slide.model_copy(update={"material_title": title, "page": page})
                          for slide, (title, page) in zip(slides, links))
     except CancelledError:
         raise
-    except Exception:
+    except (MaterialError, OSError):
         # Parsing already verified these materials; only unfinished links are
         # absent. The intermediate report emits SLIDE_NON_ABBINATA for them.
         return _match_materials(slides, [], cancellation_event)
@@ -764,7 +787,7 @@ def _copy_local(source: Path, target: Path, cancellation_event: Event | None) ->
 
 
 class MaterialProcessor:
-    """Sole candidate-to-ReportMaterial promotion gate; all failures are nonfatal."""
+    """Candidate promotion gate; operational failures are nonfatal, bugs propagate."""
 
     def __init__(self, allowed_hosts: Sequence[str] | str = "www.assoholding.it", *,
                  fetcher: Callable | None = None, extractor: Callable | None = None):
@@ -851,7 +874,7 @@ def _worker_main() -> int:
                 json.dump([{"number": page.number, "text": page.text} for page in pages], result)
         elif mode == "match":
             if Path(source).stat().st_size > MAX_RESULT_BYTES:
-                return 1
+                raise MaterialError()
             payload = json.loads(Path(source).read_text(encoding="utf-8"))
             slides = [SlideChange.model_validate(slide) for slide in payload["slides"]]
             decks = [(ReportMaterial.model_validate(deck["material"]),
@@ -860,10 +883,17 @@ def _worker_main() -> int:
             with Path(output).open("x", encoding="utf-8") as result:
                 json.dump([[slide.material_title, slide.page] for slide in matched], result)
         else:
-            return 1
+            raise MaterialInternalError()
         return 0
+    except CancelledError:
+        return _WORKER_CANCELLED
+    except (MaterialError, OSError, BadZipFile, ElementTree.ParseError, UnicodeError,
+            PyPdfError, ZlibError, EOFError):
+        return _WORKER_OPERATIONAL
     except BaseException:
-        return 1
+        # Exit tags are the entire error protocol: never serialize an exception,
+        # diagnostic, path, provider body, or traceback across this boundary.
+        return _WORKER_INTERNAL
 
 
 if __name__ == "__main__":

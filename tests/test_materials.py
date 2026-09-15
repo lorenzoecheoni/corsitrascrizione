@@ -986,6 +986,66 @@ def test_worker_total_deadline_kills_stalled_work(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("mode", ["fetch", "parse", "match"])
+@pytest.mark.parametrize("internal", [True, False])
+def test_worker_exit_tags_distinguish_internal_from_operational_errors(tmp_path, monkeypatch, mode, internal):
+    import app.materials as module
+    real_popen = subprocess.Popen
+    script = """
+import sys
+from pathlib import Path
+import app.materials as m
+mode, source, output, internal = sys.argv[1:]
+def fail(*args, **kwargs):
+    if internal == 'True':
+        raise TypeError('PRIVATE-WORKER-TRACE https://user:password@host/?token')
+    raise m.MaterialError()
+m._download_https = fail
+m._extract_pages = fail
+m._match_materials = fail
+sys.argv = ['worker', mode, source, output, '[]']
+raise SystemExit(m._worker_main())
+"""
+    source = tmp_path / "input.json"
+    source.write_text('{"slides": [], "decks": []}')
+    def worker(args, **kwargs):
+        return real_popen([sys.executable, "-B", "-c", script, mode, str(source), args[6], str(internal)], **kwargs)
+    monkeypatch.setattr(module.subprocess, "Popen", worker)
+    with pytest.raises(RuntimeError if internal else MaterialError) as caught:
+        module._run_worker(mode, str(source), tmp_path / "result", timeout=3)
+    assert str(caught.value) == ("MATERIAL_INTERNAL_ERROR" if internal else "MATERIALE_NON_RAGGIUNGIBILE")
+    assert list(tmp_path.iterdir()) == [source]
+
+
+def test_worker_supervisor_does_not_convert_programming_errors(tmp_path, monkeypatch):
+    import app.materials as module
+    def broken_popen(*args, **kwargs):
+        raise TypeError("PRIVATE-SUPERVISOR")
+    monkeypatch.setattr(module.subprocess, "Popen", broken_popen)
+    with pytest.raises(TypeError):
+        module._run_worker("fetch", URL, tmp_path / "result", timeout=3)
+
+
+def test_untagged_worker_startup_failure_is_internal(tmp_path, monkeypatch):
+    import app.materials as module
+    real_popen = subprocess.Popen
+    def startup_failure(args, **kwargs):
+        # Import/initialization failures exit 1 before the worker protocol runs.
+        return real_popen([sys.executable, "-c", "raise SystemExit(1)"], **kwargs)
+    monkeypatch.setattr(module.subprocess, "Popen", startup_failure)
+    with pytest.raises(RuntimeError, match="^MATERIAL_INTERNAL_ERROR$"):
+        module._run_worker("parse", "unused", tmp_path / "result", timeout=3)
+
+
+def test_downloader_does_not_convert_internal_connection_error(tmp_path):
+    def broken_connection(*args, **kwargs):
+        raise TypeError("PRIVATE-CONNECTION")
+    with pytest.raises(TypeError):
+        _download_https(URL, tmp_path / "result", ("www.assoholding.it",),
+                        resolver=dns, connection_factory=broken_connection)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_worker_deadline_also_stops_descendants(tmp_path, monkeypatch):
     import app.materials as module
     real_popen = subprocess.Popen

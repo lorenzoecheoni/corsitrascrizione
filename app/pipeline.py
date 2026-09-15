@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import Event
 from time import monotonic
 from urllib.parse import urlsplit
+from collections import Counter
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
 from app.boundaries import has_complete_boundary_evidence
@@ -19,9 +20,9 @@ from app.jobs import JobCancelled
 from app.inventory import InventoryError
 from app.logging_config import log_event
 from app.media import FFmpegProcessor, MediaError, MediaProtectedError, SilenceEvidenceError, temporary_workspace
-from app.material_registry import AnalysisInventoryContext
-from app.materials import MaterialAnalysis, MaterialError, MaterialProcessor
-from app.models import AcademyReport, APIUsage, ProviderUsage
+from app.material_registry import AnalysisInventoryContext, canonical_material_title
+from app.materials import MaterialAnalysis, MaterialError, MaterialInternalError, MaterialProcessor, _validate_url
+from app.models import AcademyReport, APIUsage, ProviderUsage, ReportMaterial, SlideChange
 from app.transcription import OpenAITranscriber, TranscriptionError
 
 
@@ -62,6 +63,70 @@ class PipelineError(Exception):
 
 class PipelineCancelled(JobCancelled):
     """Cancellation acknowledged after temporary artifacts have been removed."""
+
+
+def _verified_material_result(
+    context: AnalysisInventoryContext, analysis: MaterialAnalysis,
+    slide_snapshot: tuple[str, ...], workspace: Path, allowed_hosts: Sequence[str],
+) -> MaterialAnalysis:
+    """Validate the internal processor contract before any result is persisted."""
+    candidates = {}
+    for source in context.material_sources:
+        if " | " in source:
+            title, url = source.split(" | ", 1)
+            candidates[("url", url)] = canonical_material_title(title)
+        elif source.startswith(("https://", "http://")):
+            candidates[("url", source)] = canonical_material_title(Path(urlsplit(source).path).name or source)
+        else:
+            path = Path(source)
+            candidates[("file", str(path))] = canonical_material_title(path.stem)
+
+    materials, omitted, failures, all_materials = [], set(), [], []
+    # Revalidate models as model_copy/in-place assignment bypasses validators.
+    for item in analysis.materials:
+        if item.pagine is not None and type(item.pagine) is not int:
+            raise MaterialInternalError()
+        material = ReportMaterial.model_validate(item.model_dump())
+        key = ("url", material.url) if material.url is not None else ("file", material.file)
+        if key not in candidates or material.titolo != candidates[key]:
+            raise MaterialInternalError()
+        if material.file is not None and Path(material.file).resolve().is_relative_to(workspace.resolve()):
+            raise MaterialInternalError()
+        if material.url is not None:
+            try:
+                _validate_url(material.url, allowed_hosts)
+            except (MaterialError, ValueError):
+                raise MaterialInternalError() from None
+            url = urlsplit(material.url)
+            if url.username is not None or url.password is not None:
+                raise MaterialInternalError()
+            all_materials.append(material)
+            if url.query or url.fragment:
+                # Removing sensitive parts would invent a different source.
+                omitted.add(material.titolo)
+                failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                continue
+        else:
+            all_materials.append(material)
+        materials.append(material)
+    counts = Counter(material.titolo for material in all_materials)
+    verified = {material.titolo: material for material in all_materials}
+    slides = []
+    for snapshot, matched in zip(slide_snapshot, analysis.slides, strict=True):
+        title, page = matched.material_title, matched.page
+        if title is None and page is None:
+            pass
+        elif (title not in verified or counts[title] != 1
+              or type(page) is not int or verified[title].pagine is None
+              or not 1 <= page <= verified[title].pagine):
+            raise MaterialInternalError()
+        elif title in omitted:
+            title, page = None, None
+        slides.append(SlideChange.model_validate_json(snapshot).model_copy(update={
+            "material_title": title, "page": page,
+        }))
+    failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in analysis.failures)
+    return MaterialAnalysis(tuple(materials), tuple(slides), tuple(failures))
 
 
 class _LinkedCancellation:
@@ -276,33 +341,26 @@ class AnalysisPipeline:
                 progress(92, "Verifica dei materiali del corso")
                 next_phase("materials")
                 # AI output cannot promote materials or create verified links.
-                slides = [slide.model_copy(update={"material_title": None, "page": None})
-                          for slide in content.slides]
+                # Strings in a tuple form a deep immutable observation snapshot.
+                # The processor receives entirely separate models/nested lists.
+                slide_snapshot = tuple(slide.model_dump_json(exclude={"material_title", "page"})
+                                       for slide in content.slides)
+                slides = [SlideChange.model_validate_json(snapshot) for snapshot in slide_snapshot]
                 material_analysis = MaterialAnalysis((), tuple(slides), ())
                 if self.material_processor is not None:
                     try:
                         material_analysis = self.material_processor.process(
-                            context.material_sources, slides, workspace, event,
+                            context.material_sources, [slide.model_copy(deep=True) for slide in slides], workspace, event,
                         )
                     except MaterialError:
                         material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
                 check_cancelled()
-                materials = []
-                for material in material_analysis.materials:
-                    if material.url is not None:
-                        url = urlsplit(material.url)
-                        if url.query or url.fragment or url.username is not None or url.password is not None:
-                            # Removing a signed query would invent an unverified
-                            # URL. Omit this material and its links instead.
-                            material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
-                            continue
-                    materials.append(material)
+                material_analysis = _verified_material_result(
+                    context, material_analysis, slide_snapshot, workspace, self.settings.parsed_material_allowed_hosts,
+                )
+                materials = material_analysis.materials
                 material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in material_analysis.failures)
-                verified_titles = {material.titolo for material in materials}
-                slides = [original.model_copy(update={
-                    "material_title": matched.material_title if matched.material_title in verified_titles else None,
-                    "page": matched.page if matched.material_title in verified_titles else None,
-                }) for original, matched in zip(slides, material_analysis.slides, strict=True)]
+                slides = material_analysis.slides
                 progress(96, "Preparazione del report")
                 next_phase("report", error_code="MATERIALE_NON_RAGGIUNGIBILE" if material_failures else "ok")
                 usage = APIUsage(transcription=transcript.usage,

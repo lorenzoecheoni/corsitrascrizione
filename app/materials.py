@@ -407,7 +407,7 @@ def _reject_pdf_external_decoder(*args, **kwargs):
 
 
 def _pdf_object_streams(reader):
-    """Enumerate containers that resolving pypdf's compressed xrefs can decode.
+    """Enumerate containers decoded by xref parsing and object resolution.
 
     Containers are not normally trailer-reachable. Object streams cannot
     themselves be compressed objects (PDF 1.5); reject nested/cyclic tables
@@ -429,11 +429,24 @@ def _pdf_object_streams(reader):
                 or number in table or number not in direct):
             raise MaterialError()
         containers.add(number)
+    cached = getattr(reader, "resolved_objects", None)
+    if not isinstance(cached, dict) or len(cached) > 100_000:
+        raise MaterialError()
+    seen = set()
+    # Xref streams are decoded during PdfReader construction and retained in
+    # this cache, including incremental /Prev sections absent from the trailer.
+    for obj in tuple(cached.values()):
+        if isinstance(obj, StreamObject) and obj.get("/Type") in {"/ObjStm", "/XRef"}:
+            if id(obj) not in seen:
+                seen.add(id(obj))
+                yield obj
     for number in sorted(containers):
         obj = IndirectObject(number, 0, reader).get_object()
         if not isinstance(obj, StreamObject) or obj.get("/Type") != "/ObjStm":
             raise MaterialError()
-        yield obj
+        if id(obj) not in seen:
+            seen.add(id(obj))
+            yield obj
 
 
 def _pdf_content_stream_ids(reader) -> set[int]:

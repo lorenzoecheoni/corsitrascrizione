@@ -538,7 +538,7 @@ def write_object_stream_pdf(path, *, count=12, stream_bytes=9 * 1024 * 1024 + 22
     if rooted:
         probe += b"/Probe [" + b" ".join(f"{i} 0 R".encode() for i in range(first_embedded, xref_number)) + b"]"
     if direct_references:
-        probe += b"/Containers [" + b" ".join(f"{i} 0 R {i} 0 R".encode() for i in containers) + b"]"
+        probe += b"/Containers [" + b" ".join(f"{i} 0 R {i} 0 R".encode() for i in [*containers, xref_number]) + b"]"
     add(1, b"<< /Type /Catalog /Pages 2 0 R " + probe + b" >>")
     add(2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>")
     add(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
@@ -581,6 +581,27 @@ def test_pdf_object_streams_cannot_bypass_cumulative_100_mib_budget(tmp_path, ro
     assert list(tmp_path.iterdir()) == [deck]
 
 
+def test_pdf_initialization_xref_streams_share_the_cumulative_decoded_budget(tmp_path):
+    import zlib
+    deck = write_object_stream_pdf(tmp_path / "xref-stream-budget.pdf", count=0)
+    data = bytearray(deck.read_bytes())
+    previous = int(data.split(b"startxref\n")[-1].splitlines()[0])
+    for number in range(7, 19):
+        offset = len(data)
+        entry = b"\x01" + offset.to_bytes(4, "big") + b"\x00\x00"
+        compressed = zlib.compress(entry.ljust(9 * 1024 * 1024, b"\x00"))
+        data.extend(f"{number} 0 obj\n<< /Type /XRef /Size {number + 1} /Root 1 0 R "
+                    f"/Prev {previous} /W [1 4 2] /Index [{number} 1] /Filter /FlateDecode "
+                    f"/Length {len(compressed)} >>\nstream\n".encode() + compressed + b"\nendstream\nendobj\n")
+        data.extend(f"startxref\n{offset}\n%%EOF\n".encode())
+        previous = offset
+    deck.write_bytes(data)
+    assert deck.stat().st_size < 120 * 1024
+    with pytest.raises(MaterialError, match="^MATERIALE_NON_RAGGIUNGIBILE$"):
+        extract_deck_pages(deck)
+    assert list(tmp_path.iterdir()) == [deck]
+
+
 def test_pdf_object_stream_budget_is_checked_before_page_extraction(tmp_path, monkeypatch):
     import app.materials as module
     from pypdf._page import PageObject
@@ -604,7 +625,7 @@ def test_pdf_object_streams_count_once_across_xref_and_trailer_with_cycles(tmp_p
     reader = PdfReader(deck, strict=True)
     assert len(reader.xref_objStm) == 4
     assert len({value[0] for value in reader.xref_objStm.values()}) == 2
-    monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", 200)
+    monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", 300)
     assert module._pdf_pages(deck)[0].text.strip() == "safe"
 
 
@@ -613,7 +634,9 @@ def test_pdf_object_and_content_streams_share_one_inclusive_budget(tmp_path, mon
     import app.materials as module
     deck = write_object_stream_pdf(tmp_path / "combined-budget.pdf", count=2, stream_bytes=80,
                                    direct_references=True)
-    budget = 160 + len(b"BT /F1 12 Tf 10 10 Td (safe) Tj ET")
+    # Two 80-byte object containers, one content stream, one 13-entry xref
+    # stream with 7 bytes per entry. Shared trailer refs do not add copies.
+    budget = 160 + len(b"BT /F1 12 Tf 10 10 Td (safe) Tj ET") + 13 * 7
     monkeypatch.setattr(module, "MAX_UNCOMPRESSED_BYTES", budget - extra_byte)
     if extra_byte:
         with pytest.raises(MaterialError):

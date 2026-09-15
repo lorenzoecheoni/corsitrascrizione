@@ -26,12 +26,18 @@ _WORD_CHARACTER = re.compile(r"\w", re.UNICODE)
 _SAFE_NAME_SEPARATOR = re.compile(r"^[\s'’\-]{0,4}$")
 _HONORIFIC_SEPARATOR = re.compile(r"^\s{0,1}\.\s{0,2}$")
 _NAME_CONTEXT_SEPARATOR = re.compile(r"^[\s.'’\-]{1,4}$")
+_FOLLOWING_NAME_CONTEXT_SEPARATOR = re.compile(r"^[ \t'’\-]+$")
+_ORGANIZATION_CONTEXT_SEPARATOR = re.compile(r"^[ \t]*&[ \t]*$")
 _HONORIFIC_ABBREVIATION_KEYS = {"avv", "dott", "prof"}
 _STANDALONE_ALIAS_CONNECTORS = {
     "a", "ad", "ai", "al", "agli", "alla", "alle", "allo",
     "con", "da", "dai", "dal", "dagli", "dalla", "dalle", "dallo",
     "di", "dei", "del", "degli", "della", "delle", "dello",
     "e", "ed", "fra", "o", "od", "per", "su", "tra",
+}
+_ORGANIZATION_WORD_KEYS = {
+    "associati", "associates", "co", "company", "consulting", "figli",
+    "group", "gruppo", "partners", "sas", "snc", "spa", "srl", "studio",
 }
 _VIDEO_ROLE_KEYS = {"moderatore", "moderatrice"}
 _SURNAME_PARTICLES = {
@@ -99,7 +105,7 @@ def _has_unicode_word_boundaries(value: str, start: int, end: int) -> bool:
 
 
 def _is_surname_only_alias(alias_key: str, target: str) -> bool:
-    alias_tokens = alias_key.split()
+    alias_tokens = _name_key(parse_speaker_identity(alias_key).name).split()
     target_tokens = _name_key(target).split()
     return (
         len(alias_tokens) < len(target_tokens)
@@ -108,16 +114,36 @@ def _is_surname_only_alias(alias_key: str, target: str) -> bool:
 
 
 def _has_full_name_context(
-    value: str, words: Sequence[re.Match[str]], start_index: int,
+    value: str, words: Sequence[re.Match[str]], start_index: int, end_index: int,
 ) -> bool:
-    if start_index == 0:
-        return False
-    previous = words[start_index - 1]
-    separator = value[previous.end():words[start_index].start()]
-    return bool(
-        _NAME_CONTEXT_SEPARATOR.fullmatch(separator)
-        and _name_key(previous.group()) not in _STANDALONE_ALIAS_CONNECTORS
-    )
+    """Treat adjacent unknown words as identity context regardless of case."""
+    for edge_index, direction, separator_pattern in (
+        (start_index, -1, _NAME_CONTEXT_SEPARATOR),
+        (end_index, 1, _FOLLOWING_NAME_CONTEXT_SEPARATOR),
+    ):
+        adjacent_index = edge_index + direction
+        if not 0 <= adjacent_index < len(words):
+            continue
+        left_index, right_index = sorted((edge_index, adjacent_index))
+        separator = value[words[left_index].end():words[right_index].start()]
+        if _ORGANIZATION_CONTEXT_SEPARATOR.fullmatch(separator):
+            return True
+        if not separator_pattern.fullmatch(separator):
+            continue
+        if _name_key(words[adjacent_index].group()) not in _STANDALONE_ALIAS_CONNECTORS:
+            return True
+        # A grammatical connector may also be part of an organization name,
+        # such as "Studio di Morra" or "D'Andrea e Partners".
+        organization_index = adjacent_index + direction
+        if 0 <= organization_index < len(words):
+            left_index, right_index = sorted((adjacent_index, organization_index))
+            separator = value[words[left_index].end():words[right_index].start()]
+            if (
+                _FOLLOWING_NAME_CONTEXT_SEPARATOR.fullmatch(separator)
+                and _name_key(words[organization_index].group()) in _ORGANIZATION_WORD_KEYS
+            ):
+                return True
+    return False
 
 
 def correct_speaker_name_mentions(
@@ -165,7 +191,7 @@ def correct_speaker_name_mentions(
                 and not (
                     _is_surname_only_alias(alias_key, target)
                     and _has_full_name_context(
-                        value, words, start_index,
+                        value, words, start_index, end_index,
                     )
                 )
             ):
@@ -327,14 +353,14 @@ def _role_state(occurrence: _SpeakerOccurrence, honorific: str | None) -> _RoleS
     if occurrence.role is None:
         return state
 
-    organization_match = _ASSOHOLDING_ROLE.fullmatch(occurrence.role)
-    role_text = (
-        organization_match.group("role")
-        if organization_match is not None else occurrence.role
-    )
-    has_organization = organization_match is not None
-    for part in role_text.split(";"):
-        role = part.strip()
+    professional_roles: dict[str, str] = {}
+    professional_organization = False
+    for part in occurrence.role.split(";"):
+        organization_match = _ASSOHOLDING_ROLE.fullmatch(part.strip())
+        role = (
+            organization_match.group("role") if organization_match is not None else part
+        ).strip()
+        has_organization = organization_match is not None
         key = _name_key(role)
         if not key:
             continue
@@ -345,8 +371,17 @@ def _role_state(occurrence: _SpeakerOccurrence, honorific: str | None) -> _RoleS
             elif key == _name_key(state.video):
                 state.video_organization |= has_organization
             continue
-        rank = 1 if key == "relatore" else 3
-        _add_professional_role(state, role, rank, has_organization)
+        if key == "relatore":
+            _add_professional_role(state, role, 1, has_organization)
+        else:
+            professional_roles.setdefault(key, role)
+            professional_organization |= has_organization
+    if professional_roles:
+        # One source supports its whole bundle; conflicts arise only when merging
+        # different sources. Keep video roles separate until the final render.
+        _add_professional_role(
+            state, "; ".join(professional_roles.values()), 3, professional_organization,
+        )
     return state
 
 

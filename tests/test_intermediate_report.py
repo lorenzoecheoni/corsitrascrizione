@@ -794,13 +794,94 @@ def test_organization_qualification_combines_with_compatible_video_role() -> Non
     assert speaker.organizzazione == "Assoholding"
 
 
-@pytest.mark.parametrize("professional_role,expected_organization", [
-    ("Commercialista", None),
-    ("Commercialista di Assoholding", "Assoholding"),
+@pytest.mark.parametrize("role,expected_role,expected_organization", [
+    ("Commercialista; revisore legale", "Commercialista; revisore legale", None),
+    ("Avvocato; docente universitario", "Avvocato; docente universitario", None),
+    (
+        "Commercialista; revisore legale di Assoholding",
+        "Commercialista; revisore legale", "Assoholding",
+    ),
+    (
+        "Commercialista di Assoholding; revisore legale",
+        "Commercialista; revisore legale", "Assoholding",
+    ),
+    (
+        "Commercialista; revisore legale di Assoholding; moderatore",
+        "Commercialista; revisore legale; moderatore", "Assoholding",
+    ),
+    (
+        " Commercialista ; revisore legale ; commercialista ; REVISORE LEGALE ; ",
+        "Commercialista; revisore legale", None,
+    ),
+    (
+        "revisore legale; Commercialista; revisore legale",
+        "revisore legale; Commercialista", None,
+    ),
+    (
+        "Commercialista; moderatore; revisore legale; MODERATORE",
+        "Commercialista; revisore legale; moderatore", None,
+    ),
+    (
+        "Relatore; Commercialista; revisore legale",
+        "Commercialista; revisore legale", None,
+    ),
+])
+def test_single_source_explicit_qualification_bundle_is_preserved(
+    role: str, expected_role: str, expected_organization: str | None,
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Dottor Morra", role=role, confidence="alta",
+        evidence=[{"kind": "slide", "note": "Qualifiche esplicite nella stessa fonte."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == expected_role
+    assert speaker.organizzazione == expected_organization
+
+
+@pytest.mark.parametrize("first_role,second_role", [
+    ("Commercialista; revisore legale", "Avvocato; docente universitario"),
+    ("Avvocato; docente universitario", "Commercialista; revisore legale"),
+])
+def test_conflicting_source_bundles_keep_the_first_complete_qualification(
+    first_role: str, second_role: str,
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id=f"luigi-{index}", display_name="Luigi Morra", role=role,
+            confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifiche esplicite nella fonte."}],
+        )
+        for index, role in enumerate((first_role, second_role))
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == first_role
+
+
+@pytest.mark.parametrize("professional_role,expected_role,expected_organization", [
+    ("Commercialista", "Commercialista; moderatore", None),
+    ("Commercialista di Assoholding", "Commercialista; moderatore", "Assoholding"),
+    (
+        "Commercialista; revisore legale",
+        "Commercialista; revisore legale; moderatore", None,
+    ),
+    (
+        "Commercialista; revisore legale di Assoholding",
+        "Commercialista; revisore legale; moderatore", "Assoholding",
+    ),
 ])
 @pytest.mark.parametrize("order", list(permutations(range(3))))
 def test_role_specificity_is_independent_from_evidence_order(
-    professional_role: str, expected_organization: str | None,
+    professional_role: str, expected_role: str, expected_organization: str | None,
     order: tuple[int, int, int],
 ) -> None:
     report = make_report([
@@ -827,7 +908,7 @@ def test_role_specificity_is_independent_from_evidence_order(
 
     speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
 
-    assert speaker.ruolo == "Commercialista; moderatore"
+    assert speaker.ruolo == expected_role
     assert speaker.organizzazione == expected_organization
 
 

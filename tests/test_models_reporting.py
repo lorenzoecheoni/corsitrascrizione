@@ -476,6 +476,52 @@ def test_narrative_surname_alias_protection_is_case_and_unicode_independent(
     ) == text
 
 
+@pytest.mark.parametrize("text", [
+    "Morra Mario", "morra mario", "mOrRa mArIo",
+    "D’Andrea Fabio", "d’andrea fabio", "D’aNdReA fAbIo",
+    "Morra Group", "morra group", "mOrRa gRoUp",
+    "D’Andrea & Partners", "d’andrea & partners", "D’aNdReA & pArTnErS",
+    "Morra Consulting", "D’Andrea associati", "Morra G.",
+    "intervento di Morra Mario", "con D’Andrea & Partners",
+    "Dott. Morra Mario", "dott. morra group", "Avv. D’Andrea Fabio",
+    "D’Andrea e Partners", "morra e associati", "Studio di Morra",
+    "Partners & Morra", "pArTnErS & d’AnDrEa",
+])
+def test_surname_alias_keeps_following_person_or_organization_context(text: str) -> None:
+    assert reporting.correct_speaker_name_mentions(
+        text,
+        ["Luigi Morra", "Furio D’Andrea"],
+        {
+            "morra": "Luigi Morra", "dott morra": "Luigi Morra",
+            "d andrea": "Furio D’Andrea", "avv d andrea": "Furio D’Andrea",
+        },
+    ) == text
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("Slide · Morra", "Slide · Luigi Morra"),
+    ("Dott. Morra", "Luigi Morra"),
+    ("Avv. D’Andrea", "Furio D’Andrea"),
+    ("Morra. Mario", "Luigi Morra. Mario"),
+    ("Morra; Mario", "Luigi Morra; Mario"),
+    ("D’Andrea · Partners", "Furio D’Andrea · Partners"),
+    ("Morra e D’Andrea", "Luigi Morra e Furio D’Andrea"),
+    ("Morra e: Partners", "Luigi Morra e: Partners"),
+    ("Studio. Di Morra", "Studio. Di Luigi Morra"),
+])
+def test_surname_context_does_not_consume_honorifics_or_cross_prose_punctuation(
+    text: str, expected: str,
+) -> None:
+    assert reporting.correct_speaker_name_mentions(
+        text,
+        ["Luigi Morra", "Furio D’Andrea"],
+        {
+            "morra": "Luigi Morra", "dott morra": "Luigi Morra",
+            "d andrea": "Furio D’Andrea", "avv d andrea": "Furio D’Andrea",
+        },
+    ) == expected
+
+
 @pytest.mark.parametrize(("text", "expected"), [
     ("morra", "Luigi Morra"),
     ("MORRA", "Luigi Morra"),

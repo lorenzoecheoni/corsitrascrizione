@@ -1046,6 +1046,71 @@ def test_downloader_does_not_convert_internal_connection_error(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("mode,payload", [
+    ("fetch", None), ("parse", None), ("match", None), ("fetch", ""),
+    ("fetch", "<directory>"),
+    ("parse", '[{"number":2,"text":"private"}]'),
+    ("parse", '[{"number":1,"text":"private"},{"number":1,"text":"private"}]'),
+    ("parse", '{"PRIVATE": true}'), ("parse", 'PRIVATE-NOT-JSON'),
+    ("parse", '[{"number":true,"text":"private"}]'),
+    ("parse", '[{"number":1,"text":null}]'),
+    ("parse", '[{"number":1,"text":"private","extra":"PRIVATE"}]'),
+    pytest.param("parse", "[" * (sys.getrecursionlimit() + 100) + "0" + "]" * (sys.getrecursionlimit() + 100), id="deep_json"),
+    pytest.param("parse", "[" + "9" * 5000 + "]", id="oversized_integer"),
+    ("match", 'PRIVATE-NOT-JSON'), ("match", '{"PRIVATE": true}'),
+    ("match", '[["Slide · Furio D\'Andrea",true]]'),
+    ("match", '[["Slide · Furio D\'Andrea",1.0]]'),
+    ("match", '[["Slide · Furio D\'Andrea"]]'),
+    ("match", '[[null,1]]'), ("match", '[]'),
+])
+def test_successful_worker_requires_complete_typed_result(tmp_path, monkeypatch, mode, payload):
+    import app.materials as module
+    source = write_test_pptx(tmp_path / "source.pptx", [["Decisioni assembleari"]])
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    def worker(stage, source, output, **kwargs):
+        assert stage == mode
+        if payload == "<directory>":
+            output.mkdir()
+        elif payload is not None:
+            output.write_text(payload)
+    monkeypatch.setattr(module, "_run_worker", worker)
+    with pytest.raises(module.MaterialInternalError, match="^MATERIAL_INTERNAL_ERROR$"):
+        if mode == "fetch":
+            fetch_deck(URL, workspace, ("www.assoholding.it",))
+        elif mode == "parse":
+            extract_deck_pages(source)
+        else:
+            module._match_in_workspace([slide()], [(ReportMaterial(titolo=TITLE, url=URL, pagine=1),
+                (DeckPage(1, "Decisioni assembleari"),))], workspace, Event())
+    assert list(workspace.iterdir()) == []
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["job", "source.pptx"]
+
+
+@pytest.mark.parametrize("boundary", ["connection", "stream"])
+def test_downloader_internal_valueerror_propagates(tmp_path, boundary):
+    def connection(*args, **kwargs):
+        raise ValueError("PRIVATE-INTERNAL-CONNECTION-BUG")
+    with pytest.raises(ValueError, match="PRIVATE-INTERNAL-CONNECTION-BUG"):
+        if boundary == "connection":
+            _download_https(URL, tmp_path / "result", ("www.assoholding.it",),
+                            resolver=dns, connection_factory=connection)
+        else:
+            download(URL, tmp_path / "result", [Response(chunks=[b"partial", ValueError("PRIVATE-INTERNAL-CONNECTION-BUG")])])
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("url,headers", [
+    ("https://www.assoholding.it:invalid/deck", {}),
+    ("https://[broken/deck", {}), (URL, {"content-length": "PRIVATE-NOT-A-NUMBER"}),
+    (URL, {"content-length": "1.5"}),
+])
+def test_external_url_and_header_format_errors_remain_operational(tmp_path, url, headers):
+    with pytest.raises(MaterialError, match="^MATERIALE_NON_RAGGIUNGIBILE$"):
+        download(url, tmp_path / "result", [Response(headers=headers)])
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_worker_deadline_also_stops_descendants(tmp_path, monkeypatch):
     import app.materials as module
     real_popen = subprocess.Popen

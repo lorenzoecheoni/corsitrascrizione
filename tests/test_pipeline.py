@@ -335,6 +335,37 @@ def test_invalid_worker_success_payload_is_internal_failure(components, tmp_path
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("mode", ["fetch", "parse", "match", "connection_valueerror"])
+def test_missing_worker_output_and_downloader_bug_fail_job_safely(components, tmp_path, monkeypatch, caplog, mode):
+    import app.materials as module
+    from test_materials import write_test_pptx, dns
+    caplog.set_level("INFO")
+    material_context(components)
+    def connection(*args, **kwargs):
+        raise ValueError("PRIVATE-INTERNAL-CONNECTION-BUG")
+    def worker(stage, source, output, **kwargs):
+        if stage == mode:
+            return
+        if stage == "fetch":
+            if mode == "connection_valueerror":
+                module._download_https(source, output, ("www.assoholding.it",),
+                                       resolver=dns, connection_factory=connection)
+            else:
+                write_test_pptx(output, [["Decisioni assembleari"]])
+        elif stage == "parse":
+            output.write_text('[{"number":1,"text":"Decisioni assembleari"}]')
+        else:
+            raise AssertionError("unexpected worker phase")
+    monkeypatch.setattr(module, "_run_worker", worker)
+    components.pipeline.material_processor = MaterialProcessor()
+    updates = []
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert caught.value.code == "temporary_failure"
+    assert list(tmp_path.iterdir()) == [] and 100 not in updates
+    assert "PRIVATE-INTERNAL-CONNECTION-BUG" not in str(caught.value) + caplog.text
+
+
 @pytest.mark.parametrize("mutation", ["scalars", "nested"])
 def test_material_processor_cannot_mutate_slide_observations(components, mutation):
     material_context(components)

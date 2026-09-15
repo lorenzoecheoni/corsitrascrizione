@@ -30,7 +30,8 @@ SOURCE = f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}"
 
 
 @pytest.mark.parametrize("mode", ["success", "signed", "fetch_failure", "bug",
-    "worker_fetch_bug", "worker_parse_bug", "worker_match_bug", "contract", "mutation"])
+    "worker_fetch_bug", "worker_parse_bug", "worker_match_bug", "contract", "mutation",
+    "worker_fetch_missing", "worker_parse_missing", "worker_match_missing"])
 def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkeypatch, caplog, mode):
     from app.materials import MaterialError, MaterialProcessor
     from app.media import AudioChunk, FrameCandidate, MediaArtifacts
@@ -97,10 +98,12 @@ def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkey
             original_worker = module._run_worker
             def worker(stage, *args, **kwargs):
                 if stage == mode.split("_")[1]:
+                    if mode.endswith("_missing"):
+                        return
                     raise TypeError("PRIVATE-WORKER-DIAGNOSTIC")
                 return original_worker(stage, *args, **kwargs)
             monkeypatch.setattr(module, "_run_worker", worker)
-            if mode == "worker_fetch_bug":
+            if mode.startswith("worker_fetch_"):
                 app.state.pipeline.material_processor.fetcher = module.fetch_deck
         if mode in {"contract", "mutation"}:
             from app.materials import MaterialAnalysis

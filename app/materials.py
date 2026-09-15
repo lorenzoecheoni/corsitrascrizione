@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import signal
+import shutil
 import socket
 import stat
 import subprocess
@@ -96,10 +97,14 @@ class MaterialAnalysis:
 def _validate_url(url: str, allowed_hosts: Sequence[str]) -> tuple[str, str]:
     if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url) or "\\" in url:
         raise MaterialError()
-    parsed = urlsplit(url)
-    host = parsed.hostname or ""
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        raise MaterialError() from None
     if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
-            or parsed.port not in (None, 443) or host not in allowed_hosts):
+            or port not in (None, 443) or host not in allowed_hosts):
         raise MaterialError()
     # Exact DNS names only, regardless of what an operator added to the allowlist.
     try:
@@ -119,7 +124,10 @@ def _public_addresses(host: str, resolver: Callable) -> tuple[str, ...]:
     for family, socktype, protocol, _, address in answers:
         if family not in (socket.AF_INET, socket.AF_INET6):
             raise MaterialError()
-        ip = ipaddress.ip_address(address[0])
+        try:
+            ip = ipaddress.ip_address(address[0])
+        except ValueError:
+            raise MaterialError() from None
         if not ip.is_global or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
             raise MaterialError()
         if isinstance(ip, ipaddress.IPv6Address) and (
@@ -185,8 +193,12 @@ def _download_https(
                 location = response.getheader("location")
                 if not location or hop == 5:
                     raise MaterialError()
-                url = urljoin(url, location)
-                if urlsplit(url).query or urlsplit(url).fragment:
+                try:
+                    url = urljoin(url, location)
+                    redirect = urlsplit(url)
+                except ValueError:
+                    raise MaterialError() from None
+                if redirect.query or redirect.fragment:
                     # The public source must not silently resolve to a signed
                     # location whose identity cannot be safely persisted.
                     raise MaterialError()
@@ -198,7 +210,10 @@ def _download_https(
             if response.getheader("content-encoding", "identity").lower() != "identity":
                 raise MaterialError()
             length = response.getheader("content-length")
-            declared = None if length is None else int(length)
+            try:
+                declared = None if length is None else int(length)
+            except ValueError:
+                raise MaterialError() from None
             if declared is not None and not 0 <= declared <= MAX_DOWNLOAD_BYTES:
                 raise MaterialError()
             total = 0
@@ -219,7 +234,7 @@ def _download_https(
             completed = True
             return
         raise MaterialError()
-    except (MaterialError, OSError, http.client.HTTPException, ValueError):
+    except (MaterialError, OSError, http.client.HTTPException):
         raise MaterialError() from None
     finally:
         if created and not completed:
@@ -277,6 +292,32 @@ def _run_worker(
             process.wait()
 
 
+def _worker_output_size(output: Path, maximum: int) -> int:
+    """A successful worker must have produced a bounded regular result file."""
+    try:
+        info = output.lstat()
+    except OSError:
+        raise MaterialInternalError() from None
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= maximum:
+        raise MaterialInternalError()
+    return info.st_size
+
+
+def _read_worker_json(output: Path):
+    size = _worker_output_size(output, MAX_RESULT_BYTES)
+    try:
+        with output.open("rb") as result:
+            data = result.read(MAX_RESULT_BYTES + 1)
+    except OSError:
+        raise MaterialInternalError() from None
+    if len(data) != size:
+        raise MaterialInternalError()
+    try:
+        return json.loads(data)
+    except (ValueError, UnicodeError):
+        raise MaterialInternalError() from None
+
+
 def fetch_deck(
     url: str, workspace: Path, allowed_hosts: Sequence[str] | str,
     cancellation_event: Event | None = None,
@@ -289,8 +330,7 @@ def fetch_deck(
         _validate_url(url, hosts)
         _run_worker("fetch", url, destination, allowed_hosts=hosts,
                     timeout=DOWNLOAD_TIMEOUT_SECONDS, cancellation_event=cancellation_event)
-        if not destination.is_file() or not 0 < destination.stat().st_size <= MAX_DOWNLOAD_BYTES:
-            raise MaterialError()
+        _worker_output_size(destination, MAX_DOWNLOAD_BYTES)
         completed = True
         return destination
     except CancelledError:
@@ -299,7 +339,12 @@ def fetch_deck(
         raise MaterialError() from None
     finally:
         if not completed:
-            destination.unlink(missing_ok=True)
+            if destination.is_dir() and not destination.is_symlink():
+                # A bogus successful worker may have created a directory at its
+                # generated output path. Cleanup must not mask the contract error.
+                shutil.rmtree(destination)
+            else:
+                destination.unlink(missing_ok=True)
 
 
 def _xml(data: bytes) -> ElementTree.Element:
@@ -646,15 +691,16 @@ def extract_deck_pages(path: Path, *, cancellation_event: Event | None = None) -
             output = Path(directory) / "pages.json"
             _run_worker("parse", str(path), output, timeout=PARSE_TIMEOUT_SECONDS,
                         cancellation_event=cancellation_event)
-            if output.stat().st_size > MAX_RESULT_BYTES:
-                raise MaterialError()
-            records = json.loads(output.read_text(encoding="utf-8"))
-            if not 1 <= len(records) <= MAX_PAGES:
+            records = _read_worker_json(output)
+            if type(records) is not list or not 1 <= len(records) <= MAX_PAGES:
+                raise MaterialInternalError()
+            if any(type(record) is not dict or set(record) != {"number", "text"}
+                   or type(record["number"]) is not int or record["number"] != index
+                   or type(record["text"]) is not str or len(record["text"]) > MAX_PAGE_TEXT
+                   for index, record in enumerate(records, 1)):
                 raise MaterialInternalError()
             pages = tuple(DeckPage(record["number"], record["text"]) for record in records)
-            if (any(type(p.number) is not int or p.number < 1 or not isinstance(p.text, str)
-                    or len(p.text) > MAX_PAGE_TEXT for p in pages)
-                    or sum(len(p.text) for p in pages) > MAX_TOTAL_TEXT):
+            if sum(len(p.text) for p in pages) > MAX_TOTAL_TEXT:
                 raise MaterialInternalError()
             return pages
     except CancelledError:
@@ -750,13 +796,14 @@ def _match_in_workspace(slides, decks, workspace, cancellation_event) -> tuple[S
                     target.write(encoded)
             _run_worker("match", str(input_path), output_path, timeout=MATCH_TIMEOUT_SECONDS,
                         cancellation_event=cancellation_event)
-            if output_path.stat().st_size > MAX_RESULT_BYTES:
-                raise MaterialError()
-            links = json.loads(output_path.read_text(encoding="utf-8"))
+            links = _read_worker_json(output_path)
             title_counts = Counter(material.titolo for material, _ in decks)
             valid = {(material.titolo, page.number) for material, pages in decks for page in pages
                      if title_counts[material.titolo] == 1}
-            if len(links) != len(slides) or any(tuple(link) not in valid | {(None, None)} for link in links):
+            if (type(links) is not list or len(links) != len(slides)
+                    or any(type(link) is not list or len(link) != 2
+                           or not (link == [None, None] or type(link[0]) is str and type(link[1]) is int)
+                           or tuple(link) not in valid | {(None, None)} for link in links)):
                 raise MaterialInternalError()
             check_cancelled(cancellation_event)
             return tuple(slide.model_copy(update={"material_title": title, "page": page})

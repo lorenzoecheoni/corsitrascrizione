@@ -1,19 +1,15 @@
 """Build the one-video Academy intermediate report v1.1 envelope."""
 
-import asyncio
-import ipaddress
+import math
 import re
-import time
 import unicodedata
-from pathlib import Path
-from typing import Callable, Mapping, Sequence
-from urllib.parse import urljoin, urlparse
+from typing import Mapping, Sequence
 from uuid import UUID
 
-import httpx
-
 from app.academy_registry import registered_slug
-from app.boundaries import has_complete_boundary_evidence, nearest_second
+from app.boundaries import has_complete_boundary_evidence
+from app.materials import parse_material_source as parse_declared_material_source
+from app.material_registry import canonical_material_title
 from app.intermediate_models import (
     IntermediateInterventionV11,
     IntermediateMaterialV11,
@@ -55,7 +51,6 @@ _INTRODUCTORY_VERB = re.compile(
     r"^(?:approfondisce|tratta|descrive|presenta|illustra|discute|spiega|parla di)\s+",
     re.IGNORECASE,
 )
-_HTTP_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 def _name_key(value: str) -> str:
@@ -129,9 +124,11 @@ def normalize_interventions(
     video_key: str = "v1",
     *,
     stored_to_exported_ids: Mapping[str, str] | None = None,
+    duration_seconds: int | None = None,
 ) -> list[IntermediateInterventionV11]:
     """Copy and deterministically normalize persisted analytical interventions."""
     normalized = []
+    duration_seconds = math.floor(report.duration_seconds) if duration_seconds is None else duration_seconds
     ordered_interventions = sorted(report.interventions, key=lambda item: item.start_seconds)
     exported_ids = (
         stored_to_exported_ids
@@ -144,7 +141,7 @@ def normalize_interventions(
     for intervention in ordered_interventions:
         duration = intervention.end_seconds - intervention.start_seconds
         kind = intervention.tipo
-        if kind == "intervento" and duration < 20:
+        if report.analysis_profile != 2 and kind == "intervento" and duration < 20:
             kind = _short_segment_kind(
                 title=intervention.titolo,
                 summary=intervention.sintesi,
@@ -152,8 +149,8 @@ def normalize_interventions(
             )
         normalized.append(IntermediateInterventionV11(
             id=exported_ids[intervention.id],
-            inizio=intervention.start_seconds,
-            fine=intervention.end_seconds,
+            inizio=intervention.start_seconds if report.analysis_profile == 2 else min(intervention.start_seconds, duration_seconds),
+            fine=intervention.end_seconds if report.analysis_profile == 2 else min(intervention.end_seconds, duration_seconds),
             tipo=kind,
             relatori=list(intervention.relatori),
             titolo=intervention.titolo,
@@ -164,7 +161,7 @@ def normalize_interventions(
             blocco=intervention.block_id,
             capitolo_numero=intervention.chapter_number,
             capitoli_blocco=intervention.chapters_in_block,
-            confine_inizio=intervention.boundary_origin,
+            confine_inizio=intervention.boundary_origin.model_dump() if intervention.boundary_origin else None,
         ))
     return normalized
 
@@ -181,10 +178,28 @@ def build_boundary_verifications(
     stored_to_exported_ids: Mapping[str, str],
 ) -> list[VerificationRequestV11]:
     """Render one auditable warning for every final neighboring pair."""
-    if not has_complete_boundary_evidence(report):
+    if report.analysis_profile == 2:
+        ordered = sorted(report.interventions, key=lambda item: item.start_seconds)
+        evidence_by_next = {evidence.next_intervention_id: evidence for evidence in report.boundaries}
+        complete = (
+            report.audio_boundary_version == 1 and bool(ordered)
+            and len(evidence_by_next) == len(report.boundaries) == len(ordered) - 1
+            and len({item.id for item in ordered}) == len(ordered)
+        )
+        for previous, following in zip(ordered, ordered[1:]):
+            evidence = evidence_by_next.get(following.id)
+            complete = complete and evidence is not None and (
+                evidence.previous_intervention_id == previous.id
+                and evidence.boundary_seconds == previous.end_seconds == following.start_seconds
+                and (previous.tipo != "pausa" or (not evidence.words_before and evidence.pause_before))
+                and (following.tipo != "pausa" or (not evidence.words_after and evidence.pause_after))
+            )
+    else:
+        complete = has_complete_boundary_evidence(report)
+    if not complete:
         raise ValueError("Il report non contiene prove complete dei confini")
     checks = []
-    for evidence in report.boundaries:
+    for evidence in sorted(report.boundaries, key=lambda item: item.boundary_seconds):
         previous_id = stored_to_exported_ids[evidence.previous_intervention_id]
         next_id = stored_to_exported_ids[evidence.next_intervention_id]
         message = (
@@ -202,12 +217,10 @@ def build_boundary_verifications(
 def choose_public_intervention(
     interventions: Sequence[IntermediateInterventionV11],
 ) -> str | None:
-    """Return the id selected by the fixed Academy preview ranking."""
+    """Choose only the first chronological didactic chapter of 480–900 seconds."""
     duration = lambda item: item.end_seconds - item.start_seconds
-    eligible = [item for item in interventions if item.tipo == "intervento"]
-    preview = next((item for item in eligible if 480 <= duration(item) < 900), None)
-    preview = preview or next((item for item in eligible if duration(item) >= 480), None)
-    preview = preview or max(eligible, key=duration, default=None)
+    eligible = sorted((item for item in interventions if item.tipo == "intervento"), key=lambda item: item.start_seconds)
+    preview = next((item for item in eligible if 480 <= duration(item) <= 900), None)
     return preview.id if preview else None
 
 
@@ -245,101 +258,8 @@ def _deduplicate_verifications(
 
 def parse_material_source(value: str) -> IntermediateMaterialV11 | None:
     """Conservatively convert one declared inventory material into a source."""
-    source = value.strip()
-    if not source:
-        return None
-    match = _HTTP_URL.search(source)
-    if match is not None:
-        url = match.group().rstrip(").,|")
-        title = re.sub(r"[\s|\-]+$", "", source[:match.start()])
-        if not title:
-            try:
-                title = Path(urlparse(url).path).name or url
-            except ValueError:
-                title = url
-        return IntermediateMaterialV11(titolo=title, url=url)
-    path = Path(source)
-    return IntermediateMaterialV11(titolo=path.stem, file=path.name)
-
-
-def _is_safe_material_url(url: str) -> bool:
-    """Allow only credential-free HTTP(S) URLs with a public literal address.
-
-    Hostnames fail closed: validating a DNS answer separately from the HTTPX
-    connection would allow that hostname to rebind before the actual connect.
-    """
-    try:
-        parsed = urlparse(url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            return False
-        try:
-            address = ipaddress.ip_address(parsed.hostname)
-        except ValueError:
-            return False
-        return address.is_global
-    except ValueError:
-        return False
-
-
-def _material_url_is_reachable(url: str) -> bool:
-    """Probe in a private event loop, cancelling network I/O before five seconds.
-
-    The 0.5-second reserve covers socket/client and event-loop cleanup. Public
-    literal addresses avoid DNS executor work; no worker threads are created.
-    """
-    deadline = time.monotonic() + 4.5
-    if not _is_safe_material_url(url):
-        return False
-    return asyncio.run(_probe_material_url(url, deadline))
-
-
-async def _probe_material_url(url: str, deadline: float) -> bool:
-    """Cancel connect, response headers and all redirects under one deadline."""
-    current_url = url
-    opened_streams = []
-
-    async def remember_stream(event: str, info: dict) -> None:
-        # A cancelled TLS handshake may precede HTTPX's ownership of the TCP
-        # stream. Retain it via the trace extension so that path is closed too.
-        if event == "connection.connect_tcp.complete":
-            opened_streams.append(info["return_value"])
-
-    try:
-        async with asyncio.timeout(max(0, deadline - time.monotonic())):
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(4.5), follow_redirects=False, trust_env=False,
-            ) as client:
-                for _ in range(20):
-                    if not _is_safe_material_url(current_url):
-                        return False
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return False
-                    async with client.stream(
-                        "GET", current_url, timeout=httpx.Timeout(remaining),
-                        extensions={"trace": remember_stream},
-                    ) as response:
-                        if time.monotonic() > deadline:
-                            return False
-                        if 200 <= response.status_code < 300:
-                            return True
-                        if not 300 <= response.status_code < 400:
-                            return False
-                        location = response.headers.get("location")
-                        if location is None:
-                            return True
-                        current_url = urljoin(current_url, location)
-    except (httpx.HTTPError, OSError, ValueError, TimeoutError):
-        return False
-    finally:
-        for stream in opened_streams:
-            await stream.aclose()
-    return False
+    material = parse_declared_material_source(value)
+    return IntermediateMaterialV11.model_validate(material.model_dump()) if material else None
 
 
 def build_verifications(
@@ -363,6 +283,12 @@ def build_verifications(
                 "avviso", "INTERVENTO_BREVE", video=video.chiave,
                 intervention=item.id, field="durata",
                 message="Intervento separato inferiore a due minuti.",
+            ))
+        if item.tipo == "intervento" and duration > 1200:
+            checks.append(_verification(
+                "avviso", "INTERVENTO_LUNGO", video=video.chiave,
+                intervention=item.id, field="durata",
+                message="Capitolo didattico superiore a venti minuti.",
             ))
         if item.confidenza < .8:
             checks.append(_verification(
@@ -397,6 +323,12 @@ def build_verifications(
                 _speaker_warning(speaker.nome, speaker.ruolo)
             ))
     for index, slide in enumerate(video.slide):
+        if slide.materiale is None or slide.pagina is None:
+            checks.append(_verification(
+                "avviso", "SLIDE_NON_ABBINATA", video=video.chiave,
+                field=f"slide[{index}]",
+                message="Slide rilevata senza abbinamento completo a materiale e pagina.",
+            ))
         if slide.confidenza < .7:
             checks.append(_verification(
                 "avviso", "CONFIDENZA_BASSA", video=video.chiave,
@@ -417,10 +349,24 @@ def build_intermediate_report(
     guid: UUID,
     *,
     material_sources: Sequence[str] = (),
-    material_url_checker: Callable[[str], bool] | None = None,
 ) -> IntermediateReportV11:
-    """Transform one persisted report, with bounded checks for declared material URLs."""
+    """Build profile 2 exclusively from persisted evidence, without I/O."""
+    duration = math.floor(report.duration_seconds)
     ordered_interventions = sorted(report.interventions, key=lambda item: item.start_seconds)
+    ordered_blocks = sorted(report.speech_blocks, key=lambda item: item.start_seconds)
+    if report.analysis_profile == 2:
+        report = report.model_copy(update={
+            "interventions": ordered_interventions, "speech_blocks": ordered_blocks,
+        })
+    block_ids = {block.id: f"v1-b{index:03d}" for index, block in enumerate(ordered_blocks, 1)}
+    if len(block_ids) != len(ordered_blocks) or any(not block_id.strip() for block_id in block_ids):
+        raise ValueError("I blocchi parlato richiedono identificativi univoci")
+    if report.analysis_profile == 2 and any(
+        chapter.tipo not in {"pausa", "logistica"}
+        and (chapter.block_id not in block_ids or (index > 0 and chapter.boundary_origin is None))
+        for index, chapter in enumerate(ordered_interventions)
+    ):
+        raise ValueError("Ogni capitolo richiede un blocco persistito e l'origine del confine")
     stored_to_exported_ids = {
         stored.id: f"v1-i{index:03d}"
         for index, stored in enumerate(ordered_interventions, start=1)
@@ -428,27 +374,21 @@ def build_intermediate_report(
     boundary_verifications = build_boundary_verifications(
         report, stored_to_exported_ids,
     )
-    checker = material_url_checker or _material_url_is_reachable
     materials: list[IntermediateMaterialV11] = []
-    material_failures: list[str] = []
+    material_failures: list[str] = [
+        "MATERIALE_NON_RAGGIUNGIBILE" for _ in report.material_failures
+    ]
     seen_sources: set[str] = set()
-    for source in material_sources:
+    for source in (() if report.analysis_profile == 2 else material_sources):
         if source in seen_sources:
             continue
         seen_sources.add(source)
         material = parse_material_source(source)
         if material is None:
+            material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
             continue
         materials.append(material)
-        if material.url is None:
-            material_failures.append(source)
-            continue
-        try:
-            reachable = checker(material.url)
-        except Exception:
-            reachable = False
-        if not reachable:
-            material_failures.append(source)
+        material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
     reconciliation = reconcile_speakers_detailed(report)
     speakers = [
         speaker for speaker in reconciliation.speakers
@@ -461,17 +401,27 @@ def build_intermediate_report(
         ambiguous_aliases=reconciliation.ambiguous_aliases,
     )
 
+    material_titles = {}
+    material_by_source = {}
     for material in report.materials:
+        key = (material.url, material.file)
+        title = corrected(canonical_material_title(material.titolo))
+        if key in material_by_source:
+            material_titles[material.titolo] = material_by_source[key].titolo
+            continue
         material_speakers = rewrite_speaker_references(
             [material.relatore] if material.relatore else [], canonical_by_key,
         )
-        materials.append(IntermediateMaterialV11.model_validate({
-            "titolo": corrected(material.titolo),
+        exported_material = IntermediateMaterialV11.model_validate({
+            "titolo": title,
             "relatore": material_speakers[0] if material_speakers else None,
             "url": material.url,
             "file": material.file,
             "pagine": material.pagine,
-        }))
+        })
+        material_by_source[key] = exported_material
+        material_titles[material.titolo] = title
+        materials.append(exported_material)
 
     intermediate_speakers: list[IntermediateSpeakerV11] = []
     for speaker in speakers:
@@ -487,13 +437,14 @@ def build_intermediate_report(
         }))
 
     normalized = normalize_interventions(
-        report, stored_to_exported_ids=stored_to_exported_ids,
+        report, stored_to_exported_ids=stored_to_exported_ids, duration_seconds=duration,
     )
     corrected_interventions = [item.model_copy(update={
         "relatori": rewrite_speaker_references(item.relatori, canonical_by_key),
         "titolo": corrected(item.titolo),
         "sintesi": corrected(item.sintesi),
         "punti_chiave": [corrected(point) for point in item.punti_chiave],
+        "blocco": block_ids.get(item.blocco, item.blocco),
     }) for item in normalized]
     public_id = choose_public_intervention(corrected_interventions)
     interventions = [item.model_copy(update={
@@ -501,17 +452,19 @@ def build_intermediate_report(
     }) for item in corrected_interventions]
 
     slides = [{
-        "inizio": slide.timestamp_seconds,
+        "inizio": slide.timestamp_seconds if report.analysis_profile == 2 else min(slide.timestamp_seconds, duration),
         "titolo": corrected(slide.title) if slide.title else "Senza titolo",
         "testo_principale": corrected(" · ".join(slide.visible_content))[:500],
         "confidenza": _CONFIDENCE_SCORE[slide.confidence],
+        "materiale": material_titles.get(slide.material_title, corrected(canonical_material_title(slide.material_title))) if slide.material_title else None,
+        "pagina": slide.page,
     } for slide in report.slides]
 
     video_data = {
         "chiave": "v1",
         "guid": str(guid),
         "titolo_bunny": corrected(report.bunny_title),
-        "durata_secondi": nearest_second(report.duration_seconds),
+        "durata_secondi": duration,
         "ordine": 1,
         "lingua": report.detected_language,
         "sinossi": corrected(report.synopsis),
@@ -522,7 +475,7 @@ def build_intermediate_report(
     if report.analysis_profile == 2:
         video_data.update({
             "blocchi_parlato": [{
-                "id": block.id,
+                "id": block_ids[block.id],
                 "inizio": block.start_seconds,
                 "fine": block.end_seconds,
                 "tipo": block.tipo,
@@ -533,6 +486,7 @@ def build_intermediate_report(
                 "sinossi": corrected(block.sinossi),
             } for block in report.speech_blocks],
             "costo_stimato": {
+                "valuta": "USD",
                 "minimo": report.cost.estimated_low_usd,
                 "massimo": report.cost.estimated_high_usd,
                 "banda_bunny": report.cost.bunny_bandwidth_usd,

@@ -66,6 +66,37 @@ def test_v11_retains_factual_blocks_and_cost_contract():
 
 
 @pytest.mark.parametrize("mutation", [
+    lambda video: video["slide"].append({"inizio": "0:10:01", "titolo": "Slide", "testo_principale": "", "confidenza": .9}),
+    lambda video: video["interventi"][0]["confine_inizio"].update(slide_indizio_seconds=600.9),
+    lambda video: video["slide"].append({"inizio": 2, "titolo": "Slide", "testo_principale": "", "confidenza": .9, "materiale": "Missing", "pagina": 1}),
+    lambda video: video.update(materiali=[{"titolo": "Deck", "file": "deck.pptx", "pagine": 2}],
+        slide=[{"inizio": 2, "titolo": "Slide", "testo_principale": "", "confidenza": .9, "materiale": "Deck", "pagina": 3}]),
+    lambda video: video.update(materiali=[{"titolo": "Deck", "file": "one.pptx"}, {"titolo": "Deck", "file": "two.pptx"}]),
+])
+def test_granular_contract_rejects_out_of_bounds_hints_and_invalid_material_references(mutation):
+    data = valid_payload()
+    mutation(data["video"][0])
+    with pytest.raises(ValidationError):
+        IntermediateReportV11.model_validate(data)
+
+
+def test_granular_contract_does_not_allow_public_nondidactic_segments():
+    data = _two_block_payload_with_exact_pause()
+    data["video"][0]["interventi"][-1]["accesso"] = "pubblico"
+    with pytest.raises(ValidationError):
+        IntermediateReportV11.model_validate(data)
+
+
+def test_boundary_slide_hint_uses_hms_and_round_trips():
+    data = valid_payload()
+    origin = data["video"][0]["interventi"][0]["confine_inizio"]
+    origin.update(motivo_editoriale="slide_e_tema", slide_indizio="0:00:12")
+    model = IntermediateReportV11.model_validate(data)
+    assert model.video[0].interventi[0].confine_inizio.slide_indizio_seconds == 12
+    assert model.model_dump(mode="json", by_alias=True, exclude_none=True) == data
+
+
+@pytest.mark.parametrize("mutation", [
     lambda data: data["video"][0]["interventi"][0].pop("blocco"),
     lambda data: data["video"][0]["blocchi_parlato"][0].update(fine="0:10:01"),
     lambda data: data["video"][0]["blocchi_parlato"].append(

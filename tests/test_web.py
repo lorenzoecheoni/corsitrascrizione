@@ -23,7 +23,7 @@ from app.course_models import AcademyImport, IntermediateCourseReport
 from app.jobs import JobState
 from app.inventory import InventoryCourse, InventoryError
 from app.main import create_app
-from app.models import AcademyReport, BoundaryEvidence, Intervention
+from app.models import AcademyReport, BoundaryEvidence, ChapterBoundaryOrigin, Intervention, SpeechBlock
 from app.pipeline import AnalysisPipeline
 from app.selection import sign_selection
 
@@ -33,16 +33,122 @@ OTHER_VIDEO_ID = "00000000-0000-0000-0000-000000000002"
 VIDEO_TITLE = "Corso di prova"
 OTHER_VIDEO_TITLE = "Secondo corso"
 
+from granular_support import governance_report
+
+
+def test_profile2_downloads_use_only_saved_data_without_network_or_writes(client, monkeypatch):
+    report = governance_report()
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    before = store.get(job.id).model_dump_json()
+    client.app.state.inventory = _ForbiddenProvider()
+    client.app.state.bunny = _ForbiddenProvider()
+    client.app.state.openai = _ForbiddenProvider()
+    client.app.state.assemblyai = _ForbiddenProvider()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Saved downloads must perform no network I/O")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    first = client.get(f"/jobs/{job.id}/report.json")
+    assert first.status_code == 200
+    assert first.content == client.get(f"/jobs/{job.id}/report.json").content
+    assert first.json()["video"][0]["durata_secondi"] == 5789
+    for extension in ("md", "txt"):
+        response = client.get(f"/jobs/{job.id}/report.{extension}")
+        assert response.status_code == 200
+        assert "v1-b001" in response.text and "pagina 2" in response.text
+    assert store.get(job.id).model_dump_json() == before
+
+
+def test_legacy_even_with_audio_provenance_requires_granular_reanalysis(client):
+    report = governance_report()
+    report.analysis_profile = 1
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    response = client.get(f"/jobs/{job.id}/report.json")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Rianalisi necessaria per il formato granulare"}
+    assert client.get(f"/jobs/{job.id}/report.md").status_code == 200
+    assert client.get(f"/jobs/{job.id}/report.txt").status_code == 200
+    assert "Download JSON v1.1" not in client.get(f"/jobs/{job.id}").text
+
+
+def test_malformed_profile2_returns_static_contract_failure(client):
+    report = governance_report()
+    for chapter in report.interventions:
+        chapter.tipo = "saluti"
+        chapter.punti_chiave = []
+    report.material_failures = ["parser private query token=SECRET"]
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    response = client.get(f"/jobs/{job.id}/report.json")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Report granulare non valido: rianalisi necessaria"}
+    assert "SECRET" not in response.text
+    for extension in ("md", "txt"):
+        response = client.get(f"/jobs/{job.id}/report.{extension}")
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Report granulare non valido: rianalisi necessaria"}
+    page = client.get(f"/jobs/{job.id}")
+    assert page.status_code == 200
+    assert "Rianalisi necessaria" in page.text
+    assert "Download JSON v1.1" not in page.text
+
+
+def test_exportable_timeline_warning_remains_downloadable_on_archive_and_job_page(client):
+    report = governance_report()
+    report.duration_seconds = 5790
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    assert client.get(f"/jobs/{job.id}/report.json").json()["stato"] == "da_verificare"
+    assert "Download JSON v1.1" in client.get(f"/jobs/{job.id}").text
+    assert f"/jobs/{job.id}/report.json" in client.get("/").text
+
+
+def test_download_does_not_emit_persisted_raw_material_errors(client, caplog):
+    report = governance_report()
+    report.material_failures = ["worker error https://private.example/?token=SECRET_SENTINEL"]
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    for extension in ("json", "md", "txt"):
+        response = client.get(f"/jobs/{job.id}/report.{extension}")
+        assert response.status_code == 200
+        assert "MATERIALE_NON_RAGGIUNGIBILE" in response.text
+        assert "SECRET_SENTINEL" not in response.text
+    assert "SECRET_SENTINEL" not in caplog.text
+
 
 def add_complete_boundary_evidence(report: AcademyReport) -> AcademyReport:
     report.audio_boundary_version = 1
+    report.analysis_profile = 2
     if not report.interventions:
         report.interventions = [Intervention(
-            id="i001", start_seconds=0, end_seconds=report.duration_seconds,
+            id=f"i{index:03d}", start_seconds=start, end_seconds=end,
             tipo="intervento", relatori=["Giulia Bianchi"], titolo="Governance",
             sintesi="Il corso tratta governance e controlli.",
             punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
-        )]
+        ) for index, (start, end) in enumerate(((0, 600), (600, report.duration_seconds)), 1)]
+    report.speech_blocks = []
+    for index, chapter in enumerate(report.interventions, 1):
+        if chapter.tipo in {"pausa", "logistica"}:
+            continue
+        chapter.block_id = f"stored-b{index}"
+        chapter.chapter_number = chapter.chapters_in_block = 1
+        chapter.boundary_origin = ChapterBoundaryOrigin(motivo_editoriale="inizio_blocco", regola_audio="long_pause")
+        report.speech_blocks.append(SpeechBlock(
+            id=chapter.block_id, start_seconds=chapter.start_seconds, end_seconds=chapter.end_seconds,
+            tipo=chapter.tipo, relatori=chapter.relatori, titolo=chapter.titolo, sinossi=chapter.sintesi,
+        ))
     report.boundaries = [
         BoundaryEvidence(
             previous_intervention_id=previous.id,
@@ -619,7 +725,7 @@ def test_historical_json_requires_reanalysis_before_any_external_work(client, mo
     client.app.state.assemblyai = _ForbiddenProvider()
     client.app.state.openai = _ForbiddenProvider()
     monkeypatch.setattr(
-        "app.web.material_sources_for_video",
+        "app.materials.parse_material_source",
         lambda *args: (_ for _ in ()).throw(AssertionError("material checker called")),
     )
     monkeypatch.setattr(
@@ -631,7 +737,7 @@ def test_historical_json_requires_reanalysis_before_any_external_work(client, mo
 
     assert response.status_code == 409
     assert response.json() == {
-        "detail": "Rianalisi necessaria per verificare i confini sull’audio",
+        "detail": "Rianalisi necessaria per il formato granulare",
     }
     assert client.get(f"/jobs/{job.id}/report.md").status_code == 200
     assert client.get(f"/jobs/{job.id}/report.txt").status_code == 200
@@ -696,9 +802,7 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
         "testo_principale": "Obiettivi · Flusso di pubblicazione",
         "confidenza": 0.95,
     }
-    assert payload["video"][0]["materiali"] == [{
-        "titolo": "dispensa", "file": "dispensa.pdf", "accesso": "iscritti",
-    }]
+    assert payload["video"][0]["materiali"] == []
     assert "incertezze" not in payload
     assert "transcript" not in json_response.text.lower()
     page = client.get(f"/jobs/{job.id}")
@@ -719,7 +823,7 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
     report.bunny_title = "Titolo Bunny originale"
     report.interventions = [
         Intervention(
-            id="lead-in", start_seconds=0, end_seconds=125, tipo="pausa",
+            id="lead-in", start_seconds=0, end_seconds=125, tipo="saluti",
             relatori=[], titolo="Attesa", sintesi="Attesa iniziale.",
             punti_chiave=[], confidenza=.92,
         ),
@@ -730,7 +834,7 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
         punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
         ),
         Intervention(
-            id="tail", start_seconds=905, end_seconds=3720, tipo="pausa",
+            id="tail", start_seconds=905, end_seconds=3720, tipo="saluti",
             relatori=[], titolo="Coda", sintesi="Attesa finale.",
             punti_chiave=[], confidenza=.92,
         ),
@@ -754,6 +858,8 @@ def test_video_json_export_serializes_each_intervention_with_exact_hms(client):
         "sintesi": "Il relatore illustra gli assetti di governance.",
         "punti_chiave": ["Organi", "Deleghe", "Controlli"], "accesso": "pubblico",
         "confidenza": .92,
+        "blocco": "v1-b002", "capitolo_numero": 1, "capitoli_blocco": 1,
+        "confine_inizio": {"motivo_editoriale": "inizio_blocco", "regola_audio": "long_pause"},
     }
     assert "incertezze" not in payload
 
@@ -763,11 +869,12 @@ def test_json_export_preserves_accented_identity_and_survives_malformed_material
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
     report.speakers = [report.speakers[0].model_copy(update={"display_name": "José Núñez"})]
     report.interventions = [Intervention(
-        id="i001", start_seconds=0, end_seconds=120, tipo="intervento",
+        id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
         relatori=["Jose Nunez"], titolo="Governance", sintesi="Assetti e controlli.",
         punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.92,
     )]
-    report.duration_seconds = 120
+    report.duration_seconds = 600
+    report.slides = report.slides[:1]
     add_complete_boundary_evidence(report)
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
@@ -789,9 +896,7 @@ def test_json_export_preserves_accented_identity_and_survives_malformed_material
     payload = response.json()
     assert [speaker["nome"] for speaker in payload["relatori"]] == ["José Núñez"]
     assert payload["video"][0]["interventi"][0]["relatori"] == ["José Núñez"]
-    assert [item["url"] for item in payload["video"][0]["materiali"]] == materials
-    if materials:
-        assert any(check["codice"] == "MATERIALE_NON_RAGGIUNGIBILE" for check in payload["verifiche_richieste"])
+    assert payload["video"][0]["materiali"] == []
     assert store.get(job.id).model_dump() == stored
 
 

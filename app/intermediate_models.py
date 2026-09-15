@@ -132,6 +132,25 @@ class IntermediateSpeakerV11(_Model):
         return value
 
 
+class IntermediateBoundaryOriginV11(ChapterBoundaryOrigin):
+    slide_indizio_seconds: Nonnegative | None = Field(
+        default=None,
+        validation_alias=AliasChoices("slide_indizio_seconds", "slide_indizio"),
+        serialization_alias="slide_indizio",
+    )
+
+    @field_validator("slide_indizio_seconds", mode="before")
+    @classmethod
+    def parse_timestamp(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("Il tempo non può essere booleano")
+        return parse_hms(value) if isinstance(value, str) else value
+
+    @field_serializer("slide_indizio_seconds")
+    def serialize_timestamp(self, value: float | None) -> str | None:
+        return format_hms(value) if value is not None else None
+
+
 class IntermediateInterventionV11(_Model):
     id: str
     start_seconds: Nonnegative = Field(
@@ -150,7 +169,7 @@ class IntermediateInterventionV11(_Model):
     blocco: str | None = None
     capitolo_numero: int | None = Field(default=None, ge=1)
     capitoli_blocco: int | None = Field(default=None, ge=1)
-    confine_inizio: ChapterBoundaryOrigin | None = None
+    confine_inizio: IntermediateBoundaryOriginV11 | None = None
 
     @field_validator("start_seconds", "end_seconds", mode="before")
     @classmethod
@@ -188,7 +207,7 @@ class IntermediateSlideV11(_Model):
     testo_principale: str = Field(max_length=500)
     confidenza: UnitConfidence
     materiale: str | None = None
-    pagina: int | None = None
+    pagina: int | None = Field(default=None, ge=1)
 
     @field_validator("start_seconds", mode="before")
     @classmethod
@@ -207,7 +226,7 @@ class IntermediateMaterialV11(_Model):
     relatore: str | None = None
     url: str | None = None
     file: str | None = None
-    pagine: int | None = None
+    pagine: int | None = Field(default=None, ge=1)
     accesso: Access = "iscritti"
 
     @model_validator(mode="after")
@@ -252,6 +271,26 @@ class IntermediateVideoV11(_Model):
         segments = [*self.interventi, *self.blocchi_parlato]
         if any(segment.end_seconds > duration for segment in segments):
             raise ValueError("nessun estremo può superare la durata Bunny")
+        if any(slide.start_seconds > duration for slide in self.slide) or any(
+            chapter.confine_inizio is not None
+            and chapter.confine_inizio.slide_indizio_seconds is not None
+            and chapter.confine_inizio.slide_indizio_seconds > duration
+            for chapter in self.interventi
+        ):
+            raise ValueError("nessun indizio slide può superare la durata Bunny")
+
+        materials_by_title = {material.titolo: material for material in self.materiali}
+        sources = {(material.url, material.file) for material in self.materiali}
+        if len(materials_by_title) != len(self.materiali) or len(sources) != len(self.materiali):
+            raise ValueError("i materiali richiedono titoli e sorgenti univoci")
+        for slide in self.slide:
+            if slide.materiale is None:
+                continue
+            material = materials_by_title.get(slide.materiale)
+            if material is None:
+                raise ValueError("la slide deve riferirsi a un materiale presente")
+            if slide.pagina is not None and (material.pagine is None or slide.pagina > material.pagine):
+                raise ValueError("la pagina deve esistere nel materiale indicato")
 
         block_ids = [block.id for block in self.blocchi_parlato]
         if len(block_ids) != len(set(block_ids)):
@@ -329,11 +368,8 @@ class IntermediateVideoV11(_Model):
             ):
                 raise ValueError("i capitoli di un blocco devono essere contigui")
 
-        public_chapters = [
-            chapter for chapter in spoken
-            if chapter.tipo == "intervento" and chapter.accesso == "pubblico"
-        ]
-        if len(public_chapters) != 1:
+        public_chapters = [chapter for chapter in self.interventi if chapter.accesso == "pubblico"]
+        if len(public_chapters) != 1 or public_chapters[0].tipo != "intervento":
             raise ValueError("è richiesto esattamente un capitolo didattico pubblico")
         public_duration = public_chapters[0].end_seconds - public_chapters[0].start_seconds
         if not 480 <= public_duration <= 900:

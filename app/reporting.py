@@ -622,6 +622,8 @@ def _csv(items: list[str]) -> str:
 
 def render_markdown(report: AcademyReport) -> str:
     """Render a stable, human-readable Markdown representation of a report."""
+    if report.analysis_profile == 2:
+        return _render_granular_markdown(report)
     reconciliation = reconcile_speakers_detailed(report)
     speakers = reconciliation.speakers
     canonical_names = [speaker.display_name for speaker in speakers]
@@ -708,6 +710,72 @@ def render_markdown(report: AcademyReport) -> str:
         if name == "Trascrizione":
             lines.append(f"  Secondi audio restituiti dal provider: {shown(usage.provider_audio_seconds)}.")
     lines.append("Il costo monetario è una stima applicativa e non sostituisce la fattura dei fornitori.")
+    return "\n".join(lines)
+
+
+def _render_granular_markdown(report: AcademyReport) -> str:
+    # Local import avoids the speaker-reconciliation dependency cycle. All
+    # three exports use exactly the same persisted, validated contract.
+    from app.intermediate_report import build_intermediate_report
+    from app.intermediate_models import format_hms
+
+    envelope = build_intermediate_report(report, UUID(int=0))
+    video = envelope.video[0]
+    lines = [
+        f"# {envelope.corso.titolo}", "",
+        f"Titolo originale Bunny: {video.titolo_bunny}",
+        f"Durata: {format_hms(video.durata_secondi)} ({video.durata_secondi} secondi)",
+        f"Lingua rilevata: {video.lingua}", f"Stato: {envelope.stato}",
+        "", "## Sinossi", video.sinossi, "", "## Relatori",
+    ]
+    for speaker in envelope.relatori:
+        role = f" — {speaker.ruolo}" if speaker.ruolo else ""
+        organization = f" · {speaker.organizzazione}" if speaker.organizzazione else ""
+        lines.append(f"- {speaker.nome}{role}{organization} (confidenza: {speaker.confidenza})")
+    lines.extend(["", "## Blocchi parlato"])
+    for block in video.blocchi_parlato:
+        lines.extend([
+            f"- {block.id} · {format_hms(block.start_seconds)}–{format_hms(block.end_seconds)} · {block.tipo}: {block.titolo}",
+            f"  Relatori: {_csv(block.relatori) or 'Da verificare'}", f"  {block.sinossi}",
+        ])
+    lines.extend(["", "## Capitoli e segmenti"])
+    for chapter in video.interventi:
+        lines.extend([
+            f"- {chapter.id} · {format_hms(chapter.start_seconds)}–{format_hms(chapter.end_seconds)} · {chapter.tipo}: {chapter.titolo}",
+            f"  Relatori: {_csv(chapter.relatori) or 'Da verificare'}; accesso: {chapter.accesso}; confidenza: {chapter.confidenza}",
+        ])
+        if chapter.blocco is not None:
+            lines.append(f"  Capitolo {chapter.capitolo_numero}/{chapter.capitoli_blocco} del blocco {chapter.blocco}")
+        if chapter.confine_inizio is not None:
+            origin = chapter.confine_inizio
+            hint = f"; indizio slide: {format_hms(origin.slide_indizio_seconds)}" if origin.slide_indizio_seconds is not None else ""
+            lines.append(f"  Origine confine: {origin.motivo_editoriale}; regola audio: {origin.regola_audio}{hint}")
+        lines.append(f"  {chapter.sintesi}")
+        lines.extend(f"  - {point}" for point in chapter.punti_chiave)
+    lines.extend(["", "## Slide"])
+    for slide in video.slide:
+        material = slide.materiale or "non abbinato"
+        page = str(slide.pagina) if slide.pagina is not None else "non abbinata"
+        lines.extend([
+            f"- {format_hms(slide.start_seconds)}: {slide.titolo} — {slide.testo_principale}",
+            f"  Materiale: {material}; pagina {page}; confidenza: {slide.confidenza}",
+        ])
+    lines.extend(["", "## Materiali"])
+    for material in video.materiali:
+        pages = str(material.pagine) if material.pagine is not None else "non disponibili"
+        lines.append(f"- {material.titolo} · {material.url or material.file}; pagine: {pages}; accesso: {material.accesso}")
+    lines.extend(["", "## Verifiche richieste"])
+    for check in envelope.verifiche_richieste:
+        context = " · ".join(value for value in (check.intervento, check.campo) if value)
+        lines.append(f"- {check.livello} · {check.codice}{' · ' + context if context else ''}: {check.messaggio}")
+    cost = video.costo_stimato
+    lines.extend([
+        "", "## Stima costi (USD)",
+        f"- Intervallo stimato: ${cost.minimo}–${cost.massimo}",
+        f"- Banda Bunny: ${cost.banda_bunny}", f"- Trascrizione: ${cost.trascrizione}",
+        f"- Analisi: ${cost.analisi}", f"- Base della stima: {cost.criterio}",
+        "Il costo monetario è una stima applicativa e non sostituisce la fattura dei fornitori.",
+    ])
     return "\n".join(lines)
 
 

@@ -94,6 +94,21 @@ class MaterialAnalysis:
     failures: tuple[str, ...]
 
 
+def parse_material_source(value: str) -> ReportMaterial | None:
+    """Parse declared metadata only; bare labels and missing files are not sources."""
+    sources = resolve_material_sources([value], UUID(int=0))
+    if not sources:
+        return None
+    source = sources[0]
+    if " | " in source:
+        title, url = source.split(" | ", 1)
+        return ReportMaterial(titolo=canonical_material_title(title), url=url)
+    if source.startswith(("https://", "http://")):
+        return ReportMaterial(titolo=Path(urlsplit(source).path).name or source, url=source)
+    path = Path(source)
+    return ReportMaterial(titolo=canonical_material_title(path.stem), file=str(path))
+
+
 def _validate_url(url: str, allowed_hosts: Sequence[str]) -> tuple[str, str]:
     if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url) or "\\" in url:
         raise MaterialError()

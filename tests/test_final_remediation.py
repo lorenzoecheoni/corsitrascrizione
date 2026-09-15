@@ -22,7 +22,7 @@ from app.intermediate_report import build_intermediate_report
 from app.jobs import JobState, JobStore
 from app.material_registry import AnalysisInventoryContext
 from app.materials import MaterialAnalysis, MaterialProcessor, _download_https
-from app.models import AcademyReport, ReportMaterial, SlideChange
+from app.models import AcademyReport, Evidence, ReportMaterial, SlideChange, SpeakerProfile
 from app.pipeline import PipelineError, _verified_material_result
 from app.transcription import TranscriptionResult
 from app.web import router
@@ -117,6 +117,18 @@ def _material_pipeline(components, sources, *, corrupt_target=None):
 
     components.pipeline.material_processor = MaterialProcessor(fetcher=fetch)
     return requests
+
+
+def _document_speaker(components, name):
+    components.content.speakers = [SpeakerProfile(
+        id="documented-speaker", display_name=name, role="Relatore", confidence="alta",
+        evidence=[Evidence(kind="introduzione", timestamp_seconds=0,
+                           note=f"Il relatore si presenta come {name}.")],
+    )]
+    for intervention in components.content.interventions:
+        intervention.relatori = [name]
+    for block in components.content.speech_blocks:
+        block.relatori = [name]
 
 
 @pytest.mark.parametrize("titles", [("Deck", "Deck"),
@@ -390,3 +402,58 @@ def test_material_collision_gate_considers_all_original_results_in_every_order(t
             tmp_path, ("www.assoholding.it",))
         assert all(item.titolo != "Deck" for item in verified.materials)
         assert WARNING in verified.failures
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_pipeline_omits_titles_that_collide_only_after_report_reconciliation(
+        components, tmp_path, monkeypatch, order):
+    sources = [
+        f"Slide · Dottor Rossi | {HOST}/first.pptx",
+        f"Slide · Elena Rossi | {HOST}/second.pptx",
+    ]
+    _material_pipeline(components, [sources[index] for index in order])
+    _document_speaker(components, "Elena Rossi")
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert report.materials == []
+    assert report.material_failures and set(report.material_failures) == {WARNING}
+    assert report.slides[0].material_title is None and report.slides[0].page is None
+    responses = _saved_exports(report, tmp_path, monkeypatch)
+    assert responses["json"].json()["video"][0]["materiali"] == []
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+def test_pipeline_omits_normalized_source_with_conflicting_metadata(
+        components, tmp_path, monkeypatch, order):
+    sources = [
+        f"First deck | {HOST}/deck.pptx",
+        f"Other deck | {HOST}/%64eck.pptx",
+    ]
+    _material_pipeline(components, [sources[index] for index in order])
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert report.materials == []
+    assert report.material_failures and set(report.material_failures) == {WARNING}
+    assert report.slides[0].material_title is None and report.slides[0].page is None
+    responses = _saved_exports(report, tmp_path, monkeypatch)
+    assert responses["json"].json()["video"][0]["materiali"] == []
+
+
+def test_surname_only_material_stays_ambiguous_when_report_documents_another_person(
+        components, tmp_path, monkeypatch):
+    _material_pipeline(components, [f"Slide · Dottor Morra | {HOST}/deck.pptx"])
+    _document_speaker(components, "Luis Morra")
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert len(report.materials) == 1
+    assert report.materials[0].titolo == "Slide · Dottor Morra"
+    assert report.materials[0].relatore != "Luigi Morra"
+    payload = _saved_exports(report, tmp_path, monkeypatch)["json"].json()
+    assert all(person["nome"] != "Luigi Morra" for person in payload["relatori"])
+    assert all(person.get("slug") != "luigi-morra" for person in payload["relatori"])
+    assert payload["video"][0]["materiali"][0]["titolo"] != "Slide · Luigi Morra"
+    assert any(check["codice"] == "ALIAS_RELATORE_AMBIGUO"
+               for check in payload["verifiche_richieste"])

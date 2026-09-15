@@ -2,6 +2,11 @@
 
 Aggiornato: 16 settembre 2026.
 
+> **ATTENZIONE — STATO WIP, NON DISTRIBUIRE.** Il branch contiene anche l'ultimo
+> tentativo incompleto successivo al commit verificato `1bf98c5`. Non va unito in
+> `main` né distribuito finché i problemi elencati in “Stato dell'ultimo WIP” non
+> sono stati risolti e revisionati.
+
 ## Repository e revisione
 
 - Repository: `lorenzoecheoni/corsitrascrizione`
@@ -12,6 +17,31 @@ Aggiornato: 16 settembre 2026.
 - Piano: `docs/superpowers/plans/2026-09-15-report-granulare-materiali.md`
 
 Il branch non è stato unito in `main`, non è stato distribuito su Railway e non ha modificato corsi Academy.
+
+## Ambito reale chiarito
+
+- L'unico video da usare per la prova reale è **Governance**, GUID `7f254c4d-fe34-4fd3-a4cf-cda4f447e438`.
+- Non eseguire analisi reali su altri video o corsi.
+- I nomi di corsi/materiali presenti nei test sono esclusivamente fixture sintetiche locali: nessun altro corso reale è stato elaborato o modificato.
+- Non è stata eseguita alcuna nuova analisi API a pagamento durante queste ultime correzioni.
+
+## Stato dell'ultimo WIP
+
+Dopo la revisione del commit `1bf98c5`, sono stati riprodotti tre ulteriori difetti. Il WIP locale ne corregge i casi diretti:
+
+1. Collisione fra `Slide · Dottor Rossi` e `Slide · Elena Rossi` dopo la riconciliazione del report.
+2. Due URL equivalenti (`/deck.pptx` e `/%64eck.pptx`) con metadati in conflitto.
+3. Attribuzione impropria di `Slide · Dottor Morra` a Luigi quando il report documenta Luis Morra.
+
+Le tre riproduzioni dirette passano e il gruppo mirato ha prodotto **788 test superati**, ma la revisione ha trovato ancora questi problemi aperti:
+
+1. **Riconciliazione a cascata dopo le omissioni.** Se un primo gruppo ambiguo viene eliminato, i materiali rimasti possono diventare nuovamente equivalenti solo al secondo passaggio e rendere JSON/Markdown/TXT non esportabili. Serve un calcolo a punto fisso sul set finale accettato.
+2. **Qualifica del relatore persa.** Canonicalizzando `material.relatore`, prefissi come `Dottor` non devono sparire: la qualifica deve continuare ad alimentare il campo `ruolo` nell'export.
+3. **Copertura del test di sicurezza da ripristinare.** `tests/test_security.py::test_http_failed_job_has_safe_correlated_event[report-temporary_failure]` usa un `SimpleNamespace` privo di `model_copy`; il WIP fallisce troppo presto nella fase materiali e non raggiunge più la falla report che il test deve controllare.
+
+Ultimo risultato ampio osservato dalla review sul WIP: **1.674 passati, 4 esclusi, 2 falliti**. I due fallimenti sono il noto caso Python 3.13 e il test di sicurezza appena descritto. Questo WIP non è quindi pronto per merge o deploy.
+
+Per continuare, confrontare il commit WIP in testa al branch con `7e7885af8ef71f20910b28bea12f68ddd22ca215` e partire dai tre punti aperti sopra. Non scartare il lavoro: contiene test completi per le riproduzioni dirette.
 
 ## Risultato implementato
 

@@ -25,7 +25,12 @@ from app.materials import (
     MaterialAnalysis, MaterialError, MaterialInternalError, MaterialProcessor,
     _validate_url, validate_persisted_material,
 )
-from app.models import AcademyReport, APIUsage, ProviderUsage, ReportMaterial, SlideChange
+from app.models import AcademyContent, AcademyReport, APIUsage, ProviderUsage, ReportMaterial, SlideChange
+from app.reporting import (
+    correct_speaker_name_mentions,
+    reconcile_speakers_detailed,
+    rewrite_speaker_references,
+)
 from app.transcription import OpenAITranscriber, TranscriptionError
 
 
@@ -71,6 +76,7 @@ class PipelineCancelled(JobCancelled):
 def _verified_material_result(
     context: AnalysisInventoryContext, analysis: MaterialAnalysis,
     slide_snapshot: tuple[str, ...], workspace: Path, allowed_hosts: Sequence[str],
+    content: AcademyContent | None = None,
 ) -> MaterialAnalysis:
     """Validate the internal processor contract before any result is persisted."""
     candidates = {}
@@ -85,7 +91,10 @@ def _verified_material_result(
             path = Path(source)
             candidates.setdefault(("file", str(path)), set()).add(canonical_material_title(path.stem))
 
-    materials, omitted, failures, all_materials = [], set(), [], []
+    failures: list[str] = []
+    original_materials: list[ReportMaterial] = []
+    persistable: list[tuple[str, ReportMaterial]] = []
+    omitted_original_titles: set[str] = set()
     # Revalidate models as model_copy/in-place assignment bypasses validators.
     for item in analysis.materials:
         if item.pagine is not None and type(item.pagine) is not int:
@@ -104,29 +113,79 @@ def _verified_material_result(
             url = urlsplit(material.url)
             if url.username is not None or url.password is not None:
                 raise MaterialInternalError()
-        all_materials.append(material)
+        original_materials.append(material)
         try:
             # Use exactly the offline export grammar before promotion. A
             # successful fetch cannot establish a different durable source.
-            validate_persisted_material(material)
+            normalized = validate_persisted_material(material)
         except ValueError:
-            omitted.add(material.titolo)
+            omitted_original_titles.add(material.titolo)
             failures.append("MATERIALE_NON_RAGGIUNGIBILE")
             continue
-        materials.append(material)
-    counts = Counter(material.titolo for material in all_materials)
-    # Inspect every original verified identity before removing any result.
-    # Choosing a title winner would silently rebind the report's slide links.
-    sources_by_title = {}
-    for material in all_materials:
-        source = (("url", *_validate_url(material.url, allowed_hosts))
-                  if material.url is not None else ("file", material.file))
+        persistable.append((material.titolo, normalized))
+
+    # Canonicalize with the same report-aware speaker evidence used by export.
+    # Context-free surname resolution would invent an identity when the report
+    # documents another person with the same surname.
+    if content is not None:
+        speaker_context = content.model_copy(update={
+            "materials": [material for _, material in persistable],
+            "slides": list(analysis.slides),
+        })
+        reconciliation = reconcile_speakers_detailed(speaker_context)
+        canonical_names = [speaker.display_name for speaker in reconciliation.speakers]
+        corrected = lambda value: correct_speaker_name_mentions(
+            value,
+            canonical_names,
+            reconciliation.canonical_by_key,
+            ambiguous_aliases=reconciliation.ambiguous_aliases,
+        )
+    else:
+        reconciliation = None
+        corrected = lambda value: value
+
+    records = []
+    for original_title, material in persistable:
+        canonical_title = corrected(canonical_material_title(material.titolo))
+        speakers = ([material.relatore] if material.relatore else [])
+        if reconciliation is not None:
+            speakers = rewrite_speaker_references(speakers, reconciliation.canonical_by_key)
+        canonical = material.model_copy(update={
+            "titolo": canonical_title,
+            "relatore": speakers[0] if speakers else None,
+        })
+        source = (canonical.url, canonical.file)
+        metadata = (canonical.titolo, canonical.relatore, canonical.pagine)
+        records.append((original_title, canonical, source, metadata))
+
+    sources_by_title: dict[str, set[tuple[str | None, str | None]]] = {}
+    metadata_by_source: dict[tuple[str | None, str | None], set[tuple[str, str | None, int | None]]] = {}
+    for _, material, source, metadata in records:
         sources_by_title.setdefault(material.titolo, set()).add(source)
-    ambiguous = {title for title, sources in sources_by_title.items() if len(sources) > 1}
-    omitted.update(ambiguous)
-    failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in ambiguous)
-    materials = [material for material in materials if material.titolo not in omitted]
-    verified = {material.titolo: material for material in all_materials}
+        metadata_by_source.setdefault(source, set()).add(metadata)
+    ambiguous_titles = {title for title, sources in sources_by_title.items() if len(sources) > 1}
+    ambiguous_sources = {source for source, metadata in metadata_by_source.items() if len(metadata) > 1}
+    for original_title, material, source, _ in records:
+        if material.titolo in ambiguous_titles or source in ambiguous_sources:
+            omitted_original_titles.add(original_title)
+    failures.extend(
+        "MATERIALE_NON_RAGGIUNGIBILE"
+        for _ in range(len(ambiguous_titles) + len(ambiguous_sources))
+    )
+
+    accepted: dict[tuple[tuple[str | None, str | None], tuple[str, str | None, int | None]], ReportMaterial] = {}
+    accepted_title_by_original: dict[str, str] = {}
+    for original_title, material, source, metadata in records:
+        if original_title in omitted_original_titles:
+            continue
+        accepted[(source, metadata)] = material
+        accepted_title_by_original[original_title] = material.titolo
+    materials = sorted(accepted.values(), key=lambda item: (
+        item.titolo, item.url or "", item.file or "", item.relatore or "", item.pagine or 0,
+    ))
+
+    counts = Counter(material.titolo for material in original_materials)
+    verified = {material.titolo: material for material in original_materials}
     slides = []
     for snapshot, matched in zip(slide_snapshot, analysis.slides, strict=True):
         title, page = matched.material_title, matched.page
@@ -136,8 +195,10 @@ def _verified_material_result(
               or type(page) is not int or verified[title].pagine is None
               or not 1 <= page <= verified[title].pagine):
             raise MaterialInternalError()
-        elif title in omitted:
+        elif title in omitted_original_titles:
             title, page = None, None
+        else:
+            title = accepted_title_by_original[title]
         slides.append(SlideChange.model_validate_json(snapshot).model_copy(update={
             "material_title": title, "page": page,
         }))
@@ -373,6 +434,7 @@ class AnalysisPipeline:
                 check_cancelled()
                 material_analysis = _verified_material_result(
                     context, material_analysis, slide_snapshot, workspace, self.settings.parsed_material_allowed_hosts,
+                    content,
                 )
                 materials = material_analysis.materials
                 material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in material_analysis.failures)

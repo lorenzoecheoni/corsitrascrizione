@@ -32,6 +32,7 @@ _TRANSCRIPTION_SEGMENT_SECONDS = 600
 _OPENAI_MAX_AUDIO_SECONDS = 1400
 _OPENAI_MAX_AUDIO_BYTES = 24_000_000
 _DURATION_SAMPLE_RATE = 1000
+_TERMINAL_DURATION_ROUNDING_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -182,13 +183,22 @@ class _SilenceEvents:
         if duration <= 0:
             raise SilenceEvidenceError()
         if self._open_start is not None:
-            try:
+            if self._open_start < duration:
                 self._intervals.append(SilenceInterval(self._open_start, duration))
-            except ValueError:
-                raise SilenceEvidenceError() from None
+            elif self._open_start - duration >= _TERMINAL_DURATION_ROUNDING_SECONDS:
+                raise SilenceEvidenceError()
             self._open_start = None
-        if any(interval.end_seconds > duration for interval in self._intervals):
-            raise SilenceEvidenceError()
+        if self._intervals and self._intervals[-1].end_seconds > duration:
+            terminal = self._intervals[-1]
+            if (
+                any(interval.end_seconds > duration for interval in self._intervals[:-1])
+                or terminal.end_seconds - duration >= _TERMINAL_DURATION_ROUNDING_SECONDS
+            ):
+                raise SilenceEvidenceError()
+            if terminal.start_seconds < duration:
+                self._intervals[-1] = SilenceInterval(terminal.start_seconds, duration)
+            else:
+                self._intervals.pop()
         return list(self._intervals)
 
 

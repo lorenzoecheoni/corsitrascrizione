@@ -30,6 +30,16 @@ def test_silence_events_pair_and_close_end_of_file():
     ]
 
 
+def test_silence_events_clip_terminal_codec_rounding_to_bunny_timeline():
+    events = media._SilenceEvents()
+    events.consume("[silencedetect @ 0x1] silence_start: 5783.9932")
+    events.consume(
+        "[silencedetect @ 0x1] silence_end: 5789.248 | silence_duration: 5.2548"
+    )
+
+    assert events.finish(5789) == [media.SilenceInterval(5783.9932, 5789)]
+
+
 @pytest.mark.parametrize("start,end", [
     (4800123 / 48000, 4812456 / 48000),
     (48000123 / 48000, 48012456 / 48000),

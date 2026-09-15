@@ -9,16 +9,19 @@ content is logged. Only verified metadata and conservative slide links escape
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from collections import Counter
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import http.client
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -51,6 +54,9 @@ MAX_ARCHIVE_ENTRIES = 10_000
 MAX_MATERIALS = 32
 _FAILURE = "MATERIALE_NON_RAGGIUNGIBILE"
 _SLIDE_PATH = re.compile(r"ppt/slides/slide([1-9][0-9]*)\.xml\Z")
+_P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 class MaterialError(Exception):
@@ -217,6 +223,7 @@ def _run_worker(
              json.dumps(list(allowed_hosts))],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             cwd=Path(__file__).resolve().parent.parent,
+            start_new_session=True,
         )
         while True:
             check_cancelled(cancellation_event)
@@ -236,8 +243,13 @@ def _run_worker(
     except Exception:
         raise MaterialError() from None
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
+        if process is not None:
+            # Stop the session group even if the worker exited before its
+            # descendants. This also covers timeout and cancellation.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait()
 
 
@@ -272,6 +284,40 @@ def _xml(data: bytes) -> ElementTree.Element:
     return ElementTree.fromstring(text)
 
 
+def _pptx_display_order(archive, entries, slides, relationships) -> list[str]:
+    names = {entry.filename for entry in entries}
+    slide_names = {entry.filename for _, entry in slides}
+    if "ppt/presentation.xml" not in names:
+        # The brief's tiny synthetic fixtures contain slide XML only. A real
+        # package with any other part must provide authoritative ordering.
+        if any(not entry.is_dir() and entry.filename not in slide_names for entry in entries):
+            raise MaterialError()
+        return [entry.filename for _, entry in sorted(slides)]
+    if relationships is None or archive.getinfo("ppt/presentation.xml").file_size > MAX_XML_BYTES:
+        raise MaterialError()
+    root = _xml(archive.read("ppt/presentation.xml"))
+    if root.tag != f"{{{_P_NS}}}presentation":
+        raise MaterialError()
+    lists = root.findall(f"{{{_P_NS}}}sldIdLst")
+    if len(lists) != 1 or not 1 <= len(lists[0]) <= MAX_PAGES:
+        raise MaterialError()
+    order = []
+    seen_ids, seen_relationships = set(), set()
+    for node in lists[0]:
+        rid, slide_id = node.get(f"{{{_R_NS}}}id"), node.get("id")
+        if (node.tag != f"{{{_P_NS}}}sldId" or not slide_id or not slide_id.isdigit()
+                or slide_id in seen_ids or not rid or rid in seen_relationships
+                or rid not in relationships):
+            raise MaterialError()
+        target, kind = relationships[rid]
+        if target not in slide_names or kind != f"{_R_NS}/slide" or target in order:
+            raise MaterialError()
+        order.append(target)
+        seen_ids.add(slide_id)
+        seen_relationships.add(rid)
+    return order
+
+
 def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
     with ZipFile(path) as archive:
         entries = archive.infolist()
@@ -279,6 +325,7 @@ def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
             raise MaterialError()
         names: set[str] = set()
         slides = []
+        presentation_relationships = None
         for entry in entries:
             name = entry.filename
             lower = name.lower()
@@ -303,6 +350,9 @@ def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
                 if entry.file_size > MAX_XML_BYTES:
                     raise MaterialError()
                 root = _xml(archive.read(entry))
+                relationships = {}
+                if name == "ppt/_rels/presentation.xml.rels" and root.tag != f"{{{_PACKAGE_REL_NS}}}Relationships":
+                    raise MaterialError()
                 for relation in root.iter():
                     if relation.tag.rsplit("}", 1)[-1] != "Relationship":
                         continue
@@ -310,11 +360,18 @@ def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
                     source_dir = posixpath.dirname(posixpath.dirname(name))
                     resolved = posixpath.normpath(posixpath.join(source_dir, target))
                     relation_type = relation.attrib.get("Type", "").rsplit("/", 1)[-1].lower()
-                    if (relation.attrib.get("TargetMode", "").lower() == "external"
+                    if (not target or relation.attrib.get("TargetMode", "Internal").lower() != "internal"
                             or relation_type in {"oleobject", "package", "control", "vbaproject", "attachedtemplate"}
                             or urlsplit(target).scheme or target.startswith(("/", "\\"))
                             or "\\" in target or resolved == ".." or resolved.startswith("../")):
                         raise MaterialError()
+                    if name == "ppt/_rels/presentation.xml.rels":
+                        rid = relation.get("Id")
+                        if not rid or rid in relationships:
+                            raise MaterialError()
+                        relationships[rid] = (resolved, relation.get("Type"))
+                if name == "ppt/_rels/presentation.xml.rels":
+                    presentation_relationships = relationships
             match = _SLIDE_PATH.fullmatch(name)
             if match:
                 if entry.file_size > MAX_XML_BYTES:
@@ -322,25 +379,89 @@ def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
                 slides.append((int(match[1]), entry))
         if not 1 <= len(slides) <= MAX_PAGES:
             raise MaterialError()
-        pages = []
+        order = _pptx_display_order(archive, entries, slides, presentation_relationships)
+        parsed = {}
         total = 0
-        for number, entry in sorted(slides):
+        for _, entry in sorted(slides):
             root = _xml(archive.read(entry))
-            if root.tag != "{http://schemas.openxmlformats.org/presentationml/2006/main}sld":
+            if root.tag != f"{{{_P_NS}}}sld" or root.get("show", "true") not in {"0", "1", "true", "false"}:
                 raise MaterialError()
             text = " ".join(node.text or "" for node in root.iter(
                 "{http://schemas.openxmlformats.org/drawingml/2006/main}t"))
             total += len(text)
             if len(text) > MAX_PAGE_TEXT or total > MAX_TOTAL_TEXT:
                 raise MaterialError()
-            pages.append(DeckPage(number, text))
+            parsed[entry.filename] = (text, root.get("show") in {"0", "false"})
+        pages = []
+        for name in order:
+            text, hidden = parsed[name]
+            if not hidden:
+                pages.append(DeckPage(len(pages) + 1, text))
+        if not pages:
+            raise MaterialError()
         return tuple(pages)
+
+
+def _reject_pdf_external_decoder(*args, **kwargs):
+    raise MaterialError()
+
+
+def _pdf_content_stream_ids(reader) -> set[int]:
+    """Resolve page/font text streams by role, not their declared /Subtype."""
+    from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, NullObject, StreamObject
+    streams: set[int] = set()
+    visited = set()
+    steps = 0
+    font_stream_keys = {"/ToUnicode", "/FontFile", "/FontFile2", "/FontFile3"}
+    stack = [(reader.trailer, frozenset(), False, 0)]
+    stack.extend((page.get("/Contents"), frozenset(), True, 0) for page in reader.pages)
+    while stack:
+        obj, ancestors, required, depth = stack.pop()
+        steps += 1
+        if steps > 100_000 or depth > 100:
+            raise MaterialError()
+        references = set()
+        while isinstance(obj, IndirectObject):
+            key = (obj.idnum, obj.generation)
+            if key in references or len(references) > 100:
+                raise MaterialError()
+            references.add(key)
+            obj = obj.get_object()
+        if obj is None or isinstance(obj, NullObject):
+            continue
+        if required and id(obj) in ancestors:
+            raise MaterialError()
+        state = (id(obj), required)
+        if state in visited:
+            continue
+        visited.add(state)
+        if required:
+            if isinstance(obj, StreamObject):
+                streams.add(id(obj))
+            elif isinstance(obj, ArrayObject):
+                stack.extend((child, ancestors | {id(obj)}, True, depth + 1) for child in obj)
+                continue
+            else:
+                raise MaterialError()
+        if isinstance(obj, DictionaryObject):
+            stack.extend((child, frozenset(), key in font_stream_keys, depth + 1) for key, child in obj.items())
+        elif isinstance(obj, ArrayObject):
+            stack.extend((child, frozenset(), False, depth + 1) for child in obj)
+    return streams
 
 
 def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
     import pypdf
+    from pypdf import filters
     from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject, StreamObject
 
+    # Install the deny gate before PdfReader can decode an object stream.
+    # It works with both legacy constants and the newer 6.x configuration API,
+    # and blocks decoder scratch files as well as subprocess execution.
+    if hasattr(filters, "JBIG2DEC_BINARY"):
+        filters.JBIG2DEC_BINARY = None
+    if hasattr(filters, "JBIG2Decode"):
+        filters.JBIG2Decode.decode = staticmethod(_reject_pdf_external_decoder)
     # pypdf 6 supports legacy limit constants; newer 6.x exposes a scoped
     # configuration API. Both execute only in this disposable worker.
     if hasattr(pypdf, "overwrite_configuration"):
@@ -363,9 +484,15 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
     forbidden = {"/OpenAction", "/AA", "/JS", "/JavaScript", "/Launch", "/EmbeddedFiles",
                  "/EF", "/RichMedia", "/XFA", "/URI", "/GoToR", "/SubmitForm", "/ImportData"}
     with path.open("rb") as source:
-        reader = pypdf.PdfReader(source, strict=True)
+        try:
+            reader = pypdf.PdfReader(source, strict=True)
+        except Exception:
+            raise MaterialError() from None
         if reader.is_encrypted:
             raise MaterialError()
+        if not 1 <= len(reader.pages) <= MAX_PAGES:
+            raise MaterialError()
+        content_streams = _pdf_content_stream_ids(reader)
         stack = [(reader.trailer, 0)]
         visited: set[tuple[int, int]] = set()
         decoded_bytes = 0
@@ -389,7 +516,7 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
                         raise MaterialError()
                     # Image decoding is unnecessary; avoid optional external
                     # codecs. All text/font/form streams have bounded decoding.
-                    if obj.get("/Subtype") != "/Image":
+                    if id(obj) in content_streams or obj.get("/Subtype") != "/Image":
                         filters = obj.get("/Filter")
                         filters = [] if filters is None else filters if isinstance(filters, ArrayObject) else [filters]
                         if any(item not in {"/FlateDecode", "/Fl", "/LZWDecode", "/LZW", "/ASCII85Decode", "/A85",
@@ -402,8 +529,6 @@ def _pdf_pages(path: Path) -> tuple[DeckPage, ...]:
                 stack.extend((child, depth + 1) for child in obj.values())
             elif isinstance(obj, ArrayObject):
                 stack.extend((child, depth + 1) for child in obj)
-        if not 1 <= len(reader.pages) <= MAX_PAGES:
-            raise MaterialError()
         pages = []
         total = 0
         for number, page in enumerate(reader.pages, 1):
@@ -457,11 +582,19 @@ def _normalized(text: str) -> tuple[str, set[str]]:
     return normalized, set(normalized.split())
 
 
+def _margin_at_least_tenth(best: float, runner_up: float) -> bool:
+    margin = best - runner_up
+    # One ulp at the maximum possible score covers subtraction roundoff;
+    # it does not relax the editorial threshold for real score differences.
+    return margin >= .10 or math.isclose(margin, .10, rel_tol=0, abs_tol=math.ulp(1.0))
+
+
 def _match_materials(
     slides: Sequence[SlideChange], decks: Sequence[tuple[ReportMaterial, Sequence[DeckPage]]],
     cancellation_event: Event | None = None,
 ) -> tuple[SlideChange, ...]:
     check_cancelled(cancellation_event)
+    title_counts = Counter(material.titolo for material, _ in decks)
     candidates = [(index, material, page, *_normalized(page.text))
                   for index, (material, pages) in enumerate(decks)
                   for page in sorted(pages, key=lambda page: page.number)]
@@ -486,7 +619,8 @@ def _match_materials(
             continue
         score, index, material, page = scores[0]
         runner_up = scores[1][0] if len(scores) > 1 else 0.0
-        if score >= .55 and score - runner_up >= .10 and page.number >= last_page.get(index, 0):
+        if (score >= .55 and _margin_at_least_tenth(score, runner_up)
+                and title_counts[material.titolo] == 1 and page.number >= last_page.get(index, 0)):
             output[slide_index] = slide.model_copy(update={"material_title": material.titolo, "page": page.number})
             last_page[index] = page.number
     check_cancelled(cancellation_event)
@@ -528,7 +662,9 @@ def _match_in_workspace(slides, decks, workspace, cancellation_event) -> tuple[S
             if output_path.stat().st_size > MAX_RESULT_BYTES:
                 raise MaterialError()
             links = json.loads(output_path.read_text(encoding="utf-8"))
-            valid = {(material.titolo, page.number) for material, pages in decks for page in pages}
+            title_counts = Counter(material.titolo for material, _ in decks)
+            valid = {(material.titolo, page.number) for material, pages in decks for page in pages
+                     if title_counts[material.titolo] == 1}
             if len(links) != len(slides) or any(tuple(link) not in valid | {(None, None)} for link in links):
                 raise MaterialError()
             check_cancelled(cancellation_event)
@@ -572,7 +708,7 @@ class MaterialProcessor:
                 cancellation_event: Event | None = None) -> MaterialAnalysis:
         decks = []
         failures = []
-        seen: set[str] = set()
+        seen: set[tuple[str, ...]] = set()
         for position, source in enumerate(sources):
             check_cancelled(cancellation_event)
             try:
@@ -583,9 +719,6 @@ class MaterialProcessor:
                 if not declared:
                     raise MaterialError()
                 candidate = declared[0]
-                if candidate in seen:
-                    continue
-                seen.add(candidate)
                 url = None
                 local = None
                 if " | " in candidate:
@@ -596,6 +729,10 @@ class MaterialProcessor:
                 else:
                     local = Path(candidate)
                     title = local.stem
+                key = ("url", *_validate_url(url, self.allowed_hosts)) if url is not None else ("file", os.path.abspath(local))
+                if key in seen:
+                    continue
+                seen.add(key)
                 title = canonical_material_title(title)
                 with tempfile.TemporaryDirectory(prefix="material-", dir=workspace) as directory:
                     material_workspace = Path(directory)
@@ -623,6 +760,7 @@ class MaterialProcessor:
                 raise
             except Exception:
                 failures.append(_FAILURE)
+        failures.extend(_FAILURE for count in Counter(material.titolo for material, _ in decks).values() if count > 1)
         matched = _match_in_workspace(slides, decks, workspace, cancellation_event)
         return MaterialAnalysis(tuple(material for material, _ in decks), matched, tuple(failures))
 

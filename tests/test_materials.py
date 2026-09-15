@@ -1,12 +1,15 @@
 """Synthetic decks and hostile boundaries; no external network or real content."""
 
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
+import os
+import signal
 import socket
 import random
 import subprocess
 import sys
 from threading import Event, Timer
+import time
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
@@ -25,16 +28,36 @@ TITLE = "Slide · Furio D'Andrea"
 PUBLIC = "93.184.216.34"
 
 
-def write_test_pptx(path, pages):
+def write_test_pptx(path, pages, *, hidden=()):
     with ZipFile(path, "w", ZIP_DEFLATED) as archive:
         for number, lines in enumerate(pages, start=1):
             runs = "".join(f"<a:r><a:t>{escape(line)}</a:t></a:r>" for line in lines)
             archive.writestr(
                 f"ppt/slides/slide{number}.xml",
-                '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                ('<p:sld show="0" ' if number in hidden else '<p:sld ') +
+                'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
                 'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
                 f"<p:cSld><a:p>{runs}</a:p></p:cSld></p:sld>",
             )
+    return path
+
+
+def add_test_presentation(path, order, relationships=None):
+    relationships = relationships if relationships is not None else [
+        ("r1", "slides/slide1.xml"), ("r2", "slides/slide2.xml"),
+    ]
+    ids = "".join(f'<p:sldId id="{256 + n}" r:id="{rid}"/>' for n, rid in enumerate(order))
+    rels = "".join(
+        f'<Relationship Id="{rid}" Target="{target}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide"/>'
+        for rid, target in relationships)
+    with ZipFile(path, "a") as archive:
+        archive.writestr("ppt/presentation.xml", '<p:presentation '
+                         'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                         f'<p:sldIdLst>{ids}</p:sldIdLst></p:presentation>')
+        archive.writestr("ppt/_rels/presentation.xml.rels", '<Relationships '
+                         'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                         f'{rels}</Relationships>')
     return path
 
 
@@ -124,6 +147,21 @@ def test_page_order_is_chronological_stable_and_never_falls_back_to_worse_match(
                                      [DeckPage(2, "Decisioni"), DeckPage(1, "Premesse")])
     assert [s.page for s in result] == [2, 1, None, 2]
     assert [s.timestamp_seconds for s in result] == [20, 10, 30, 40]
+
+
+def test_matching_accepts_exact_one_tenth_margin_for_scores_one_and_point_nine():
+    # Same token set; 12 matching characters out of 16 => sequence .75,
+    # runner-up .6 * 1 + .4 * .75 = .9. The best page scores exactly 1.
+    result = match_slides_to_material(
+        [slide("one two three xx")], ReportMaterial(titolo=TITLE, url=URL),
+        [DeckPage(1, "one two three xx"), DeckPage(2, "one three two xx")])
+    assert result[0].page == 1
+
+
+@pytest.mark.parametrize("runner_up,accepted", [(.9, True), (.90000000000001, False), (.90000001, False)])
+def test_margin_tolerance_only_covers_float_roundoff(runner_up, accepted):
+    from app.materials import _margin_at_least_tenth
+    assert _margin_at_least_tenth(1.0, runner_up) is accepted
 
 
 class Response:
@@ -349,6 +387,41 @@ def test_pptx_numeric_page_order_and_empty_pages(tmp_path):
     assert pages[-1].text == ""
 
 
+def test_pptx_page_numbers_follow_presentation_relationship_order(tmp_path):
+    deck = add_test_presentation(write_test_pptx(tmp_path / "ordered.pptx", [["Premesse"], ["Decisioni"]]), ["r2", "r1"])
+    pages = extract_deck_pages(deck)
+    assert [(p.number, p.text) for p in pages] == [(1, "Decisioni"), (2, "Premesse")]
+    matched = match_slides_to_material([slide("Decisioni")], ReportMaterial(titolo=TITLE, file=str(deck)), pages)
+    assert matched[0].page == 1
+
+
+def test_pptx_hidden_slides_do_not_consume_displayed_page_numbers(tmp_path):
+    deck = add_test_presentation(write_test_pptx(tmp_path / "hidden.pptx", [["Premesse"], ["Hidden"]], hidden=(2,)), ["r2", "r1"])
+    assert [(p.number, p.text) for p in extract_deck_pages(deck)] == [(1, "Premesse")]
+
+
+@pytest.mark.parametrize("order,relationships", [
+    (["r1"], [("r1", "slides/missing.xml")]),
+    (["r3"], [("r1", "slides/slide1.xml")]),
+    (["r1"], [("r1", "slides/slide1.xml"), ("r1", "slides/slide2.xml")]),
+    (["r1", "r1"], [("r1", "slides/slide1.xml")]),
+    (["r1"], [("r1", "../../../escape.xml")]),
+    (["r1"], [("r1", "https://private.example/slides.xml")]),
+])
+def test_pptx_rejects_missing_ambiguous_or_unsafe_presentation_references(tmp_path, order, relationships):
+    deck = add_test_presentation(write_test_pptx(tmp_path / "bad-order.pptx", [["one"], ["two"]]), order, relationships)
+    with pytest.raises(MaterialError):
+        extract_deck_pages(deck)
+
+
+def test_pptx_real_package_never_falls_back_when_presentation_relationships_are_missing(tmp_path):
+    deck = write_test_pptx(tmp_path / "incomplete.pptx", [["one"]])
+    with ZipFile(deck, "a") as archive:
+        archive.writestr("ppt/presentation.xml", '<presentation/>')
+    with pytest.raises(MaterialError):
+        extract_deck_pages(deck)
+
+
 def test_pdf_active_content_and_encryption_are_rejected(tmp_path):
     from pypdf import PdfWriter
     for kind in ["javascript", "attachment", "encrypted"]:
@@ -389,7 +462,8 @@ def test_pdf_text_never_invokes_an_optional_external_image_decoder(tmp_path, mon
     writer.write(deck)
     def forbidden_decoder(*args, **kwargs):
         raise AssertionError("Optional external decoder reached")
-    monkeypatch.setattr(filters.JBIG2Decode, "decode", forbidden_decoder)
+    if hasattr(filters, "JBIG2Decode"):
+        monkeypatch.setattr(filters.JBIG2Decode, "decode", forbidden_decoder)
     with pytest.raises(MaterialError):
         module._pdf_pages(deck)
 
@@ -399,6 +473,141 @@ def test_pdf_resource_limits_are_enforced(tmp_path, kind):
     deck = write_test_pdf(tmp_path / "oversized.pdf", [""] * 1001 if kind == "pages" else ["x" * 100_001])
     with pytest.raises(MaterialError):
         extract_deck_pages(deck)
+
+
+def write_disguised_pdf_contents(path, *, count=1, stream_bytes=32, codec="/FlateDecode", indirect_array=False):
+    import zlib
+    from pypdf import PdfWriter
+    from pypdf.generic import ArrayObject, DictionaryObject, EncodedStreamObject, NameObject
+    writer = PdfWriter()
+    font = writer._add_object(DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"), NameObject("/BaseFont"): NameObject("/Helvetica")}))
+    for _ in range(count):
+        page = writer.add_blank_page(width=100, height=100)
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
+        content = EncodedStreamObject()
+        program = b"BT /F1 12 Tf 10 10 Td (safe) Tj ET" if stream_bytes > 100 else b""
+        content._data = zlib.compress(b"%" + b"x" * (stream_bytes - len(program) - 2) + b"\n" + program)
+        content[NameObject("/Filter")] = NameObject(codec)
+        content[NameObject("/Subtype")] = NameObject("/Image")
+        reference = writer._add_object(content)
+        page[NameObject("/Contents")] = writer._add_object(ArrayObject([reference])) if indirect_array else reference
+    writer.write(path)
+    return path
+
+
+def test_disguised_pdf_contents_cannot_bypass_100_mib_decoded_limit(tmp_path):
+    # Eleven distinct 10 MiB streams: each is at its individual limit, the
+    # compressed file is small, and only the cumulative limit must reject it.
+    deck = write_disguised_pdf_contents(tmp_path / "110-mib.pdf", count=11, stream_bytes=10 * 1024 * 1024)
+    with pytest.raises(MaterialError):
+        extract_deck_pages(deck)
+    assert list(tmp_path.iterdir()) == [deck]
+
+
+def test_disguised_pdf_contents_at_exact_100_mib_are_accounted_and_read(tmp_path):
+    deck = write_disguised_pdf_contents(tmp_path / "100-mib.pdf", count=10, stream_bytes=10 * 1024 * 1024)
+    pages = extract_deck_pages(deck)
+    assert len(pages) == 10
+    assert all(page.text.strip() == "safe" for page in pages)
+    assert list(tmp_path.iterdir()) == [deck]
+
+
+def test_disguised_font_streams_are_counted_before_text_extraction(tmp_path, monkeypatch):
+    import zlib
+    import app.materials as module
+    from pypdf import PdfWriter
+    from pypdf._page import PageObject
+    from pypdf.generic import DictionaryObject, EncodedStreamObject, NameObject
+    writer = PdfWriter()
+    for _ in range(11):
+        page = writer.add_blank_page(width=100, height=100)
+        cmap = EncodedStreamObject()
+        cmap._data = zlib.compress(b"%" + b"x" * (10 * 1024 * 1024 - 2) + b"\n")
+        cmap[NameObject("/Filter")] = NameObject("/FlateDecode")
+        cmap[NameObject("/Subtype")] = NameObject("/Image")
+        font = DictionaryObject({NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"), NameObject("/BaseFont"): NameObject("/Helvetica"),
+            NameObject("/ToUnicode"): writer._add_object(cmap)})
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"):
+            DictionaryObject({NameObject("/F1"): writer._add_object(font)})})
+    deck = tmp_path / "font-110-mib.pdf"
+    writer.write(deck)
+    def forbidden_extract(*args, **kwargs):
+        raise AssertionError("Oversized disguised font stream reached extraction")
+    monkeypatch.setattr(PageObject, "extract_text", forbidden_extract)
+    with pytest.raises(MaterialError):
+        module._pdf_pages(deck)
+
+
+def test_disguised_pdf_contents_are_checked_through_indirect_arrays(tmp_path, monkeypatch):
+    import app.materials as module
+    from pypdf import filters
+    deck = write_disguised_pdf_contents(tmp_path / "array.pdf", codec="/JBIG2Decode", indirect_array=True)
+    def forbidden_decode(*args, **kwargs):
+        raise AssertionError("Unvalidated disguised content reached the decoder")
+    if hasattr(filters, "JBIG2Decode"):
+        monkeypatch.setattr(filters.JBIG2Decode, "decode", forbidden_decode)
+    with pytest.raises(MaterialError):
+        module._pdf_pages(deck)
+
+
+@pytest.mark.parametrize("legacy_api", [False, True])
+def test_pdf_disables_external_decoders_before_reader_parses_any_objects(tmp_path, monkeypatch, legacy_api):
+    import pypdf
+    import app.materials as module
+    from pypdf import filters
+    from pypdf.generic import EncodedStreamObject, NameObject
+    from contextlib import nullcontext
+    deck = write_test_pdf(tmp_path / "safe.pdf", ["safe"])
+    reader = pypdf.PdfReader
+    def reader_with_encoded_object(*args, **kwargs):
+        # A malicious object stream can be decoded inside PdfReader before
+        # application traversal sees the page or /Contents dictionary.
+        encoded = EncodedStreamObject()
+        encoded._data = b"untrusted JBIG2 bytes"
+        encoded[NameObject("/Filter")] = NameObject("/JBIG2Decode")
+        encoded.get_data()
+        return reader(*args, **kwargs)
+    monkeypatch.setattr(pypdf, "PdfReader", reader_with_encoded_object)
+    monkeypatch.setattr(filters, "JBIG2DEC_BINARY", "/untrusted/decoder", raising=False)
+    attempted = []
+    def forbidden_subprocess(*args, **kwargs):
+        attempted.append("subprocess")
+        raise AssertionError("External execution attempted")
+    monkeypatch.setattr(subprocess, "run", forbidden_subprocess)
+    temporary = []
+    def forbidden_temp(*args, **kwargs):
+        temporary.append("temporary")
+        raise AssertionError("Decoder created a directory outside workspace")
+    monkeypatch.setattr(filters, "TemporaryDirectory", forbidden_temp, raising=False)
+    context = pypdf.apply_configuration(jbig2dec_binary="/untrusted/decoder", disable_legacy_handling=False) if hasattr(pypdf, "apply_configuration") else nullcontext()
+    with context:
+        if legacy_api:
+            monkeypatch.delattr(pypdf, "overwrite_configuration", raising=False)
+        with pytest.raises(MaterialError):
+            module._pdf_pages(deck)
+    assert attempted == [] and temporary == []
+
+
+def test_pdf_cyclic_contents_array_is_rejected_without_text_extraction(tmp_path, monkeypatch):
+    import app.materials as module
+    from pypdf import PdfWriter
+    from pypdf._page import PageObject
+    from pypdf.generic import ArrayObject, NameObject
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=100, height=100)
+    contents = ArrayObject()
+    reference = writer._add_object(contents)
+    contents.append(reference)
+    page[NameObject("/Contents")] = reference
+    deck = tmp_path / "cycle.pdf"
+    writer.write(deck)
+    def forbidden_extract(*args, **kwargs):
+        raise AssertionError("Cyclic contents reached extraction")
+    monkeypatch.setattr(PageObject, "extract_text", forbidden_extract)
+    with pytest.raises(MaterialError):
+        module._pdf_pages(deck)
 
 
 def test_settings_produce_an_exact_normalized_host_allowlist():
@@ -440,6 +649,39 @@ def test_processor_compares_all_materials_before_accepting(tmp_path):
     assert len(result.materials) == 2
     assert result.slides[0].page is None
     assert result.slides[0].material_title is None
+    assert list(workspace.iterdir()) == []
+
+
+def test_distinct_sources_with_identical_titles_never_get_title_only_links(tmp_path):
+    one, two, workspace = tmp_path / "one", tmp_path / "two", tmp_path / "job"
+    one.mkdir()
+    two.mkdir()
+    workspace.mkdir()
+    first = write_test_pptx(one / "Slide Furio D’Andrea.pptx", [["Decisioni assembleari"]])
+    second = write_test_pptx(two / "Slide Furio D'Andrea.pptx", [["Comunicazioni logistiche"]])
+    result = MaterialProcessor().process([str(first), str(second)], [slide()], workspace)
+    assert [m.titolo for m in result.materials] == [TITLE, TITLE]
+    assert result.slides[0].material_title is None and result.slides[0].page is None
+    assert result.failures == ("MATERIALE_NON_RAGGIUNGIBILE",)
+    assert list(workspace.iterdir()) == []
+
+
+def test_duplicate_source_urls_deduplicate_before_title_ambiguity(tmp_path):
+    source = write_test_pptx(tmp_path / "source.pptx", [["Decisioni assembleari"]])
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    def fetcher(url, workspace, allowed_hosts, cancellation_event=None):
+        deck = workspace / "deck"
+        deck.write_bytes(source.read_bytes())
+        return deck
+    first = f"{TITLE} | https://www.assoholding.it/a.pptx"
+    result = MaterialProcessor(fetcher=fetcher).process(
+        [first, first, "Other label | https://WWW.ASSOHOLDING.IT:443/a.pptx#section"],
+        [slide()], workspace)
+    assert len(result.materials) == 1
+    assert result.materials[0].titolo == TITLE
+    assert result.slides[0].page == 1
+    assert result.failures == ()
     assert list(workspace.iterdir()) == []
 
 
@@ -571,3 +813,48 @@ def test_worker_total_deadline_kills_stalled_work(tmp_path, monkeypatch):
         fetch_deck(URL, tmp_path, ("www.assoholding.it",))
     assert processes and processes[0].poll() is not None
     assert list(tmp_path.iterdir()) == []
+
+
+def test_worker_deadline_also_stops_descendants(tmp_path, monkeypatch):
+    import app.materials as module
+    real_popen = subprocess.Popen
+    marker, pidfile = tmp_path / "escaped", tmp_path / "child.pid"
+    child_script = "import sys,time; from pathlib import Path; time.sleep(.6); Path(sys.argv[1]).write_text('escaped')"
+    worker_script = (
+        "import subprocess,sys,time; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); "
+        "Path(sys.argv[3]).write_text(str(child.pid)); time.sleep(60)"
+    )
+    def parent_and_child(args, **kwargs):
+        return real_popen([sys.executable, "-c", worker_script, child_script, str(marker), str(pidfile)], **kwargs)
+    monkeypatch.setattr(module.subprocess, "Popen", parent_and_child)
+    try:
+        with pytest.raises(MaterialError):
+            module._run_worker("parse", "unused", tmp_path / "output", timeout=.25)
+        assert pidfile.exists()
+        time.sleep(.7)
+        assert not marker.exists(), "Worker child outlived the enforced deadline"
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_concurrent_jobs_keep_materials_and_cleanup_isolated(tmp_path):
+    one = write_test_pdf(tmp_path / "one.pdf", ["Decisioni assembleari"])
+    two = write_test_pptx(tmp_path / "two.pptx", [["Premesse"]])
+    workspaces = [tmp_path / "job-one", tmp_path / "job-two"]
+    for workspace in workspaces:
+        workspace.mkdir()
+    processor = MaterialProcessor()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(processor.process, [str(source)], [slide(title)], workspace)
+                   for source, title, workspace in zip([one, two], ["Decisioni assembleari", "Premesse"], workspaces)]
+        results = [future.result(timeout=10) for future in futures]
+    assert [result.materials[0].titolo for result in results] == ["one", "two"]
+    assert [result.slides[0].page for result in results] == [1, 1]
+    assert all(result.failures == () for result in results)
+    assert all(list(workspace.iterdir()) == [] for workspace in workspaces)
+    assert one.is_file() and two.is_file()

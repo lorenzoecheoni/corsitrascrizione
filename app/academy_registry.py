@@ -53,13 +53,17 @@ class ParsedSpeakerIdentity:
 REGISTRY_PEOPLE = (
     RegistryPerson("Vincenzo Manfredi", "vincenzo-manfredi"),
     RegistryPerson("Gaetano De Vito", "gaetano-de-vito"),
-    RegistryPerson("Furio D’Andrea", "furio-dandrea"),
+    RegistryPerson("Furio D'Andrea", "furio-dandrea"),
     RegistryPerson("Antonio Sibilia", "antonio-sibilia"),
     RegistryPerson("Luigi Morra", "luigi-morra"),
 )
 
 _ALIASES_BY_SLUG = {
-    "furio-dandrea": ("Fulvio D’Andrea",),
+    "furio-dandrea": (
+        "Furio D’Andrea",
+        "Fulvio D'Andrea",
+        "Fulvio D’Andrea",
+    ),
 }
 
 

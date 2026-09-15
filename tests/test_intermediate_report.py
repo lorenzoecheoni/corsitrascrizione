@@ -359,9 +359,9 @@ def test_timeline_only_normalized_names_preserve_the_first_spelling_and_known_al
 
     result = build_intermediate_report(report, TARGET_GUID)
 
-    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio D’Andrea"]
+    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio D'Andrea"]
     assert [item.relatori for item in result.video[0].interventi] == [
-        ["Jose Nunez"], ["Jose Nunez", "Furio D’Andrea"], ["Furio D’Andrea"],
+        ["Jose Nunez"], ["Jose Nunez", "Furio D'Andrea"], ["Furio D'Andrea"],
     ]
     assert "Fulvio" not in render_markdown(report)
     assert "Fulvio" not in render_text(report)
@@ -508,12 +508,12 @@ def test_builder_wraps_one_video_and_reconciles_registry_speakers() -> None:
     data = result.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert data["versione"] == 1
     assert data["corso"] == {
-        "titolo": "Webinar con Furio D’Andrea",
-        "sinossi_corso": "Furio D’Andrea presenta la sinossi.",
+        "titolo": "Webinar con Furio D'Andrea",
+        "sinossi_corso": "Furio D'Andrea presenta la sinossi.",
     }
     assert [(item["chiave"], item["ordine"]) for item in data["video"]] == [("v1", 1)]
     assert [item["nome"] for item in data["relatori"]] == [
-        "Vincenzo Manfredi", "Gaetano De Vito", "Furio D’Andrea",
+        "Vincenzo Manfredi", "Gaetano De Vito", "Furio D'Andrea",
         "Antonio Sibilia", "Luigi Morra",
     ]
     assert {item.get("slug") for item in data["relatori"]} == {
@@ -605,8 +605,8 @@ def test_furio_is_canonical_when_furio_and_fulvio_are_both_candidate_names() -> 
 
     assert correct_speaker_name_mentions(
         "Furio d'Andrea e Fulvio D'Andrea", ["Furio d'Andrea", "Fulvio D'Andrea"]
-    ) == "Furio D’Andrea e Furio D’Andrea"
-    assert names.count("Furio D’Andrea") == 1
+    ) == "Furio D'Andrea e Furio D'Andrea"
+    assert names.count("Furio D'Andrea") == 1
     assert "Fulvio D'Andrea" not in names
 
 
@@ -642,14 +642,14 @@ def test_governance_aliases_collapse_to_registry_people_and_rewrite_references()
     result = build_intermediate_report(report, TARGET_GUID)
 
     assert [(person.nome, person.slug) for person in result.relatori] == [
-        ("Furio D’Andrea", "furio-dandrea"),
+        ("Furio D'Andrea", "furio-dandrea"),
         ("Luigi Morra", "luigi-morra"),
         ("Antonio Sibilia", "antonio-sibilia"),
         ("Gaetano De Vito", "gaetano-de-vito"),
         ("Vincenzo Manfredi", "vincenzo-manfredi"),
     ]
     assert [item.relatori for item in result.video[0].interventi] == [
-        ["Furio D’Andrea"], ["Luigi Morra"], ["Luigi Morra"],
+        ["Furio D'Andrea"], ["Luigi Morra"], ["Luigi Morra"],
         ["Antonio Sibilia"], ["Antonio Sibilia"], ["Gaetano De Vito"],
         ["Vincenzo Manfredi"],
     ]
@@ -1011,13 +1011,13 @@ def test_dotted_initial_stays_distinct_from_apostrophe_surname_variants() -> Non
     result = build_intermediate_report(report, TARGET_GUID)
 
     assert [(speaker.nome, speaker.slug) for speaker in result.relatori] == [
-        ("Furio D’Andrea", "furio-dandrea"),
+        ("Furio D'Andrea", "furio-dandrea"),
         ("Domenico Andrea", None),
         ("D. Andrea", None),
     ]
     assert [item.relatori for item in result.video[0].interventi] == [
-        ["Furio D’Andrea"], ["Domenico Andrea"], ["D. Andrea"],
-        ["D. Andrea"], ["Furio D’Andrea"], ["Furio D’Andrea"],
+        ["Furio D'Andrea"], ["Domenico Andrea"], ["D. Andrea"],
+        ["D. Andrea"], ["Furio D'Andrea"], ["Furio D'Andrea"],
     ]
     assert all(
         check.codice != "ALIAS_RELATORE_AMBIGUO" or "D. Andrea" not in check.messaggio
@@ -1054,6 +1054,11 @@ def test_granular_export_rewrites_block_chapter_slide_and_material_references() 
         0, 600, relatori=["Avv. Furio d'Andrea", "Furio D’Andrea"],
         titolo="Capitolo di Fulvio D'Andrea",
         sintesi="Fulvio D'Andrea illustra la governance.",
+        punti_chiave=[
+            "Poteri illustrati da Fulvio D'Andrea",
+            "Deleghe secondo Fulvio D'Andrea",
+            "Controlli riepilogati da Fulvio D'Andrea",
+        ],
     ).model_copy(update={
         "block_id": "b001", "chapter_number": 1, "chapters_in_block": 1,
         "boundary_origin": ChapterBoundaryOrigin(
@@ -1080,14 +1085,23 @@ def test_granular_export_rewrites_block_chapter_slide_and_material_references() 
     result = build_intermediate_report(report, TARGET_GUID)
     video = result.video[0]
 
-    assert video.blocchi_parlato[0].relatori == ["Furio D’Andrea"]
-    assert video.blocchi_parlato[0].titolo == "Blocco di Furio D’Andrea"
-    assert video.blocchi_parlato[0].sinossi == "Furio D’Andrea tratta gli assetti."
-    assert video.interventi[0].relatori == ["Furio D’Andrea"]
+    assert video.blocchi_parlato[0].relatori == ["Furio D'Andrea"]
+    assert video.blocchi_parlato[0].titolo == "Blocco di Furio D'Andrea"
+    assert video.blocchi_parlato[0].sinossi == "Furio D'Andrea tratta gli assetti."
+    assert video.interventi[0].relatori == ["Furio D'Andrea"]
+    assert video.interventi[0].titolo == "Capitolo di Furio D'Andrea"
+    assert video.interventi[0].sintesi == "Furio D'Andrea illustra la governance."
+    assert video.interventi[0].punti_chiave == [
+        "Poteri illustrati da Furio D'Andrea",
+        "Deleghe secondo Furio D'Andrea",
+        "Controlli riepilogati da Furio D'Andrea",
+    ]
     assert video.interventi[0].blocco == "b001"
-    assert video.slide[0].titolo == "Furio D’Andrea in apertura"
-    assert video.materiali[0].relatore == "Furio D’Andrea"
-    assert video.materiali[0].titolo == "Slide · Furio D’Andrea"
+    assert video.slide[0].titolo == "Furio D'Andrea in apertura"
+    assert video.slide[0].testo_principale == "Relazione di Furio D'Andrea"
+    assert video.materiali[0].relatore == "Furio D'Andrea"
+    assert video.materiali[0].titolo == "Slide · Furio D'Andrea"
+    assert "Furio D’Andrea" not in result.model_dump_json()
 
 
 def test_builder_filters_generic_formal_speaker_profiles() -> None:

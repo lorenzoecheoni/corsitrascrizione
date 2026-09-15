@@ -52,11 +52,11 @@ def test_report_models_retain_blocks_chapter_origin_and_material_page():
     })
     block = SpeechBlock(
         id="b003", start_seconds=862, end_seconds=3135, tipo="intervento",
-        relatori=["Furio D’Andrea"], titolo="Governance delle holding",
+        relatori=["Furio D'Andrea"], titolo="Governance delle holding",
         sinossi="Il blocco tratta poteri, assemblea e direttive.",
     )
     material = ReportMaterial(
-        titolo="Slide · Furio D’Andrea", relatore="Furio D’Andrea",
+        titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
         url="https://www.assoholding.it/materiali/furio.pptx", pagine=18,
     )
     report = make_report([chapter]).model_copy(update={
@@ -282,7 +282,7 @@ def topic_unit(start: float, end: float, speaker: str) -> SemanticIntervention:
     )
 
 def test_long_speaker_block_is_preserved_and_partitioned_near_nine_minutes():
-    units = [topic_unit(index * 180, (index + 1) * 180, "Furio D’Andrea")
+    units = [topic_unit(index * 180, (index + 1) * 180, "Furio D'Andrea")
              for index in range(13)]
     plan = plan_semantic_timeline(units, slides=[
         SlideChange(timestamp_seconds=1280, title="Poteri", confidence="alta"),
@@ -493,13 +493,14 @@ git commit -m "feat: derive chapter cuts from themes slides and silence"
 ```python
 def test_governance_aliases_collapse_to_registry_people_and_rewrite_references():
     report = report_with_names([
-        "Furio d'Andrea", "Avvocato Furio D'Andrea", "Luigi Morra",
+        "Furio d'Andrea", "Furio D’Andrea", "Furio D ’ Andrea",
+        "Avvocato Furio D'Andrea", "Luigi Morra",
         "Dottor Morra", "Antonio Sibilia", "Dottor Sibilia",
         "Gaetano De Vito", "Vincenzo Manfredi",
     ])
     result = build_intermediate_report(report, TARGET_GUID)
     assert [(person.nome, person.slug) for person in result.relatori] == [
-        ("Furio D’Andrea", "furio-dandrea"),
+        ("Furio D'Andrea", "furio-dandrea"),
         ("Luigi Morra", "luigi-morra"),
         ("Antonio Sibilia", "antonio-sibilia"),
         ("Gaetano De Vito", "gaetano-de-vito"),
@@ -528,7 +529,7 @@ class RegistryPerson:
 REGISTRY_PEOPLE = (
     RegistryPerson("Vincenzo Manfredi", "vincenzo-manfredi"),
     RegistryPerson("Gaetano De Vito", "gaetano-de-vito"),
-    RegistryPerson("Furio D’Andrea", "furio-dandrea"),
+    RegistryPerson("Furio D'Andrea", "furio-dandrea"),
     RegistryPerson("Antonio Sibilia", "antonio-sibilia"),
     RegistryPerson("Luigi Morra", "luigi-morra"),
 )
@@ -578,12 +579,12 @@ git commit -m "fix: canonicalize Academy speakers and honorific aliases"
 ```python
 def test_governance_guid_returns_curated_real_materials_before_sheet_labels():
     sources = material_sources_for_video(
-        [inventory_course(materiali=["Slide Furio D’Andrea", "Slide Luigi Morra"])],
+        [inventory_course(materiali=["Slide Furio D'Andrea", "Slide Luigi Morra"])],
         UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438"),
         "Governance delle holding e conferimenti a realizzo controllato",
     )
     assert sources == [
-        "Slide · Furio D’Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
+        "Slide · Furio D'Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
         "Slide · Luigi Morra | https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx",
     ]
 ```
@@ -602,7 +603,7 @@ Expected: FAIL perché il CSV perde hyperlink e non esiste il registro GUID.
 GOVERNANCE_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
 CURATED_MATERIALS = {
     GOVERNANCE_GUID: (
-        "Slide · Furio D’Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
+        "Slide · Furio D'Andrea | https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx",
         "Slide · Luigi Morra | https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx",
     ),
 }
@@ -669,7 +670,7 @@ def test_pptx_pages_are_matched_to_video_slides(tmp_path):
         ["PREMESSE", "Poteri e responsabilità"],
         ["DECISIONI ASSEMBLEARI", "Quorum e maggioranze"],
     ])
-    material = ReportMaterial(titolo="Slide · Furio D’Andrea", file=str(deck))
+    material = ReportMaterial(titolo="Slide · Furio D'Andrea", file=str(deck))
     pages = extract_deck_pages(deck)
     slides = match_slides_to_material(
         [SlideChange(timestamp_seconds=10, title="Decisioni assembleari",
@@ -677,7 +678,7 @@ def test_pptx_pages_are_matched_to_video_slides(tmp_path):
         material,
         pages,
     )
-    assert slides[0].material_title == "Slide · Furio D’Andrea"
+    assert slides[0].material_title == "Slide · Furio D'Andrea"
     assert slides[0].page == 2
     assert len(pages) == 2
 ```
@@ -746,7 +747,7 @@ git commit -m "feat: map detected slides to verified deck pages"
 def test_pipeline_persists_material_metadata_but_removes_downloaded_deck(components, tmp_path):
     components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext(
         speaker_hints=(),
-        material_sources=("Slide · Furio D’Andrea | https://www.assoholding.it/furio.pptx",),
+        material_sources=("Slide · Furio D'Andrea | https://www.assoholding.it/furio.pptx",),
     )
 
     class FakeMaterialProcessor:
@@ -755,18 +756,18 @@ def test_pipeline_persists_material_metadata_but_removes_downloaded_deck(compone
             deck.write_bytes(b"temporary deck bytes")
             return MaterialAnalysis(
                 materials=(ReportMaterial(
-                    titolo="Slide · Furio D’Andrea", relatore="Furio D’Andrea",
+                    titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
                     url="https://www.assoholding.it/furio.pptx", pagine=2,
                 ),),
                 slides=tuple(slide.model_copy(update={
-                    "material_title": "Slide · Furio D’Andrea", "page": 2,
+                    "material_title": "Slide · Furio D'Andrea", "page": 2,
                 }) for slide in slides),
                 failures=(),
             )
 
     components.pipeline.material_processor = FakeMaterialProcessor()
     report = components.pipeline.run(SOURCE, lambda percent, message: None)
-    assert report.materials[0].titolo == "Slide · Furio D’Andrea"
+    assert report.materials[0].titolo == "Slide · Furio D'Andrea"
     assert report.slides[0].page == 2
     assert list(tmp_path.iterdir()) == []
     serialized = report.model_dump_json()

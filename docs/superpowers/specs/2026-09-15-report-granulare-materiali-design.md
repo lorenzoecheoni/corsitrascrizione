@@ -115,7 +115,7 @@ Esempio:
   "inizio": "0:14:22",
   "fine": "0:52:15",
   "tipo": "intervento",
-  "relatori": ["Furio D’Andrea"],
+  "relatori": ["Furio D'Andrea"],
   "titolo": "Governance delle holding",
   "sinossi": "Il blocco affronta poteri societari, decisioni assembleari e direttive della holding."
 }
@@ -152,7 +152,7 @@ Esempio:
   "inizio": "0:22:49",
   "fine": "0:32:11",
   "tipo": "intervento",
-  "relatori": ["Furio D’Andrea"],
+  "relatori": ["Furio D'Andrea"],
   "titolo": "Le decisioni assembleari",
   "sintesi": "Il capitolo esamina competenze dei soci, quorum e modalità decisionali alternative.",
   "confine_inizio": {
@@ -196,13 +196,13 @@ diventa mai un file.
 Per il video Governance il registro iniziale userà gli URL ufficiali già
 presenti nell'import Academy esistente:
 
-- Furio D’Andrea:
+- Furio D'Andrea:
   `https://www.assoholding.it/wp-content/uploads/2026/07/19072026_PP-Avv.-Furio-DAndrea_Webinar-22-luglio-2026.pptx`;
 - Luigi Morra:
   `https://www.assoholding.it/wp-content/uploads/2026/07/Slide-Morra-Conferimenti-1.pptx`.
 
 I titoli destinati alla piattaforma sono rispettivamente
-`Slide · Furio D’Andrea` e `Slide · Luigi Morra`. L'etichetta dell'inventario
+`Slide · Furio D'Andrea` e `Slide · Luigi Morra`. L'etichetta dell'inventario
 può servire a trovare la sorgente, ma non viene copiata automaticamente come
 titolo pubblico.
 
@@ -349,9 +349,12 @@ video, il ruolo le conserva entrambe in forma leggibile, per esempio
 
 Per ogni persona riconosciuta nel Registro il report usa sia il nome canonico
 del Registro sia il relativo `slug`; lo slug non viene ricostruito dal nome.
-Nel video Governance, in particolare, la voce è `Furio D’Andrea` con apostrofo
-tipografico e `slug: "furio-dandrea"`. Tutti i riferimenti interni usano la
-stessa grafia per evitare la creazione di doppioni durante l'import.
+Nel video Governance, in particolare, la voce è `Furio D'Andrea` con apostrofo
+ASCII diritto e `slug: "furio-dandrea"`. Gli input `Furio D’Andrea`,
+`Furio d'Andrea`, le forme con spazi attorno all'apostrofo e le varianti con
+onorifico vengono ricondotti alla stessa voce; tutti gli output e i riferimenti
+interni usano la grafia canonica con apostrofo diritto per evitare doppioni
+durante l'import.
 
 ## Recupero e analisi dei materiali
 
@@ -430,7 +433,7 @@ Lo sviluppo procede per test-first:
 4. fallback `INTERVENTO_LUNGO` quando non esiste una chiusura valida;
 5. slide usata come indizio ma confine collocato sul silenzio vicino;
 6. sinossi distinta per ogni capitolo;
-7. alias onorifici di Furio D’Andrea, Luigi Morra e Antonio Sibilia ricondotti
+7. alias onorifici di Furio D'Andrea, Luigi Morra e Antonio Sibilia ricondotti
    a cinque persone totali nel video di riferimento;
 8. caso omonimo che resta separato e genera `ALIAS_RELATORE_AMBIGUO`;
 9. cella con hyperlink Google conservata come URL reale;
@@ -452,14 +455,14 @@ Dopo i test locali e la pubblicazione:
 
 1. rianalizzare il GUID `7f254c4d-fe34-4fd3-a4cf-cda4f447e438`;
 2. verificare che le persone siano esattamente Vincenzo Manfredi, Gaetano De
-   Vito, Furio D’Andrea, Antonio Sibilia e Luigi Morra, con nomi e slug del
+   Vito, Furio D'Andrea, Antonio Sibilia e Luigi Morra, con nomi e slug del
    Registro;
 3. verificare che nessun intervento usi `Avvocato`, `Dottor` o altri alias;
-4. verificare che il blocco di Furio D’Andrea resti visibile come blocco lungo
+4. verificare che il blocco di Furio D'Andrea resti visibile come blocco lungo
    e produca capitoli distinti;
 5. verificare una struttura attesa di circa 10–12 capitoli, preferibilmente da
    8–10 minuti, senza trasformare questa quantità in un vincolo artificiale;
-6. verificare URL reali per i deck di Furio D’Andrea e Luigi Morra;
+6. verificare URL reali per i deck di Furio D'Andrea e Luigi Morra;
 7. verificare `materiale` e `pagina` sulle slide abbinate;
 8. verificare tutti i `CONFINE` e l'origine dei tagli;
 9. validare gli export JSON, Markdown e testo;

@@ -8,7 +8,7 @@ from app.models import SlideChange
 from app.transcription import TranscriptSegment, TranscriptWord
 
 
-def topic_unit(start, end, speaker="Furio D’Andrea", label="A", kind="intervento"):
+def topic_unit(start, end, speaker="Furio D'Andrea", label="A", kind="intervento"):
     words = [
         TranscriptWord(text="Apertura.", start_seconds=start, end_seconds=start + .4,
                        diarization_label=label, confidence=.99),
@@ -58,14 +58,14 @@ def test_indivisible_long_unit_is_retained_even_with_internal_slides():
 
 
 def test_moderator_and_logistics_end_voice_blocks_and_alias_does_not():
-    units = [topic_unit(0, 180), topic_unit(180, 540, "F. D’Andrea"),
+    units = [topic_unit(0, 180), topic_unit(180, 540, "F. D'Andrea"),
              topic_unit(540, 550, "Moderatore", "M", "cambio_relatore"),
              topic_unit(550, 1090), topic_unit(1090, 1100, kind="logistica"),
              topic_unit(1100, 1640)]
     plan = plan_semantic_timeline(units, [])
     assert [item.block_id for item in plan.groups] == ["b001", "b002", "b003", None, "b004"]
     assert [block.group_indexes for block in plan.blocks] == [(0,), (1,), (2,), (4,)]
-    assert plan.groups[0].relatori == ("Furio D’Andrea", "F. D’Andrea")
+    assert plan.groups[0].relatori == ("Furio D'Andrea", "F. D'Andrea")
 
 
 def test_diarization_change_splits_block_even_when_display_name_matches():

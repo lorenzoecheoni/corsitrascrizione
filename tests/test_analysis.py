@@ -143,11 +143,20 @@ def test_window_seam_continuation_is_decided_with_previous_context(
     texts = [before, after] if limit == "seconds" else ["Premessa. " * 700 + before, after + " Spiegazione." * 580]
     inputs["metadata"].duration_seconds = content["duration_seconds"] = duration
     inputs["frames"] = []
+
+    def word_evidence(text, left, right):
+        terms = text.split()
+        return [TranscriptWord(
+            text=term,
+            start_seconds=left + (right - left) * index / len(terms),
+            end_seconds=left + (right - left) * (index + 1) / len(terms),
+            diarization_label="assembly:A", confidence=.9,
+        ) for index, term in enumerate(terms)]
+
     inputs["transcription"].segments = [TranscriptSegment(
         start_seconds=left, end_seconds=right, diarization_label="assembly:A",
         text=text, source_utterance_id=f"distinct-{index}",
-        words=[TranscriptWord(text="PRIVATE-WORD-EVIDENCE", start_seconds=left,
-                              end_seconds=right, diarization_label="assembly:A", confidence=.9)],
+        words=word_evidence(text, left, right),
     ) for index, (left, right, text) in enumerate([(0, end, texts[0]), (start, duration - 1, texts[1])])]
 
     def respond(call):
@@ -158,7 +167,7 @@ def test_window_seam_continuation_is_decided_with_previous_context(
         if payload["start_seconds"]:
             context = payload.get("previous_context")
             assert context is not None
-            assert context["segments"][-1]["text"].endswith(before)
+            assert " ".join(item["text"] for item in context["segments"]).endswith(before)
             data["previous_continuity"] = "continue"
         return SimpleNamespace(output_parsed=data, usage=SimpleNamespace(input_tokens=11, output_tokens=3))
 

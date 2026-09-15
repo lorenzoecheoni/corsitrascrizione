@@ -7,7 +7,7 @@ transcript text.
 from collections.abc import Sequence
 from dataclasses import replace
 import json
-import math
+import re
 from typing import Annotated, Literal, Mapping
 
 from pydantic import Field, field_validator, model_validator
@@ -25,12 +25,14 @@ from app.models import (
     SlideChange,
     UnitConfidence,
 )
-from app.transcription import TranscriptionResult, TranscriptSegment
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 
 
 MAX_WINDOW_SECONDS = 600
 MAX_WINDOW_CHARS = 12_000
 MAX_PREVIOUS_CONTEXT_CHARS = 3_000
+ATOM_MAX_SECONDS = 90
+ATOM_MAX_CHARS = 3_000
 MAX_CONSOLIDATION_CHARS = 30_000
 MAX_VISUAL_CONTEXT_CHARS = 18_000
 MAX_FAST_REPORT_CHARS = 30_000
@@ -147,50 +149,46 @@ def _fits_window(segments: list[TranscriptSegment]) -> bool:
     )
 
 
-def _split_oversized_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
-    """Split only the text, retaining the source segment's timing and label."""
-    if not segment.text:
-        return [segment] if _fits_window([segment]) else []
-    pieces: list[TranscriptSegment] = []
-    offset = 0
-    while offset < len(segment.text):
-        low, high = 1, len(segment.text) - offset
-        best = 0
-        while low <= high:
-            size = (low + high) // 2
-            piece = segment.model_copy(update={"text": segment.text[offset:offset + size]})
-            if _fits_window([piece]):
-                best = size
-                low = size + 1
-            else:
-                high = size - 1
-        if best == 0:
-            raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
-        pieces.append(segment.model_copy(update={"text": segment.text[offset:offset + best]}))
-        offset += best
-    return pieces
+def _segment_from_words(source: TranscriptSegment, words: Sequence[TranscriptWord]) -> TranscriptSegment:
+    return source.model_copy(update={
+        "start_seconds": words[0].start_seconds,
+        "end_seconds": words[-1].end_seconds,
+        "text": " ".join(word.text for word in words),
+        "words": list(words),
+    })
 
 
-def _split_long_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
-    """Bound a provider utterance in time while preserving its text exactly once."""
-    duration = segment.end_seconds - segment.start_seconds
-    part_count = max(1, math.ceil(duration / MAX_WINDOW_SECONDS))
-    pieces: list[TranscriptSegment] = []
-    for index in range(part_count):
-        text_start = len(segment.text) * index // part_count
-        text_end = len(segment.text) * (index + 1) // part_count
-        start = segment.start_seconds + duration * index / part_count
-        end = (
-            segment.end_seconds
-            if index == part_count - 1
-            else segment.start_seconds + duration * (index + 1) / part_count
-        )
-        pieces.append(segment.model_copy(update={
-            "start_seconds": start,
-            "end_seconds": end,
-            "text": segment.text[text_start:text_end],
-        }))
-    return pieces
+def split_transcript_atoms(
+    segment: TranscriptSegment,
+    *,
+    max_seconds: float = ATOM_MAX_SECONDS,
+    max_chars: int = ATOM_MAX_CHARS,
+) -> list[TranscriptSegment]:
+    """Split a provider utterance only at recorded word boundaries."""
+    if not segment.words:
+        raise ValueError("Un segmento richiede parole per la divisione editoriale")
+    atoms: list[TranscriptSegment] = []
+    start = 0
+    while start < len(segment.words):
+        candidates: list[int] = []
+        chars = 0
+        for index in range(start, len(segment.words)):
+            word = segment.words[index]
+            chars += len(word.text) + (index > start)
+            if (word.end_seconds - segment.words[start].start_seconds > max_seconds
+                    or chars > max_chars):
+                break
+            candidates.append(index)
+        if not candidates:
+            candidates = [start]
+        sentence_ends = [
+            index for index in candidates
+            if re.search(r"[.!?…][\"'’)]*$", segment.words[index].text)
+        ]
+        end = sentence_ends[-1] if sentence_ends else candidates[-1]
+        atoms.append(_segment_from_words(segment, segment.words[start:end + 1]))
+        start = end + 1
+    return atoms
 
 
 def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[TranscriptWindow]:
@@ -201,27 +199,22 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
 
     for segment in ordered:
         time_pieces = (
-            _split_long_segment(segment)
-            if segment.end_seconds - segment.start_seconds > MAX_WINDOW_SECONDS
+            split_transcript_atoms(segment)
+            if (segment.end_seconds - segment.start_seconds > ATOM_MAX_SECONDS
+                or not _fits_window([segment]))
             else [segment]
         )
         for time_piece in time_pieces:
-            pieces = (
-                [time_piece]
-                if _fits_window([time_piece])
-                else _split_oversized_segment(time_piece)
-            )
-            if not pieces:
+            if not _fits_window([time_piece]):
                 raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
-            for piece in pieces:
-                candidate = [*current, piece]
-                if current and not _fits_window(candidate):
-                    windows.append(_window_for(current))
-                    current = [piece]
-                else:
-                    current = candidate
-                if not _fits_window(current):
-                    raise ValueError("Una finestra non puo rispettare i limiti richiesti")
+            candidate = [*current, time_piece]
+            if current and not _fits_window(candidate):
+                windows.append(_window_for(current))
+                current = [time_piece]
+            else:
+                current = candidate
+            if not _fits_window(current):
+                raise ValueError("Una finestra non puo rispettare i limiti richiesti")
 
     if current:
         windows.append(_window_for(current))

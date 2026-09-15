@@ -116,6 +116,31 @@ def test_word_deduplication_applies_only_to_copies_of_the_same_source_utterance(
     assert result.boundaries[0].words_before == ["eco", "eco"]
 
 
+def test_word_aligned_atoms_preserve_each_word_once_for_boundary_evidence():
+    from app.analysis_chunks import split_transcript_atoms
+
+    words = [TranscriptWord(
+        text=f"parola-{index}", start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="A", confidence=.9,
+    ) for index in range(12)]
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=111, diarization_label="A",
+        text=" ".join(word.text for word in words), source_utterance_id="assembly-u000001",
+        words=words,
+    )
+    split_group = SemanticIntervention(
+        tipo="intervento", relatori=("Mario Rossi",), titolo="Tema", sintesi="Sintesi",
+        punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+        segments=tuple(split_transcript_atoms(source, max_seconds=90)),
+    )
+
+    result = align_intervention_boundaries(140, [split_group, group(120, 139)], [])
+
+    assert result.boundaries[0].words_before == [
+        "parola-7", "parola-8", "parola-9", "parola-10", "parola-11",
+    ]
+
+
 def test_absence_of_words_in_adjacent_second_sets_pause_flags():
     texts = ("uno", "due", "tre", "quattro", "cinque")
     result = align_intervention_boundaries(

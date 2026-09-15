@@ -64,6 +64,60 @@ def test_window_payload_preserves_source_utterance_id_without_word_evidence():
     assert json.loads(payload)["segments"][0]["source_utterance_id"] == "assembly-u000001"
 
 
+def test_long_utterance_becomes_word_aligned_atoms_without_duplicates():
+    from app import analysis_chunks
+
+    words = [TranscriptWord(
+        text=f"parola-{index}.", start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="A", confidence=.9,
+    ) for index in range(25)]
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=241, diarization_label="A",
+        text=" ".join(word.text for word in words), source_utterance_id="assembly-u000001",
+        words=words,
+    )
+
+    atoms = analysis_chunks.split_transcript_atoms(source, max_seconds=90, max_chars=3000)
+
+    assert [word.text for atom in atoms for word in atom.words] == [word.text for word in words]
+    assert all(atom.start_seconds == atom.words[0].start_seconds for atom in atoms)
+    assert all(atom.end_seconds == atom.words[-1].end_seconds for atom in atoms)
+    assert all(atom.source_utterance_id == "assembly-u000001" for atom in atoms)
+    assert max(atom.end_seconds - atom.start_seconds for atom in atoms) <= 90
+
+
+def test_atoms_prefer_a_sentence_end_or_last_complete_word_before_the_cap():
+    from app import analysis_chunks
+
+    def source(words):
+        return TranscriptSegment(
+            start_seconds=0, end_seconds=111, diarization_label="A",
+            text=" ".join(word.text for word in words), words=words,
+        )
+
+    sentence_words = [TranscriptWord(
+        text="otto." if index == 7 else f"parola-{index}",
+        start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="A", confidence=.9,
+    ) for index in range(12)]
+    unpunctuated_words = [TranscriptWord(
+        text=f"parola-{index}", start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="A", confidence=.9,
+    ) for index in range(12)]
+
+    sentence_atoms = analysis_chunks.split_transcript_atoms(source(sentence_words), max_seconds=90)
+    unpunctuated_atoms = analysis_chunks.split_transcript_atoms(source(unpunctuated_words), max_seconds=90)
+
+    assert [word.text for word in sentence_atoms[0].words] == [
+        "parola-0", "parola-1", "parola-2", "parola-3", "parola-4", "parola-5",
+        "parola-6", "otto.",
+    ]
+    assert [word.text for word in unpunctuated_atoms[0].words] == [
+        "parola-0", "parola-1", "parola-2", "parola-3", "parola-4", "parola-5",
+        "parola-6", "parola-7", "parola-8",
+    ]
+
+
 def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval
@@ -174,11 +228,18 @@ def test_materialize_interventions_rejects_overlapping_speech():
 def test_materialize_merges_shared_source_utterance_across_adjacent_windows():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
 
-    original = _spoken(0, 1300, "assembly:A", "esempio " * 2000, "utterance-1")
+    words = [TranscriptWord(
+        text=f"esempio-{index}.", start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="assembly:A", confidence=.9,
+    ) for index in range(130)]
+    original = TranscriptSegment(
+        start_seconds=0, end_seconds=1300, diarization_label="assembly:A",
+        text=" ".join(word.text for word in words), source_utterance_id="utterance-1", words=words,
+    )
     windows = split_transcript_windows([original])
     analyses = [WindowAnalysis(
         detected_language="it", synopsis_notes=[], speakers=[],
-        interventions=[_draft([index], titolo=f"Parte {index}") for index in range(len(window.segments))],
+        interventions=[_draft(list(range(len(window.segments))), titolo="Parte continuativa")],
     ) for window in windows]
 
     result = materialize_interventions(1300, windows, analyses, {"assembly:A": "Mario Rossi"}, [])
@@ -359,9 +420,20 @@ def test_previous_context_escaping_is_bounded_and_hints_cannot_drop_it():
     from app.analysis import _window_payload
     from app.analysis_chunks import WindowAnalysis, previous_window_context, split_transcript_windows
 
+    words = [TranscriptWord(
+        text='"\\', start_seconds=index * .1, end_seconds=index * .1 + .05,
+        diarization_label="assembly:A", confidence=.9,
+    ) for index in range(5_000)]
+    words.append(TranscriptWord(
+        text="Conclusione della premessa", start_seconds=598, end_seconds=599,
+        diarization_label="assembly:A", confidence=.9,
+    ))
     windows = split_transcript_windows([
-        _spoken(0, 599, "assembly:A", "\"\\\n" * 5000 + "Conclusione della premessa", "u1"),
-        _spoken(600, 610, "assembly:A", "Si conclude lo stesso esempio.", "u2"),
+        TranscriptSegment(
+            start_seconds=0, end_seconds=599, diarization_label="assembly:A",
+            text=" ".join(word.text for word in words), source_utterance_id="u1", words=words,
+        ),
+        _spoken(1200, 1210, "assembly:A", "Si conclude lo stesso esempio.", "u2"),
     ])
     previous = windows[-2]
     analysis = WindowAnalysis(detected_language="it", synopsis_notes=[], speakers=[],
@@ -427,73 +499,81 @@ def test_segment_crossing_a_time_boundary_is_kept_once():
     from app.analysis_chunks import split_transcript_windows
 
     segments = [
-        TranscriptSegment(start_seconds=0, end_seconds=590, diarization_label="chunk-0:A", text="first"),
+        TranscriptSegment(
+            start_seconds=0, end_seconds=590, diarization_label="chunk-0:A",
+            text="first continua continua continua continua continua continua",
+            words=[TranscriptWord(
+                text="first" if index == 0 else "continua", start_seconds=index * 80,
+                end_seconds=index * 80 + 80, diarization_label="chunk-0:A", confidence=.9,
+            ) for index in range(7)],
+        ),
         TranscriptSegment(start_seconds=590, end_seconds=610, diarization_label="chunk-0:B", text="boundary"),
         TranscriptSegment(start_seconds=610, end_seconds=620, diarization_label="chunk-1:A", text="last"),
     ]
 
     windows = split_transcript_windows(segments)
 
-    assert [segment for window in windows for segment in window.segments] == segments
+    assert [word.text for window in windows for segment in window.segments for word in segment.words] == [
+        "first", "continua", "continua", "continua", "continua", "continua", "continua",
+    ]
     assert all(window.end_seconds - window.start_seconds <= 600 for window in windows)
 
 
-def test_one_oversized_text_segment_is_split_deterministically_with_original_timing():
-    from app.analysis_chunks import MAX_WINDOW_CHARS, split_transcript_windows
+def test_oversized_text_without_word_evidence_fails_closed():
+    from app.analysis_chunks import split_transcript_windows
 
     segment = TranscriptSegment(
         start_seconds=15, end_seconds=45, diarization_label="chunk-0:A", text="a" * 50_000,
     )
 
-    windows = split_transcript_windows([segment])
-    pieces = [piece for window in windows for piece in window.segments]
-
-    assert len(pieces) > 1
-    assert "".join(piece.text for piece in pieces) == segment.text
-    assert all((piece.start_seconds, piece.end_seconds) == (15, 45) for piece in pieces)
-    assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
+    with pytest.raises(ValueError, match="richiede parole"):
+        split_transcript_windows([segment])
 
 
-def test_split_segments_preserve_source_utterance_id_without_serializing_words():
+def test_word_aligned_segments_preserve_source_utterance_id_and_bounded_payloads():
     from app.analysis_chunks import MAX_WINDOW_CHARS, split_transcript_windows
-    from app.transcription import TranscriptWord
+
+    words = [TranscriptWord(
+        text="contenuto", start_seconds=15 + index * .02, end_seconds=15 + index * .02 + .01,
+        diarization_label="assembly:A", confidence=.97,
+    ) for index in range(1_200)]
 
     segment = TranscriptSegment(
-        start_seconds=15, end_seconds=45, diarization_label="assembly:A", text="a" * 50_000,
-        source_utterance_id="assembly-u000001",
-        words=[TranscriptWord(
-            text="PRIVATE-WORD-EVIDENCE", start_seconds=15, end_seconds=16,
-            diarization_label="assembly:A", confidence=.97,
-        )],
+        start_seconds=15, end_seconds=45, diarization_label="assembly:A",
+        text=" ".join(word.text for word in words), source_utterance_id="assembly-u000001", words=words,
     )
 
     windows = split_transcript_windows([segment])
     pieces = [piece for window in windows for piece in window.segments]
 
     assert all(piece.source_utterance_id == "assembly-u000001" for piece in pieces)
-    assert all("PRIVATE-WORD-EVIDENCE" not in window.to_payload() for window in windows)
+    assert [word.text for piece in pieces for word in piece.words] == [word.text for word in words]
     assert all(len(window.to_payload()) <= MAX_WINDOW_CHARS for window in windows)
 
 
-def test_one_long_provider_utterance_is_split_by_time_without_text_loss():
-    from app.analysis_chunks import MAX_WINDOW_SECONDS, split_transcript_windows
+def test_one_long_provider_utterance_is_split_at_real_word_times():
+    from app.analysis_chunks import ATOM_MAX_SECONDS, MAX_WINDOW_SECONDS, split_transcript_windows
+
+    words = [TranscriptWord(
+        text=f"intervento-{index}.", start_seconds=120 + index * 10,
+        end_seconds=120 + index * 10 + .4, diarization_label="assembly:A", confidence=.9,
+    ) for index in range(181)]
 
     segment = TranscriptSegment(
         start_seconds=120,
         end_seconds=1921,
         diarization_label="assembly:A",
-        text="Intervento continuativo " * 900,
+        text=" ".join(word.text for word in words), words=words,
     )
 
     windows = split_transcript_windows([segment])
     pieces = [piece for window in windows for piece in window.segments]
 
     assert len(pieces) >= 4
-    assert "".join(piece.text for piece in pieces) == segment.text
-    assert pieces[0].start_seconds == segment.start_seconds
-    assert pieces[-1].end_seconds == segment.end_seconds
-    assert all(left.end_seconds == right.start_seconds for left, right in zip(pieces, pieces[1:]))
-    assert all(piece.end_seconds - piece.start_seconds <= MAX_WINDOW_SECONDS for piece in pieces)
+    assert [word.text for piece in pieces for word in piece.words] == [word.text for word in words]
+    assert pieces[0].start_seconds == words[0].start_seconds
+    assert pieces[-1].end_seconds == words[-1].end_seconds
+    assert all(piece.end_seconds - piece.start_seconds <= ATOM_MAX_SECONDS for piece in pieces)
     assert all(window.end_seconds - window.start_seconds <= MAX_WINDOW_SECONDS for window in windows)
 
 

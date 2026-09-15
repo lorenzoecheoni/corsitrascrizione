@@ -200,7 +200,8 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
     for segment in ordered:
         time_pieces = (
             split_transcript_atoms(segment)
-            if (segment.end_seconds - segment.start_seconds > ATOM_MAX_SECONDS
+            if (segment.words
+                or segment.end_seconds - segment.start_seconds > ATOM_MAX_SECONDS
                 or not _fits_window([segment]))
             else [segment]
         )

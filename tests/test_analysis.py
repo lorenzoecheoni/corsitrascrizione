@@ -435,13 +435,15 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
         text="private full transcript", audio_seconds=5760,
         segments=[TranscriptSegment(
             start_seconds=i * 60, end_seconds=(i + 1) * 60,
-            diarization_label=f"chunk-{i // 10}:A", source_utterance_id=f"u{i}",
-            text=f"Segmento distinto {i}: pubblicazione Academy.",
-            words=[TranscriptWord(
-                text=f"parola-{i}", start_seconds=i * 60 + 1,
-                end_seconds=(i + 1) * 60 - 1,
-                diarization_label=f"chunk-{i // 10}:A", confidence=.9,
-            )],
+                diarization_label=f"chunk-{i // 10}:A", source_utterance_id=f"u{i}",
+                text=f"Segmento distinto {i}: pubblicazione Academy.",
+                words=[TranscriptWord(
+                    text=word, start_seconds=i * 60 + 1 + word_index,
+                    end_seconds=i * 60 + 1.4 + word_index,
+                    diarization_label=f"chunk-{i // 10}:A", confidence=.9,
+                ) for word_index, word in enumerate(
+                    f"Segmento distinto {i}: pubblicazione Academy.".split()
+                )],
         )
                   for i in range(96)],
     )
@@ -568,7 +570,7 @@ def test_long_provider_segment_is_split_before_remote_analysis(inputs, content, 
 def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, content):
     inputs["transcription"].segments[0].source_utterance_id = "assembly-u000001"
     inputs["transcription"].segments[0].words = [TranscriptWord(
-        text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+        text="Sono Giulia Bianchi.", start_seconds=0, end_seconds=10,
         diarization_label="chunk-0:A", confidence=.97,
     )]
     client = FakeClient(visual("slide", "camera_change", "uncertain"), window_result(), content)

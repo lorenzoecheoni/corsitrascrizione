@@ -45,7 +45,7 @@ def test_window_payload_has_stable_local_segment_indexes():
     assert [item["segment_index"] for item in payload["segments"]] == [0, 1]
 
 
-def test_window_payload_preserves_source_utterance_id_without_word_evidence():
+def test_window_payload_preserves_source_utterance_id_without_serializing_words():
     from app.analysis_chunks import split_transcript_windows
     from app.transcription import TranscriptWord
 
@@ -53,15 +53,16 @@ def test_window_payload_preserves_source_utterance_id_without_word_evidence():
         start_seconds=0, end_seconds=5, diarization_label="assembly:A", text="uno",
         source_utterance_id="assembly-u000001",
         words=[TranscriptWord(
-            text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+            text="uno", start_seconds=0, end_seconds=1,
             diarization_label="assembly:A", confidence=.97,
         )],
     )
 
     payload = split_transcript_windows([segment])[0].to_payload()
 
-    assert "PRIVATE-WORD-EVIDENCE" not in payload
-    assert json.loads(payload)["segments"][0]["source_utterance_id"] == "assembly-u000001"
+    segment_payload = json.loads(payload)["segments"][0]
+    assert "words" not in segment_payload
+    assert segment_payload["source_utterance_id"] == "assembly-u000001"
 
 
 def test_long_utterance_becomes_word_aligned_atoms_without_duplicates():
@@ -116,6 +117,35 @@ def test_atoms_prefer_a_sentence_end_or_last_complete_word_before_the_cap():
         "parola-0", "parola-1", "parola-2", "parola-3", "parola-4", "parola-5",
         "parola-6", "parola-7", "parola-8",
     ]
+
+
+def test_word_evidence_produces_identical_windows_despite_provider_envelope():
+    from app.analysis_chunks import split_transcript_atoms, split_transcript_windows
+
+    words = [
+        TranscriptWord(text="La", start_seconds=10, end_seconds=10.4,
+                       diarization_label="A", confidence=.9),
+        TranscriptWord(text="governance.", start_seconds=10.5, end_seconds=11.2,
+                       diarization_label="A", confidence=.9),
+    ]
+    short_envelope = TranscriptSegment(
+        start_seconds=0, end_seconds=12, diarization_label="A", text="testo breve del provider",
+        source_utterance_id="assembly-u000001", words=words,
+    )
+    long_envelope = TranscriptSegment(
+        start_seconds=0, end_seconds=180, diarization_label="A", text="testo diverso del provider " * 100,
+        source_utterance_id="assembly-u000001", words=words,
+    )
+
+    short_atoms = split_transcript_atoms(short_envelope)
+    long_atoms = split_transcript_atoms(long_envelope)
+    short_windows = split_transcript_windows([short_envelope])
+    long_windows = split_transcript_windows([long_envelope])
+
+    assert short_atoms == long_atoms
+    assert short_windows == long_windows
+    assert short_windows[0].segments[0].words[0] is words[0]
+    assert short_windows[0].segments[0].words[1] is words[1]
 
 
 def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
@@ -501,20 +531,39 @@ def test_segment_crossing_a_time_boundary_is_kept_once():
     segments = [
         TranscriptSegment(
             start_seconds=0, end_seconds=590, diarization_label="chunk-0:A",
-            text="first continua continua continua continua continua continua",
+            text="first-0 first-1 first-2 first-3 first-4 first-5 first-6",
+            source_utterance_id="first",
             words=[TranscriptWord(
-                text="first" if index == 0 else "continua", start_seconds=index * 80,
+                text=f"first-{index}", start_seconds=index * 80,
                 end_seconds=index * 80 + 80, diarization_label="chunk-0:A", confidence=.9,
             ) for index in range(7)],
         ),
-        TranscriptSegment(start_seconds=590, end_seconds=610, diarization_label="chunk-0:B", text="boundary"),
-        TranscriptSegment(start_seconds=610, end_seconds=620, diarization_label="chunk-1:A", text="last"),
+        TranscriptSegment(
+            start_seconds=590, end_seconds=610, diarization_label="chunk-0:B", text="boundary",
+            source_utterance_id="boundary",
+            words=[TranscriptWord(text="boundary", start_seconds=590, end_seconds=610,
+                                  diarization_label="chunk-0:B", confidence=.9)],
+        ),
+        TranscriptSegment(
+            start_seconds=610, end_seconds=620, diarization_label="chunk-1:A", text="last",
+            source_utterance_id="last",
+            words=[TranscriptWord(text="last", start_seconds=610, end_seconds=620,
+                                  diarization_label="chunk-1:A", confidence=.9)],
+        ),
     ]
 
     windows = split_transcript_windows(segments)
+    pieces = [segment for window in windows for segment in window.segments]
 
-    assert [word.text for window in windows for segment in window.segments for word in segment.words] == [
-        "first", "continua", "continua", "continua", "continua", "continua", "continua",
+    assert [word.text for segment in pieces for word in segment.words] == [
+        "first-0", "first-1", "first-2", "first-3", "first-4", "first-5", "first-6",
+        "boundary", "last",
+    ]
+    assert [segment.source_utterance_id for segment in pieces] == [
+        "first", "first", "first", "first", "first", "first", "first", "boundary", "last",
+    ]
+    assert [word for segment in pieces for word in segment.words] == [
+        word for source in segments for word in source.words
     ]
     assert all(window.end_seconds - window.start_seconds <= 600 for window in windows)
 

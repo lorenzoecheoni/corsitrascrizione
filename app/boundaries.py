@@ -241,17 +241,21 @@ def align_intervention_boundaries(
         # generated cut can land outside the actual video. The terminal group
         # must still contain speech before Bunny's end even though its final
         # word may extend into the accepted provider rounding second.
+        word_start_limit = duration_seconds if is_terminal_group else duration
         if (
             speech_start >= speech_end
-            or speech_start >= duration
+            or speech_start >= word_start_limit
             or speech_end > (duration_seconds + 1 if is_terminal_group else duration)
-            or any(word.start_seconds >= duration for word in words[index])
+            or any(word.start_seconds >= word_start_limit for word in words[index])
         ):
             raise ValueError("La partizione contiene tempi vocali non validi")
         # Keep the provider's original words untouched. Only the effective
         # terminal extent is limited to Bunny's authoritative whole-second end.
         if is_terminal_group:
-            extents[index] = (speech_start, min(speech_end, duration))
+            effective_end = min(speech_end, duration)
+            if speech_start >= effective_end:
+                raise ValueError("La partizione contiene tempi vocali non validi")
+            extents[index] = (speech_start, effective_end)
         if (group.slide_hint_seconds is not None
                 and (not math.isfinite(group.slide_hint_seconds)
                      or not 0 <= group.slide_hint_seconds <= duration)):

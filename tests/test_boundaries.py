@@ -294,6 +294,53 @@ def test_bunny_fractional_duration_floors_export_and_terminal_provider_rounding(
     assert has_complete_boundary_evidence(report_for(rounded_up, 5789.9))
 
 
+@pytest.mark.parametrize("duration,word_start,word_end,expected", [
+    (1080.9, 1080.8, 1080.9, 1080),
+    (5789.248, 5789.148, 5789.496, 5789),
+])
+def test_terminal_word_in_bunny_fractional_tail_preserves_raw_evidence(duration, word_start, word_end, expected):
+    terminal_word = TranscriptWord(
+        text="Conclusione.", start_seconds=word_start, end_seconds=word_end,
+        diarization_label="A", confidence=.99,
+    )
+    first_word = TranscriptWord(
+        text="Apertura.", start_seconds=0, end_seconds=.4,
+        diarization_label="A", confidence=.99,
+    )
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=word_end, text="Apertura. Conclusione.",
+        diarization_label="A", source_utterance_id="u1", words=[first_word, terminal_word],
+    )
+    original = replace(group(0, 1), segments=(source,), block_id="b001",
+                       chapter_number=1, chapters_in_block=1)
+    before = source.model_dump()
+
+    result = align_intervention_boundaries(duration, [original], [])
+
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, expected)]
+    assert [(block.start_seconds, block.end_seconds) for block in result.blocks] == [(0, expected)]
+    assert source.model_dump() == before
+    assert source.words[0] is first_word
+    assert source.words[-1] is terminal_word
+    assert (terminal_word.start_seconds, terminal_word.end_seconds) == (word_start, word_end)
+    assert has_complete_boundary_evidence(report_for(result, duration))
+    assert result == align_intervention_boundaries(duration, [original], [])
+
+
+def test_terminal_word_start_outside_raw_bunny_is_rejected_even_with_earlier_speech():
+    source = group(0, 1080).segments[0]
+    outside_word = TranscriptWord(text="Fuori.", start_seconds=1080.95,
+                                  end_seconds=1081.1, diarization_label="A", confidence=.9)
+    source = source.model_copy(update={"words": [*source.words, outside_word], "end_seconds": 1081.1})
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(1080.9, [replace(group(0, 1080), segments=(source,))], [])
+
+
+def test_standalone_terminal_subsecond_group_cannot_collapse_exported_interval():
+    with pytest.raises(ValueError):
+        align_intervention_boundaries(1080.9, [group(0, 1080), group(1080.8, 1080.9)], [])
+
+
 @pytest.mark.parametrize("changes", [
     {"chapter_number": 3}, {"chapters_in_block": 3}, {"block_id": "b002"},
 ])

@@ -110,3 +110,23 @@ def test_titles_summaries_and_key_points_derive_from_constituent_evidence():
 def test_planner_rejects_overlapping_semantic_units_before_merging():
     with pytest.raises(ValueError, match="sovrapposto"):
         plan_semantic_timeline([topic_unit(0, 600), topic_unit(590, 700)], [])
+
+
+def test_planner_rejects_topic_unit_with_fewer_than_three_distinct_points():
+    unit = replace(topic_unit(0, 540), punti_chiave=("Uno", "Uno", "Due"))
+    with pytest.raises(ValueError, match="almeno tre punti chiave distinti"):
+        plan_semantic_timeline([unit], [])
+
+
+def test_invalid_topic_points_cannot_be_hidden_by_merging_with_valid_neighbor():
+    invalid = replace(topic_unit(0, 180), punti_chiave=("Uno", "Uno", "Due"))
+    with pytest.raises(ValueError, match="almeno tre punti chiave distinti"):
+        plan_semantic_timeline([invalid, topic_unit(180, 540)], [])
+
+
+def test_valid_distinct_points_keep_order_after_duplicate_removal():
+    unit = replace(topic_unit(0, 540), punti_chiave=("Uno", "Uno", "Due", "Tre"))
+    plan = plan_semantic_timeline([unit], [])
+    assert plan.groups[0].punti_chiave == ("Uno", "Due", "Tre")
+    result = align_intervention_boundaries(540, plan.groups, [])
+    assert result.interventions[0].punti_chiave == ["Uno", "Due", "Tre"]

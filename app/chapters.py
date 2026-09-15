@@ -111,10 +111,15 @@ def plan_semantic_timeline(groups: Sequence[SemanticIntervention],
 
     Inputs must be word-backed units. Only the audio aligner can create a
     measured pause; an AI-declared pause fails closed in ``_group_words``.
+    Every didactic unit must supply at least three distinct key points; the
+    upstream draft validator should enforce this before regeneration completes.
     Bunny duration is checked by the aligner, which owns final endpoints.
     """
     if not groups:
         return PlannedTimeline(groups=(), blocks=())
+    if any(group.tipo == "intervento" and len(set(group.punti_chiave)) < 3
+           for group in groups):
+        raise ValueError("Un'unità didattica richiede almeno tre punti chiave distinti")
     words = [_group_words(group) for group in groups]
     extents = [_speech_extent(items) for items in words]
     if any(left[1] > right[0] for left, right in zip(extents, extents[1:])):

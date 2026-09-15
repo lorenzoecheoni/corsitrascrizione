@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
@@ -24,15 +25,26 @@ CURATED_MATERIALS = {
     ),
 }
 
-_HTTP_URL = re.compile(r"https?://[^\s|]+", re.IGNORECASE)
+_EXACT_HTTP_URL = re.compile(r"https?://[^\s<>\"'|]+", re.IGNORECASE)
+_EXACT_TITLE = re.compile(r"[^\x00-\x1f<>|]+")
 _SLIDE_TITLE = re.compile(r"^\s*slide(?:\s*[\u00b7:\-–—]\s*|\s+)(?P<person>.+?)\s*$", re.I)
 _SUPPORTED_LOCAL_EXTENSIONS = {".pdf", ".pptx"}
+
+
+@dataclass(frozen=True)
+class MaterialSourceFailure:
+    """Safe, application-authored reason why an inventory cell was rejected."""
+
+    inventory_reference: str
+    reason: Literal["dichiarazione_ambigua", "sorgente_reale_assente"]
+    code: Literal["MATERIALE_NON_RAGGIUNGIBILE"] = "MATERIALE_NON_RAGGIUNGIBILE"
 
 
 @dataclass(frozen=True)
 class AnalysisInventoryContext:
     speaker_hints: tuple[str, ...]
     material_sources: tuple[str, ...]
+    material_failures: tuple[MaterialSourceFailure, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,15 +112,22 @@ def _declared_material(
     source = value.strip()
     if not source:
         return None
-    match = _HTTP_URL.search(source)
-    if match is not None:
-        url = match.group().rstrip(").,")
+    if source.count(" | ") == 1:
+        title, url = source.split(" | ", 1)
+        if (
+            title != title.strip()
+            or not _EXACT_TITLE.fullmatch(title)
+            or not _EXACT_HTTP_URL.fullmatch(url)
+        ):
+            return None
         if not _valid_http_url(url):
             return None
-        title = re.sub(r"[\s|\-]+$", "", source[:match.start()])
-        if not title:
-            title = Path(urlsplit(url).path).name or url
         return RegistryMaterial(canonical_material_title(title), url=url)
+    if _EXACT_HTTP_URL.fullmatch(source):
+        if not _valid_http_url(source):
+            return None
+        title = Path(urlsplit(source).path).name or source
+        return RegistryMaterial(canonical_material_title(title), url=source)
 
     path = Path(source)
     if path.suffix.lower() not in _SUPPORTED_LOCAL_EXTENSIONS:
@@ -122,18 +141,39 @@ def _declared_material(
     return RegistryMaterial(path.stem, file=str(path))
 
 
+def material_declaration_failure_reason(
+    value: str,
+    *,
+    file_exists: Callable[[Path], bool] = Path.is_file,
+) -> Literal["dichiarazione_ambigua", "sorgente_reale_assente"] | None:
+    """Classify a rejected declaration without retaining its untrusted text."""
+    if _declared_material(value, file_exists=file_exists) is not None:
+        return None
+    source = value.strip()
+    if " | " in source or re.search(r"https?://", source, re.I) or "<" in source or ">" in source:
+        return "dichiarazione_ambigua"
+    return "sorgente_reale_assente"
+
+
+def is_curated_material_label(video_id: UUID, value: str) -> bool:
+    """Return whether a bare label names a curated source for this GUID."""
+    candidate = canonical_material_title(value)
+    return any(
+        candidate == entry.split(" | ", 1)[0]
+        for entry in CURATED_MATERIALS.get(video_id, ())
+    )
+
+
 def resolve_material_sources(
     declared_sources: Iterable[str],
     video_id: UUID,
     *,
-    url_reachable: Callable[[str], bool] | None = None,
     file_exists: Callable[[Path], bool] = Path.is_file,
 ) -> list[str]:
-    """Return curated sources first, then explicit reachable declarations.
+    """Return curated sources first, then explicit source candidates.
 
-    Curated URLs have already been verified when entered in the local registry.
-    Callers may inject a fresh reachability policy; when supplied it is applied
-    to every URL and failures are omitted conservatively.
+    This function performs no network I/O and makes no reachability claim.
+    Download policy and promotion to an analyzed material belong to Task 7.
     """
     candidates = (*CURATED_MATERIALS.get(video_id, ()), *declared_sources)
     sources: list[str] = []
@@ -143,12 +183,6 @@ def resolve_material_sources(
         if material is None:
             continue
         if material.url is not None:
-            if url_reachable is not None:
-                try:
-                    if not url_reachable(material.url):
-                        continue
-                except Exception:
-                    continue
             key = ("url", _url_key(material.url))
         else:
             key = ("file", str(Path(material.file or "").resolve(strict=False)))
@@ -161,5 +195,7 @@ def resolve_material_sources(
 
 __all__ = [
     "AnalysisInventoryContext", "CURATED_MATERIALS", "GOVERNANCE_GUID",
-    "RegistryMaterial", "canonical_material_title", "resolve_material_sources",
+    "MaterialSourceFailure", "RegistryMaterial", "canonical_material_title",
+    "is_curated_material_label", "material_declaration_failure_reason",
+    "resolve_material_sources",
 ]

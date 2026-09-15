@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import builtins
 import json
 from uuid import UUID
 
@@ -386,18 +387,68 @@ def test_non_curated_materials_require_an_http_url_or_existing_supported_file(tm
     ]
 
 
-def test_injected_network_reachability_omits_an_unavailable_explicit_url() -> None:
+def test_material_resolution_carries_explicit_candidate_without_network_io(monkeypatch) -> None:
     target_id = UUID("00000000-0000-0000-0000-000000000001")
-    available = "https://materials.example.test/available.pdf"
-    unavailable = "https://materials.example.test/unavailable.pdf"
+    candidate = "https://materials.example.test/download?id=123"
     course = inventory_course(
-        "Corso con materiali", guid=target_id, materiali=[available, unavailable],
+        "Corso con materiali", guid=target_id, materiali=[candidate],
+    )
+    monkeypatch.setattr(
+        httpx.Client, "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Task 6 must not perform material network I/O")
+        ),
     )
 
-    assert material_sources_for_video(
-        [course], target_id, course.titolo,
-        url_reachable=lambda url: url == available,
-    ) == [f"available.pdf | {available}"]
+    assert material_sources_for_video([course], target_id, course.titolo) == [
+        f"download | {candidate}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        '<a href="https://materials.example.test/deck.pdf">Slide</a>',
+        "<b>Slide</b> | https://materials.example.test/deck.pdf",
+        "Apri https://materials.example.test/deck.pdf adesso",
+        "Slide | https://materials.example.test/a.pdf https://materials.example.test/b.pdf",
+        "Slide | https://materials.example.test/deck.pdf | duplicato",
+        "Slide | /tmp/deck.pdf",
+    ],
+)
+def test_material_parser_rejects_html_embedded_text_multiple_urls_and_non_url_pipe(
+    declaration,
+) -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    course = inventory_course(
+        "Corso con dichiarazione ambigua", guid=target_id, materiali=[declaration],
+    )
+
+    assert material_sources_for_video([course], target_id, course.titolo) == []
+
+
+@pytest.mark.parametrize(
+    ("declaration", "expected"),
+    [
+        (
+            "Slide finale | https://materials.example.test/download?ids=a,b,",
+            "Slide finale | https://materials.example.test/download?ids=a,b,",
+        ),
+        (
+            "https://materials.example.test/download?ids=a,b,",
+            "download | https://materials.example.test/download?ids=a,b,",
+        ),
+    ],
+)
+def test_material_parser_preserves_exact_url_bytes_in_exact_declarations(
+    declaration, expected,
+) -> None:
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    course = inventory_course(
+        "Corso con URL esatto", guid=target_id, materiali=[declaration],
+    )
+
+    assert material_sources_for_video([course], target_id, course.titolo) == [expected]
 
 
 def test_malformed_explicit_url_is_omitted_instead_of_breaking_resolution() -> None:
@@ -436,6 +487,32 @@ def test_inventory_context_keeps_speakers_and_resolved_materials_together() -> N
         speaker_hints=("Furio d'Andrea",),
         material_sources=(
             "Slide · Furio D'Andrea | https://materials.example.test/deck.pdf",
+        ),
+        material_failures=(),
+    )
+
+
+def test_inventory_context_material_failures_is_default_compatible() -> None:
+    from app.inventory import AnalysisInventoryContext
+
+    assert AnalysisInventoryContext(speaker_hints=(), material_sources=()).material_failures == ()
+
+
+def test_inventory_context_records_safe_failure_for_unresolved_bare_label() -> None:
+    from app.inventory import MaterialSourceFailure, inventory_context_for_video
+
+    target_id = UUID("00000000-0000-0000-0000-000000000001")
+    course = inventory_course(
+        "Corso con etichetta", guid=target_id, materiali=["Slide Persona"],
+    )
+
+    context = inventory_context_for_video([course], target_id, course.titolo)
+
+    assert context.material_sources == ()
+    assert context.material_failures == (
+        MaterialSourceFailure(
+            inventory_reference="Formazione!2",
+            reason="sorgente_reale_assente",
         ),
     )
 
@@ -517,6 +594,8 @@ def test_authenticated_fetch_uses_one_unambiguous_rich_text_link() -> None:
 
 
 def test_authenticated_fetch_does_not_invent_a_source_for_ambiguous_rich_text_links() -> None:
+    from app.inventory import inventory_context_for_video
+
     def handle(request: httpx.Request):
         return httpx.Response(200, json=_grid_sheet_payload(material_cell={
             "formattedValue": "Slide Persona A e Persona B",
@@ -536,11 +615,43 @@ def test_authenticated_fetch_does_not_invent_a_source_for_ambiguous_rich_text_li
     finally:
         client.close()
 
-    assert courses[0].materiali == ["Slide Persona A e Persona B"]
-    assert material_sources_for_video(
+    assert courses[0].materiali == []
+    context = inventory_context_for_video(
         courses, UUID("00000000-0000-0000-0000-000000000001"),
         "Corso con hyperlink",
-    ) == []
+    )
+    assert context.material_sources == ()
+    assert [failure.reason for failure in context.material_failures] == [
+        "dichiarazione_ambigua",
+    ]
+    assert context.material_failures[0].inventory_reference == "Formazione!C2"
+
+
+def test_authenticated_fetch_rejects_visible_url_when_rich_text_has_multiple_links() -> None:
+    visible = "https://materials.example.test/visible.pdf"
+
+    def handle(request: httpx.Request):
+        return httpx.Response(200, json=_grid_sheet_payload(material_cell={
+            "formattedValue": visible,
+            "hyperlink": "https://materials.example.test/cell.pdf",
+            "textFormatRuns": [{
+                "startIndex": 0,
+                "format": {"link": {"uri": "https://materials.example.test/run.pdf"}},
+            }],
+        }), request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].materiali == []
+    assert courses[0].material_failures[0].reason == "dichiarazione_ambigua"
 
 
 def test_authenticated_fetch_failure_is_static_and_never_falls_back_to_csv() -> None:
@@ -564,6 +675,119 @@ def test_authenticated_fetch_failure_is_static_and_never_falls_back_to_csv() -> 
     assert len(requests) == 1
     assert "sheets.googleapis.com" in requests[0].url.host
     assert "PRIVATE GOOGLE BODY" not in str(caught.value)
+
+
+def _service_account_json() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_key = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return json.dumps({
+        "type": "service_account",
+        "project_id": "test-project",
+        "private_key_id": "test-key-id",
+        "private_key": private_key,
+        "client_email": "inventory-test@test-project.iam.gserviceaccount.com",
+        "client_id": "123456789",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    })
+
+
+def test_service_account_path_constructs_real_credentials_and_requests_transport(monkeypatch) -> None:
+    from google.auth.transport.requests import Request
+    from google.oauth2.service_account import Credentials
+
+    transports = []
+
+    def refresh(credentials, request):
+        transports.append(request)
+        credentials.token = "fresh-production-token"
+
+    monkeypatch.setattr(Credentials, "refresh", refresh)
+
+    def handle(request: httpx.Request):
+        assert request.headers["authorization"] == "Bearer fresh-production-token"
+        return httpx.Response(
+            200,
+            json=_grid_sheet_payload(material_cell={"formattedValue": "Nessun materiale"}),
+            request=request,
+        )
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],),
+        service_account_json=_service_account_json(),
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        courses = client.fetch()
+    finally:
+        client.close()
+
+    assert courses[0].titolo == "Corso con hyperlink"
+    assert len(transports) == 1
+    assert isinstance(transports[0], Request)
+
+
+@pytest.mark.parametrize("exception_name", ["RefreshError", "TransportError"])
+def test_service_account_refresh_errors_become_static_inventory_error(
+    monkeypatch, exception_name,
+) -> None:
+    from google.auth import exceptions as google_exceptions
+    from google.oauth2.service_account import Credentials
+
+    private_message = "PRIVATE GOOGLE AUTH DIAGNOSTIC"
+    error_type = getattr(google_exceptions, exception_name)
+
+    def refresh(_credentials, _request):
+        raise error_type(private_message)
+
+    monkeypatch.setattr(Credentials, "refresh", refresh)
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],),
+        service_account_json=_service_account_json(),
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(AssertionError("Sheets request must not run"))
+        )),
+    )
+    try:
+        with pytest.raises(InventoryError) as caught:
+            client.fetch()
+    finally:
+        client.close()
+
+    assert private_message not in str(caught.value)
+    assert str(caught.value) == "La lettura autenticata del foglio non è configurata correttamente"
+
+
+def test_google_transport_import_failure_becomes_static_inventory_error(monkeypatch) -> None:
+    real_import = builtins.__import__
+
+    def reject_requests_transport(name, *args, **kwargs):
+        if name == "google.auth.transport.requests":
+            raise ImportError("PRIVATE MISSING DEPENDENCY DETAIL")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_requests_transport)
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],),
+        service_account_json=_service_account_json(),
+        http_client=httpx.Client(transport=httpx.MockTransport(
+            lambda request: (_ for _ in ()).throw(AssertionError("Sheets request must not run"))
+        )),
+    )
+    try:
+        with pytest.raises(InventoryError) as caught:
+            client.fetch()
+    finally:
+        client.close()
+
+    assert str(caught.value) == "La lettura autenticata del foglio non è configurata correttamente"
+    assert "PRIVATE" not in str(caught.value)
 
 
 def test_sheet_write_requires_optional_credentials(csv_by_gid):

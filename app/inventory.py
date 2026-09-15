@@ -20,6 +20,9 @@ from pydantic import Field, field_validator
 from app.bunny import BunnyCatalogVideo
 from app.material_registry import (
     AnalysisInventoryContext,
+    MaterialSourceFailure,
+    is_curated_material_label,
+    material_declaration_failure_reason,
     resolve_material_sources,
 )
 from app.models import ReportModel
@@ -71,6 +74,7 @@ class InventoryCourse(ReportModel):
     titolo: str
     relatori_attesi: list[str] = Field(default_factory=list)
     materiali: list[str] = Field(default_factory=list)
+    material_failures: list[MaterialSourceFailure] = Field(default_factory=list)
     link: str | None = None
     colonna_link: str | None = None
     guid_esplicito: UUID | None = None
@@ -139,6 +143,7 @@ def _find_column(headers: list[str], candidates: set[str]) -> int | None:
 
 def _parse_rows(
     tab: InventoryTab, tab_position: int, rows: list[list[str]],
+    *, material_rejections: Sequence[tuple[int, int, str]] = (),
 ) -> list[InventoryCourse]:
     if not rows:
         raise InventoryError("Il foglio inventario non contiene intestazioni valide")
@@ -156,6 +161,12 @@ def _parse_rows(
         if any(token in header for token in ("slide", "material", "dispensa"))
     ]
     courses: list[InventoryCourse] = []
+    failures_by_row: dict[int, list[MaterialSourceFailure]] = {}
+    for sheet_row, column_index, reason in material_rejections:
+        failures_by_row.setdefault(sheet_row, []).append(MaterialSourceFailure(
+            inventory_reference=f"{tab.title}!{_column_letter(column_index)}{sheet_row}",
+            reason=reason,
+        ))
     for row_index, row in enumerate(rows[1:], start=2):
         title = row[title_index].strip() if title_index < len(row) else ""
         if not title:
@@ -181,6 +192,7 @@ def _parse_rows(
             titolo=title,
             relatori_attesi=list(dict.fromkeys(speakers)),
             materiali=list(dict.fromkeys(materials)),
+            material_failures=failures_by_row.get(row_index, []),
             link=link or None,
             colonna_link=_column_letter(link_index) if link_index is not None else None,
             guid_esplicito=UUID(guid_match.group()) if guid_match else None,
@@ -199,30 +211,38 @@ def _cell_text(cell: object) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def _material_cell_text(cell: object) -> str:
+def _material_cell_text(cell: object) -> tuple[str, str | None]:
     """Keep a cell link only when it identifies one unambiguous source."""
     value = _cell_text(cell).strip()
-    if re.search(r"https?://", value, re.I):
-        return value
     if not isinstance(cell, dict):
-        return value
+        return value, None
+    links: set[str] = set()
     hyperlink = cell.get("hyperlink")
     if isinstance(hyperlink, str) and hyperlink.strip():
-        return f"{value} | {hyperlink.strip()}" if value else hyperlink.strip()
-    links = {
-        uri.strip()
-        for run in cell.get("textFormatRuns", [])
-        if isinstance(run, dict)
-        for uri in [run.get("format", {}).get("link", {}).get("uri")]
-        if isinstance(uri, str) and uri.strip()
-    }
-    if len(links) != 1:
-        return value
+        links.add(hyperlink.strip())
+    runs = cell.get("textFormatRuns", [])
+    if isinstance(runs, list):
+        for run in runs:
+            if not isinstance(run, dict):
+                continue
+            formatting = run.get("format")
+            link = formatting.get("link") if isinstance(formatting, dict) else None
+            uri = link.get("uri") if isinstance(link, dict) else None
+            if isinstance(uri, str) and uri.strip():
+                links.add(uri.strip())
+    if len(links) > 1:
+        return "", "dichiarazione_ambigua"
+    if re.search(r"https?://", value, re.I):
+        return value, None
+    if not links:
+        return value, None
     link = next(iter(links))
-    return f"{value} | {link}" if value else link
+    return (f"{value} | {link}" if value else link), None
 
 
-def _rows_from_grid_sheet(sheet: object) -> list[list[str]]:
+def _rows_from_grid_sheet(
+    sheet: object,
+) -> tuple[list[list[str]], list[tuple[int, int, str]]]:
     if not isinstance(sheet, dict):
         raise InventoryError("Google Sheets ha restituito dati inventario non validi")
     cells: dict[tuple[int, int], object] = {}
@@ -251,7 +271,7 @@ def _rows_from_grid_sheet(sheet: object) -> list[list[str]]:
                 cells[(row_index, column_index)] = cell
                 max_column = max(max_column, column_index)
     if max_row < 0 or max_column < 0:
-        return []
+        return [], []
     rows = [
         [_cell_text(cells.get((row, column))) for column in range(max_column + 1)]
         for row in range(max_row + 1)
@@ -260,12 +280,16 @@ def _rows_from_grid_sheet(sheet: object) -> list[list[str]]:
         index for index, header in enumerate(_header(value) for value in rows[0])
         if any(token in header for token in ("slide", "material", "dispensa"))
     ]
+    material_rejections: list[tuple[int, int, str]] = []
     for row_index in range(1, len(rows)):
         for column_index in material_indexes:
-            rows[row_index][column_index] = _material_cell_text(
+            value, rejection = _material_cell_text(
                 cells.get((row_index, column_index))
             )
-    return rows
+            rows[row_index][column_index] = value
+            if rejection is not None:
+                material_rejections.append((row_index + 1, column_index, rejection))
+    return rows, material_rejections
 
 
 class InventoryClient:
@@ -345,7 +369,11 @@ class InventoryClient:
                 sheet = by_gid.get(tab.gid) or by_title.get(tab.title)
                 if sheet is None:
                     raise InventoryError("Google Sheets non contiene tutti i fogli inventario")
-                courses.extend(_parse_rows(tab, position, _rows_from_grid_sheet(sheet)))
+                rows, material_rejections = _rows_from_grid_sheet(sheet)
+                courses.extend(_parse_rows(
+                    tab, position, rows,
+                    material_rejections=material_rejections,
+                ))
             return courses
         except InventoryError:
             raise
@@ -363,9 +391,14 @@ class InventoryClient:
                 "La scrittura sul foglio richiede un service account configurato"
             )
         try:
+            from google.auth.exceptions import RefreshError, TransportError
             from google.auth.transport.requests import Request
             from google.oauth2.service_account import Credentials
-
+        except (ImportError, AttributeError):
+            raise InventoryWriteUnavailable(
+                "La scrittura sul foglio non è configurata correttamente"
+            ) from None
+        try:
             info = json.loads(self._service_account_json)
             credentials = Credentials.from_service_account_info(
                 info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
@@ -374,7 +407,7 @@ class InventoryClient:
             if not credentials.token:
                 raise ValueError
             return credentials.token
-        except (ImportError, TypeError, ValueError, KeyError):
+        except (RefreshError, TransportError, TypeError, ValueError, KeyError):
             raise InventoryWriteUnavailable(
                 "La scrittura sul foglio non è configurata correttamente"
             ) from None
@@ -573,17 +606,16 @@ def _material_cells_for_video(
 def material_sources_for_video(
     courses: Sequence[InventoryCourse], video_id: UUID, title: str,
     *,
-    url_reachable: Callable[[str], bool] | None = None,
     file_exists: Callable[[Path], bool] = Path.is_file,
 ) -> list[str]:
-    """Resolve only real material sources explicitly associated with one video.
+    """Return explicit candidates associated with one video, without fetching.
 
     Materials are evidence from the inventory, so title similarity proposals
-    are deliberately excluded from this lookup.
+    are deliberately excluded. Task 7 alone validates remote reachability and
+    promotes candidates to analyzed materials.
     """
     return resolve_material_sources(
         _material_cells_for_video(courses, video_id, title), video_id,
-        url_reachable=url_reachable,
         file_exists=file_exists,
     )
 
@@ -598,15 +630,39 @@ def raw_material_sources_for_video(
 def inventory_context_for_video(
     courses: Sequence[InventoryCourse], video_id: UUID, title: str,
     *,
-    url_reachable: Callable[[str], bool] | None = None,
     file_exists: Callable[[Path], bool] = Path.is_file,
 ) -> AnalysisInventoryContext:
     """Keep the once-fetched inventory inputs for analysis in one value."""
+    normalized_title = normalize_title(title)
+    material_failures: list[MaterialSourceFailure] = []
+    for course in sorted(courses, key=lambda item: (item.posizione_foglio, item.riga, item.id)):
+        matches = (
+            course.guid_esplicito == video_id
+            if course.guid_esplicito is not None
+            else normalize_title(course.titolo) == normalized_title
+        )
+        if not matches:
+            continue
+        for failure in course.material_failures:
+            if failure not in material_failures:
+                material_failures.append(failure)
+        for source in course.materiali:
+            reason = material_declaration_failure_reason(
+                source, file_exists=file_exists,
+            )
+            if reason is None or is_curated_material_label(video_id, source):
+                continue
+            failure = MaterialSourceFailure(
+                inventory_reference=f"{course.foglio}!{course.riga}",
+                reason=reason,
+            )
+            if failure not in material_failures:
+                material_failures.append(failure)
     return AnalysisInventoryContext(
         speaker_hints=tuple(speaker_hints_for_video(list(courses), video_id, title)),
         material_sources=tuple(material_sources_for_video(
             courses, video_id, title,
-            url_reachable=url_reachable,
             file_exists=file_exists,
         )),
+        material_failures=tuple(material_failures),
     )

@@ -24,7 +24,111 @@ from app.reporting import correct_speaker_name_mentions, render_markdown, render
 
 TARGET_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
 
-from granular_support import governance_report
+from granular_support import UNSAFE_MATERIAL_SOURCES, conflicting_material_report, governance_report
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+def test_all_original_material_identities_are_validated_before_source_deduplication(order):
+    report = conflicting_material_report()
+    report.materials = [report.materials[index] for index in order]
+    before = report.model_dump_json()
+    with pytest.raises(ValueError):
+        build_intermediate_report(report, TARGET_GUID)
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,value", [("pagine", 1), ("titolo", "Deck B"), ("relatore", "Luigi Morra")])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("source", ["https://www.assoholding.it/governance.pptx", "https://WWW.ASSOHOLDING.IT:443/governance.pptx"])
+def test_same_normalized_source_cannot_have_conflicting_metadata(field, value, reverse, source):
+    report = governance_report()
+    report.slides[0].page = 1
+    report.materials.append(report.materials[0].model_copy(update={
+        "url": source, field: value,
+    }))
+    if reverse:
+        report.materials.reverse()
+    with pytest.raises(ValueError):
+        build_intermediate_report(report, TARGET_GUID)
+
+
+def test_equivalent_persisted_materials_deduplicate_deterministically_without_io(monkeypatch):
+    report = governance_report()
+    original = report.materials[0]
+    report.materials = [original, original.model_copy(update={
+        "titolo": "Slide · Furio D'Andrea", "relatore": "Furio D’Andrea",
+        "url": "https://WWW.ASSOHOLDING.IT:443/governance%2Epptx",
+    }), original.model_copy(update={
+        "titolo": "Deck B", "url": "https://www.assoholding.it/B.pdf", "pagine": 4,
+    })]
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Persisted export must use no filesystem or network resolution")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+    results = []
+    for order in permutations(report.materials):
+        variant = report.model_copy(update={"materials": list(order)})
+        before = variant.model_dump_json()
+        result = build_intermediate_report(variant, TARGET_GUID)
+        assert variant.model_dump_json() == before
+        assert [(item.titolo, item.url, item.pagine) for item in result.video[0].materiali] == [
+            ("Deck B", "https://www.assoholding.it/B.pdf", 4),
+            ("Slide · Furio D'Andrea", "https://www.assoholding.it/governance.pptx", 18),
+        ]
+        assert result.video[0].slide[0].materiale == "Slide · Furio D'Andrea"
+        assert result.video[0].slide[0].pagina == 2
+        results.append(result.model_dump_json(by_alias=True))
+    assert len(set(results)) == 1
+
+
+def test_concurrent_exports_of_equivalent_material_records_leave_source_unchanged():
+    from concurrent.futures import ThreadPoolExecutor
+
+    report = governance_report()
+    report.materials.append(report.materials[0].model_copy(update={
+        "url": "https://WWW.ASSOHOLDING.IT:443/governance.pptx", "relatore": "Furio D’Andrea",
+    }))
+    before = report.model_dump_json()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outputs = list(executor.map(
+            lambda _: build_intermediate_report(report, TARGET_GUID).model_dump_json(by_alias=True),
+            range(16),
+        ))
+    assert len(set(outputs)) == 1
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,source", UNSAFE_MATERIAL_SOURCES)
+def test_profile2_revalidates_persisted_material_source_syntax_offline(field, source):
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": None, field: source})
+    before = report.model_dump_json()
+    with pytest.raises(ValueError) as caught:
+        build_intermediate_report(report, TARGET_GUID)
+    assert "PRIVATE_SOURCE_SENTINEL" not in str(caught.value)
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,source,expected", [
+    ("url", "https://www.assoholding.it/wp-content/uploads/deck.pptx", "https://www.assoholding.it/wp-content/uploads/deck.pptx"),
+    ("url", "https://WWW.ASSOHOLDING.IT:443/slides/deck%20Furio.pdf", "https://www.assoholding.it/slides/deck%20Furio.pdf"),
+    ("file", "furio.pptx", "furio.pptx"),
+    ("file", "materials/Governance Furio.pdf", "materials/Governance Furio.pdf"),
+    ("file", "/data/materials/Furio D'Andrea.pptx", "/data/materials/Furio D'Andrea.pptx"),
+])
+def test_profile2_accepts_supported_persisted_material_sources_without_accessing_them(monkeypatch, field, source, expected):
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": None, field: source})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Stored source verification must be syntactic only")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+    monkeypatch.setattr(Path, "is_file", forbidden)
+    result = build_intermediate_report(report, TARGET_GUID)
+    assert getattr(result.video[0].materiali[0], field) == expected
+    assert result.video[0].slide[0].pagina == 2
 
 
 def test_intermediate_json_exposes_blocks_chapters_cost_and_one_public_preview():

@@ -49,3 +49,64 @@ def governance_report():
               "bunny_bandwidth_usd": .012345, "transcription_usd": .234567,
               "analysis_usd": .345678, "basis": "Costi persistiti per richiesta."},
     )
+
+
+def conflicting_material_report():
+    """Reviewer A/B/C case: a repeated source must not rebind a slide title."""
+    report = governance_report()
+    first = report.materials[0]
+    report.materials = [
+        first.model_copy(update={"url": "https://www.assoholding.it/X.pptx"}),
+        first.model_copy(update={"titolo": "Deck B", "url": "https://www.assoholding.it/Y.pptx"}),
+        first.model_copy(update={"url": "https://www.assoholding.it/Y.pptx"}),
+    ]
+    return report
+
+
+# Syntax-only export checks must reject these without resolving any source.
+UNSAFE_MATERIAL_SOURCES = [
+    ("url", ""),
+    ("file", ""),
+    ("url", "PRIVATE_SOURCE_SENTINEL"),
+    ("url", "javascript:PRIVATE_SOURCE_SENTINEL"),
+    ("url", "http://www.assoholding.it/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "ftp://www.assoholding.it/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://user:PRIVATE_SOURCE_SENTINEL@www.assoholding.it/deck.pptx"),
+    ("url", "https://www.assoholding.it/deck.pptx?token=PRIVATE_SOURCE_SENTINEL"),
+    ("url", "https://www.assoholding.it/deck.pptx#PRIVATE_SOURCE_SENTINEL"),
+    ("url", "https://www.assoholding.it/deck.pptx?"),
+    ("url", "https://www.assoholding.it/deck.pptx#"),
+    ("url", "https://[broken/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://localhost/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://127.0.0.1/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://[::1]/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://cdn.internal/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://bad_host.example/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://-bad.example/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www..assoholding.it/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it:bad/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it:444/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it:/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/../PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/%2e%2e/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/%252e%252e/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/a%2fb/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/%5cPRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/%00PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/%ZZPRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it//PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("url", "https://www.assoholding.it/PRIVATE_SOURCE_SENTINEL\ndeck.pptx"),
+    ("file", "PRIVATE_SOURCE_SENTINEL"),
+    ("file", "PRIVATE_SOURCE_SENTINEL.txt"),
+    ("file", "../PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("file", "decks/../PRIVATE_SOURCE_SENTINEL.pdf"),
+    ("file", "decks\\PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("file", "decks/%2e%2e/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("file", "file:///PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("file", "decks/PRIVATE_SOURCE_SENTINEL.pptx?token=secret"),
+    ("file", "/tmp/PRIVATE_SOURCE_SENTINEL.pptx"),
+    ("file", "/private/var/folders/random/PRIVATE_SOURCE_SENTINEL.pdf"),
+    ("file", "/data/bunny-video-random/PRIVATE_SOURCE_SENTINEL.pdf"),
+    ("file", "workspace/PRIVATE_SOURCE_SENTINEL.pdf"),
+    ("file", "material-random/PRIVATE_SOURCE_SENTINEL.pdf"),
+]

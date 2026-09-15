@@ -109,6 +109,84 @@ def parse_material_source(value: str) -> ReportMaterial | None:
     return ReportMaterial(titolo=canonical_material_title(path.stem), file=str(path))
 
 
+def validate_persisted_material(material: ReportMaterial) -> ReportMaterial:
+    """Revalidate archived metadata syntactically, without filesystem or network I/O.
+
+    Source normalization changes only equivalent HTTPS spellings; it never
+    strips credentials/query strings or resolves filesystem paths. A current
+    allowlist cannot establish the historical reachability of an archived deck.
+    """
+    try:
+        if material.pagine is not None and type(material.pagine) is not int:
+            raise ValueError()
+        validated = ReportMaterial.model_validate(material.model_dump())
+        if not validated.titolo.strip():
+            raise ValueError()
+        if validated.url is not None:
+            source = _persisted_https_source(validated.url)
+            return validated.model_copy(update={"url": source})
+        source = _persisted_file_source(validated.file)
+        return validated.model_copy(update={"file": source})
+    except (ValueError, MaterialError):
+        raise ValueError("Metadati del materiale persistito non validi") from None
+
+
+def _persisted_https_source(source: str) -> str:
+    if not source or "?" in source or "#" in source:
+        raise ValueError()
+    parsed = urlsplit(source)
+    host = parsed.hostname or ""
+    hosts = parse_material_allowed_hosts([host])
+    _validate_url(source, hosts)
+    if parsed.netloc.lower() not in {host, f"{host}:443"} or host.rsplit(".", 1)[-1].isdigit():
+        raise ValueError()
+    if not parsed.path.startswith("/") or parsed.path.endswith("/"):
+        raise ValueError()
+    parts = parsed.path[1:].split("/")
+    normalized = []
+    for part in parts:
+        if not part or re.search(r"%(?![0-9a-fA-F]{2})", part):
+            raise ValueError()
+        decoded = unquote(part, errors="strict")
+        if decoded in {".", ".."} or any(
+            not character.isprintable() or character in "/\\%?#<>\"|"
+            for character in decoded
+        ):
+            raise ValueError()
+        # Decode only RFC 3986 unreserved octets. Preserve encoded spaces and
+        # other reserved characters, with stable uppercase percent escapes.
+        normalized.append(re.sub(
+            r"%[0-9a-fA-F]{2}",
+            lambda match: (chr(int(match[0][1:], 16))
+                           if re.fullmatch(r"[A-Za-z0-9._~-]", chr(int(match[0][1:], 16)))
+                           else match[0].upper()),
+            part,
+        ))
+    return urlunsplit(("https", host, "/" + "/".join(normalized), "", ""))
+
+
+def _persisted_file_source(source: str) -> str:
+    if (not source or source != source.strip() or source.startswith("~")
+            or any(not character.isprintable() or character in "\\%?#<>\"|:*" for character in source)):
+        raise ValueError()
+    parts = source.removeprefix("/").split("/")
+    if any(part in {"", ".", ".."} or part != part.strip() for part in parts):
+        raise ValueError()
+    if PurePosixPath(source).suffix.lower() not in {".pdf", ".pptx"}:
+        raise ValueError()
+    # These are application/OS scratch locations, never durable source files.
+    lowered = source.lower()
+    if lowered.startswith(("/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/",
+                           "/private/var/folders/", "/dev/", "/proc/", "/sys/")):
+        raise ValueError()
+    if any(re.fullmatch(
+        r"(?:\.worktrees|\.superpowers|workspaces?|(?:workspace|bunny-video|material|material-match|deck-pages|media|split)-.+)",
+        part, re.IGNORECASE,
+    ) for part in parts[:-1]):
+        raise ValueError()
+    return source
+
+
 def _validate_url(url: str, allowed_hosts: Sequence[str]) -> tuple[str, str]:
     if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url) or "\\" in url:
         raise MaterialError()

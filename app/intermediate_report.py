@@ -8,7 +8,7 @@ from uuid import UUID
 
 from app.academy_registry import registered_slug
 from app.boundaries import has_complete_boundary_evidence
-from app.materials import parse_material_source as parse_declared_material_source
+from app.materials import parse_material_source as parse_declared_material_source, validate_persisted_material
 from app.material_registry import canonical_material_title
 from app.intermediate_models import (
     IntermediateInterventionV11,
@@ -355,8 +355,13 @@ def build_intermediate_report(
     ordered_interventions = sorted(report.interventions, key=lambda item: item.start_seconds)
     ordered_blocks = sorted(report.speech_blocks, key=lambda item: item.start_seconds)
     if report.analysis_profile == 2:
+        persisted_materials = [validate_persisted_material(material) for material in report.materials]
         report = report.model_copy(update={
             "interventions": ordered_interventions, "speech_blocks": ordered_blocks,
+            "materials": sorted(persisted_materials, key=lambda material: (
+                canonical_material_title(material.titolo), material.url or "", material.file or "",
+                material.relatore or "", material.pagine or 0,
+            )),
         })
     block_ids = {block.id: f"v1-b{index:03d}" for index, block in enumerate(ordered_blocks, 1)}
     if len(block_ids) != len(ordered_blocks) or any(not block_id.strip() for block_id in block_ids):
@@ -401,14 +406,9 @@ def build_intermediate_report(
         ambiguous_aliases=reconciliation.ambiguous_aliases,
     )
 
-    material_titles = {}
-    material_by_source = {}
+    canonical_materials = []
     for material in report.materials:
-        key = (material.url, material.file)
         title = corrected(canonical_material_title(material.titolo))
-        if key in material_by_source:
-            material_titles[material.titolo] = material_by_source[key].titolo
-            continue
         material_speakers = rewrite_speaker_references(
             [material.relatore] if material.relatore else [], canonical_by_key,
         )
@@ -419,9 +419,25 @@ def build_intermediate_report(
             "file": material.file,
             "pagine": material.pagine,
         })
-        material_by_source[key] = exported_material
-        material_titles[material.titolo] = title
-        materials.append(exported_material)
+        canonical_materials.append((material.titolo, exported_material))
+
+    # Validate every canonical record before collapsing any duplicate. Otherwise
+    # an A/X, B/Y, A/Y sequence could silently rebind an A slide to source Y.
+    material_titles = {}
+    material_by_source = {}
+    source_by_title = {}
+    for original_title, material in canonical_materials:
+        key = (material.url, material.file)
+        if material.titolo in source_by_title and source_by_title[material.titolo] != key:
+            raise ValueError("Identità dei materiali persistiti incoerente")
+        if key in material_by_source and material_by_source[key] != material:
+            raise ValueError("Metadati dei materiali persistiti incoerenti")
+        source_by_title[material.titolo] = key
+        material_by_source[key] = material
+        material_titles[original_title] = material.titolo
+    materials.extend(sorted(material_by_source.values(), key=lambda material: (
+        material.titolo, material.url or "", material.file or "",
+    )))
 
     intermediate_speakers: list[IntermediateSpeakerV11] = []
     for speaker in speakers:

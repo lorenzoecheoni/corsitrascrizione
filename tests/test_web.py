@@ -33,7 +33,51 @@ OTHER_VIDEO_ID = "00000000-0000-0000-0000-000000000002"
 VIDEO_TITLE = "Corso di prova"
 OTHER_VIDEO_TITLE = "Secondo corso"
 
-from granular_support import governance_report
+from granular_support import UNSAFE_MATERIAL_SOURCES, conflicting_material_report, governance_report
+
+
+def test_conflicting_material_record_cannot_rebind_slide_in_any_download(client, monkeypatch, caplog):
+    report = conflicting_material_report()
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    before = store.get(job.id).model_dump_json()
+    client.app.state.inventory = client.app.state.bunny = _ForbiddenProvider()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Conflict validation must not perform network I/O")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    for extension in ("json", "md", "txt"):
+        response = client.get(f"/jobs/{job.id}/report.{extension}")
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Report granulare non valido: rianalisi necessaria"}
+        assert "Deck B" not in response.text and "Y.pptx" not in response.text
+    assert store.get(job.id).model_dump_json() == before
+    assert "Y.pptx" not in caplog.text
+
+
+@pytest.mark.parametrize("field,source", UNSAFE_MATERIAL_SOURCES)
+def test_unsafe_persisted_material_returns_only_static_error_on_every_download(client, monkeypatch, caplog, field, source):
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": None, field: source})
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    before = store.get(job.id).model_dump_json()
+    client.app.state.inventory = client.app.state.bunny = _ForbiddenProvider()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Syntax rejection must precede network I/O")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    for extension in ("json", "md", "txt"):
+        response = client.get(f"/jobs/{job.id}/report.{extension}")
+        assert response.status_code == 409
+        assert response.json() == {"detail": "Report granulare non valido: rianalisi necessaria"}
+        assert "PRIVATE_SOURCE_SENTINEL" not in response.text
+    assert store.get(job.id).model_dump_json() == before
+    assert "PRIVATE_SOURCE_SENTINEL" not in caplog.text
 
 
 def test_profile2_downloads_use_only_saved_data_without_network_or_writes(client, monkeypatch):

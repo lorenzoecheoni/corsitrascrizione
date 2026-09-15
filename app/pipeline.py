@@ -21,7 +21,10 @@ from app.inventory import InventoryError
 from app.logging_config import log_event
 from app.media import FFmpegProcessor, MediaError, MediaProtectedError, SilenceEvidenceError, temporary_workspace
 from app.material_registry import AnalysisInventoryContext, canonical_material_title
-from app.materials import MaterialAnalysis, MaterialError, MaterialInternalError, MaterialProcessor, _validate_url
+from app.materials import (
+    MaterialAnalysis, MaterialError, MaterialInternalError, MaterialProcessor,
+    _validate_url, validate_persisted_material,
+)
 from app.models import AcademyReport, APIUsage, ProviderUsage, ReportMaterial, SlideChange
 from app.transcription import OpenAITranscriber, TranscriptionError
 
@@ -74,12 +77,13 @@ def _verified_material_result(
     for source in context.material_sources:
         if " | " in source:
             title, url = source.split(" | ", 1)
-            candidates[("url", url)] = canonical_material_title(title)
+            candidates.setdefault(("url", url), set()).add(canonical_material_title(title))
         elif source.startswith(("https://", "http://")):
-            candidates[("url", source)] = canonical_material_title(Path(urlsplit(source).path).name or source)
+            candidates.setdefault(("url", source), set()).add(
+                canonical_material_title(Path(urlsplit(source).path).name or source))
         else:
             path = Path(source)
-            candidates[("file", str(path))] = canonical_material_title(path.stem)
+            candidates.setdefault(("file", str(path)), set()).add(canonical_material_title(path.stem))
 
     materials, omitted, failures, all_materials = [], set(), [], []
     # Revalidate models as model_copy/in-place assignment bypasses validators.
@@ -88,7 +92,7 @@ def _verified_material_result(
             raise MaterialInternalError()
         material = ReportMaterial.model_validate(item.model_dump())
         key = ("url", material.url) if material.url is not None else ("file", material.file)
-        if key not in candidates or material.titolo != candidates[key]:
+        if key not in candidates or material.titolo not in candidates[key]:
             raise MaterialInternalError()
         if material.file is not None and Path(material.file).resolve().is_relative_to(workspace.resolve()):
             raise MaterialInternalError()
@@ -100,16 +104,28 @@ def _verified_material_result(
             url = urlsplit(material.url)
             if url.username is not None or url.password is not None:
                 raise MaterialInternalError()
-            all_materials.append(material)
-            if url.query or url.fragment:
-                # Removing sensitive parts would invent a different source.
-                omitted.add(material.titolo)
-                failures.append("MATERIALE_NON_RAGGIUNGIBILE")
-                continue
-        else:
-            all_materials.append(material)
+        all_materials.append(material)
+        try:
+            # Use exactly the offline export grammar before promotion. A
+            # successful fetch cannot establish a different durable source.
+            validate_persisted_material(material)
+        except ValueError:
+            omitted.add(material.titolo)
+            failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+            continue
         materials.append(material)
     counts = Counter(material.titolo for material in all_materials)
+    # Inspect every original verified identity before removing any result.
+    # Choosing a title winner would silently rebind the report's slide links.
+    sources_by_title = {}
+    for material in all_materials:
+        source = (("url", *_validate_url(material.url, allowed_hosts))
+                  if material.url is not None else ("file", material.file))
+        sources_by_title.setdefault(material.titolo, set()).add(source)
+    ambiguous = {title for title, sources in sources_by_title.items() if len(sources) > 1}
+    omitted.update(ambiguous)
+    failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in ambiguous)
+    materials = [material for material in materials if material.titolo not in omitted]
     verified = {material.titolo: material for material in all_materials}
     slides = []
     for snapshot, matched in zip(slide_snapshot, analysis.slides, strict=True):

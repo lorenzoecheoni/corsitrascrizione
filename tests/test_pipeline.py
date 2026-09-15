@@ -475,15 +475,18 @@ def test_processor_contract_rejects_even_declared_workspace_files(tmp_path):
 
 
 def test_pipeline_accepts_exact_declared_external_file_and_preserves_source(components, tmp_path):
+    from tempfile import TemporaryDirectory
     from test_materials import write_test_pptx
-    source = write_test_pptx(tmp_path / "declared.pptx", [["Decisioni assembleari"]])
-    material_context(components)
-    components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (str(source),))
-    components.pipeline.material_processor = MaterialProcessor()
-    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
-    assert report.materials == [ReportMaterial(titolo="declared", file=str(source), pagine=1)]
-    assert report.slides[0].material_title == "declared" and report.slides[0].page == 1
-    assert list(tmp_path.iterdir()) == [source]
+    # A persisted local source must be an archive, outside OS scratch roots.
+    with TemporaryDirectory(prefix="durable-archive-", dir=Path.cwd()) as archive:
+        source = write_test_pptx(Path(archive) / "declared.pptx", [["Decisioni assembleari"]])
+        material_context(components)
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (str(source),))
+        components.pipeline.material_processor = MaterialProcessor()
+        report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+        assert report.materials == [ReportMaterial(titolo="declared", file=str(source), pagine=1)]
+        assert report.slides[0].material_title == "declared" and report.slides[0].page == 1
+        assert source.is_file() and list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("error", [CancelledError(), TypeError("PRIVATE-CONTEXT")])

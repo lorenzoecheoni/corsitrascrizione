@@ -3,18 +3,17 @@
 import base64
 from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
-from difflib import SequenceMatcher
 import json
 import math
 import re
 from threading import Event
 from typing import Literal, TypeVar
-import unicodedata
 
 import httpx
 from openai import APIStatusError, APITimeoutError, OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+from app.academy_registry import find_registry_person, person_key
 from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
     MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS, MAX_SLIDE_HINT_CHARS,
@@ -146,33 +145,16 @@ def _valid_time(value: float, duration: float) -> bool:
     return math.isfinite(value) and 0 <= value <= duration
 
 
-def _name_key(value: str) -> str:
-    folded = "".join(
-        character for character in unicodedata.normalize("NFKD", value.lower())
-        if not unicodedata.combining(character)
-    )
-    return " ".join(re.findall(r"[a-z]+", folded))
-
-
 def _canonical_name(value: str, hints: Sequence[str]) -> str:
-    key = _name_key(value)
-    tokens = key.split()
-    if len(tokens) < 2:
-        return value
-    ranked = sorted(
-        (
-            (SequenceMatcher(None, key, _name_key(hint)).ratio(), hint)
-            for hint in hints
-            if len(_name_key(hint).split()) >= 2
-            and _name_key(hint).split()[-1] == tokens[-1]
-        ),
-        reverse=True,
-    )
-    if not ranked or ranked[0][0] < .82:
-        return value
-    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < .08:
-        return value
-    return ranked[0][1]
+    # Identity evidence cannot be repaired by similarity to an inventory name.
+    # The Registry owns the only explicit aliases (including Fulvio/Furio).
+    person = find_registry_person(value)
+    if person is not None:
+        return person.nome
+    key = person_key(value)
+    equivalent = sorted({hint.strip() for hint in hints
+                         if len(key.split()) >= 2 and person_key(hint) == key})
+    return equivalent[0] if equivalent else value
 
 
 def _normalize_window_speakers(data: dict, hints: Sequence[str]) -> None:

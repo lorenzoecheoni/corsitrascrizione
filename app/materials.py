@@ -528,9 +528,15 @@ def _pptx_pages(path: Path) -> tuple[DeckPage, ...]:
                     source_dir = posixpath.dirname(posixpath.dirname(name))
                     resolved = posixpath.normpath(posixpath.join(source_dir, target))
                     relation_type = relation.attrib.get("Type", "").rsplit("/", 1)[-1].lower()
+                    try:
+                        target_scheme = urlsplit(target).scheme
+                    except ValueError:
+                        # Malformed relationship URLs are untrusted deck data;
+                        # keep unrelated parser/programming ValueErrors fatal.
+                        raise MaterialError() from None
                     if (not target or relation.attrib.get("TargetMode", "Internal").lower() != "internal"
                             or relation_type in {"oleobject", "package", "control", "vbaproject", "attachedtemplate"}
-                            or urlsplit(target).scheme or target.startswith(("/", "\\"))
+                            or target_scheme or target.startswith(("/", "\\"))
                             or "\\" in target or resolved == ".." or resolved.startswith("../")):
                         raise MaterialError()
                     if name == "ppt/_rels/presentation.xml.rels":

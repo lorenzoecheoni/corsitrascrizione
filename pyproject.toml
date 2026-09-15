@@ -33,3 +33,6 @@ markers = ["live: richiede credenziali reali e accesso a Bunny/OpenAI"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/app", "/pyproject.toml", "/README.md", "/uv.lock", "/.gitignore"]

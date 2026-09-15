@@ -609,9 +609,9 @@ def test_inventory_hints_canonicalize_spelling_but_provider_letters_stay_generic
         **inputs, speaker_name_hints=["Furio d'Andrea"],
     )
 
-    assert result.speakers[0].display_name == "Furio d'Andrea"
+    assert result.speakers[0].display_name == "Furio D'Andrea"
     assert result.speakers[1].display_name == "Relatore 1"
-    assert result.interventions[0].relatori == ["Furio d'Andrea"]
+    assert result.interventions[0].relatori == ["Furio D'Andrea"]
 
 
 def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):

@@ -315,27 +315,36 @@ class IntermediateVideoV11(_Model):
             ) or intervention.confine_inizio is not None:
                 raise ValueError("pausa e logistica non appartengono a capitoli")
         consumed_bridge_ids: set[str] = set()
+        gaps = []
+        # Edge logistics are factual timeline segments too. When present they
+        # must cover the entire edge gap, just like an interior bridge. Keep
+        # undeclared terminal timing discrepancies available to warning checks.
+        if any(bridge.start_seconds < ordered_blocks[0].start_seconds for bridge in bridge_segments):
+            gaps.append((0, ordered_blocks[0].start_seconds))
         for previous, following in zip(ordered_blocks, ordered_blocks[1:]):
             if following.start_seconds < previous.end_seconds:
                 raise ValueError("i blocchi parlato non possono sovrapporsi")
-            if following.start_seconds == previous.end_seconds:
-                continue
-            covered_until = previous.end_seconds
+            if following.start_seconds > previous.end_seconds:
+                gaps.append((previous.end_seconds, following.start_seconds))
+        if any(bridge.end_seconds > ordered_blocks[-1].end_seconds for bridge in bridge_segments):
+            gaps.append((ordered_blocks[-1].end_seconds, duration))
+        for gap_start, gap_end in gaps:
+            covered_until = gap_start
             for bridge in bridge_segments:
                 if bridge.id in consumed_bridge_ids:
                     continue
-                if bridge.start_seconds < covered_until or bridge.end_seconds > following.start_seconds:
+                if bridge.start_seconds < covered_until or bridge.end_seconds > gap_end:
                     continue
                 if bridge.start_seconds != covered_until:
                     break
                 covered_until = bridge.end_seconds
                 consumed_bridge_ids.add(bridge.id)
-                if covered_until == following.start_seconds:
+                if covered_until == gap_end:
                     break
-            if covered_until != following.start_seconds:
-                raise ValueError("un intervallo tra blocchi richiede pausa o logistica")
+            if covered_until != gap_end:
+                raise ValueError("un intervallo fuori dai blocchi richiede pausa o logistica")
         if consumed_bridge_ids != {bridge.id for bridge in bridge_segments}:
-            raise ValueError("pausa e logistica devono coprire un solo intervallo tra blocchi")
+            raise ValueError("pausa e logistica devono coprire un solo intervallo fuori dai blocchi")
         spoken = [
             intervention for intervention in self.interventi
             if intervention.tipo not in {"pausa", "logistica"}

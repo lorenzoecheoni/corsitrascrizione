@@ -14,7 +14,12 @@ from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
-from app.academy_registry import find_registry_person, parse_speaker_identity
+from app.academy_registry import (
+    REGISTRY_PEOPLE,
+    find_registry_person,
+    parse_speaker_identity,
+    person_key,
+)
 
 
 GOVERNANCE_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
@@ -75,6 +80,13 @@ def canonical_material_title(value: str) -> str:
         return title
     parsed = parse_speaker_identity(match.group("person"))
     person = find_registry_person(parsed.name)
+    if person is None:
+        # A surname-only label is safe only when the Registry has one exact
+        # candidate. This mirrors report reconciliation without fuzzy names.
+        key = person_key(parsed.name)
+        candidates = [candidate for candidate in REGISTRY_PEOPLE
+                      if key and candidate.surname_key == key]
+        person = candidates[0] if len(candidates) == 1 else None
     return f"Slide · {person.nome}" if person is not None else title
 
 

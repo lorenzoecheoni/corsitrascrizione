@@ -191,7 +191,7 @@ def _two_contiguous_blocks_with_extra_pause(pause_start, pause_end):
 
 @pytest.mark.parametrize("pause_start,pause_end", [
     ("0:00:10", "0:00:20"),
-    ("0:16:40", "0:16:41"),
+    ("0:16:39", "0:16:41"),  # overlaps the final speech block
 ])
 def test_v11_rejects_a_pause_not_consumed_by_an_interblock_gap(pause_start, pause_end):
     data = _two_contiguous_blocks_with_extra_pause(pause_start, pause_end)

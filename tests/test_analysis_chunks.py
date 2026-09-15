@@ -148,6 +148,43 @@ def test_word_evidence_produces_identical_windows_despite_provider_envelope():
     assert short_windows[0].segments[0].words[1] is words[1]
 
 
+def test_word_evidence_order_does_not_depend_on_provider_envelope_order():
+    from app.analysis_chunks import split_transcript_windows
+
+    first_word = TranscriptWord(
+        text="Prima.", start_seconds=5, end_seconds=6, diarization_label="B", confidence=.9,
+    )
+    second_word = TranscriptWord(
+        text="Seconda.", start_seconds=10, end_seconds=11, diarization_label="A", confidence=.9,
+    )
+    early_speaker = TranscriptSegment(
+        start_seconds=5, end_seconds=6, diarization_label="B", text="Prima.",
+        source_utterance_id="assembly-u000002", words=[first_word],
+    )
+    narrow_late_speaker = TranscriptSegment(
+        start_seconds=10, end_seconds=11, diarization_label="A", text="Seconda.",
+        source_utterance_id="assembly-u000001", words=[second_word],
+    )
+    broad_late_speaker = narrow_late_speaker.model_copy(update={
+        "start_seconds": 0, "end_seconds": 20, "text": "testo del provider non ordinabile",
+    })
+
+    narrow_windows = split_transcript_windows([narrow_late_speaker, early_speaker])
+    broad_windows = split_transcript_windows([broad_late_speaker, early_speaker])
+
+    assert narrow_windows == broad_windows
+    pieces = [segment for window in broad_windows for segment in window.segments]
+    assert [(piece.start_seconds, piece.end_seconds) for piece in pieces] == [(5, 6), (10, 11)]
+    assert [piece.diarization_label for piece in pieces] == ["B", "A"]
+    assert [word for piece in pieces for word in piece.words] == [first_word, second_word]
+    assert pieces[0].words[0] is first_word
+    assert pieces[1].words[0] is second_word
+    assert all(
+        window.start_seconds <= word.start_seconds <= word.end_seconds <= window.end_seconds
+        for window in broad_windows for segment in window.segments for word in segment.words
+    )
+
+
 def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval

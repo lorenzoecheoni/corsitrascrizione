@@ -193,11 +193,11 @@ def split_transcript_atoms(
 
 def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[TranscriptWindow]:
     """Return chronological payload-sized windows without retaining transcript data."""
-    ordered = sorted(segments, key=lambda segment: (segment.start_seconds, segment.end_seconds))
     windows: list[TranscriptWindow] = []
     current: list[TranscriptSegment] = []
+    normalized: list[tuple[float, float, int, int, TranscriptSegment]] = []
 
-    for segment in ordered:
+    for source_index, segment in enumerate(segments):
         time_pieces = (
             split_transcript_atoms(segment)
             if (segment.words
@@ -205,17 +205,22 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
                 or not _fits_window([segment]))
             else [segment]
         )
-        for time_piece in time_pieces:
+        for piece_index, time_piece in enumerate(time_pieces):
             if not _fits_window([time_piece]):
                 raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
-            candidate = [*current, time_piece]
-            if current and not _fits_window(candidate):
-                windows.append(_window_for(current))
-                current = [time_piece]
-            else:
-                current = candidate
-            if not _fits_window(current):
-                raise ValueError("Una finestra non puo rispettare i limiti richiesti")
+            normalized.append((
+                time_piece.start_seconds, time_piece.end_seconds, source_index, piece_index, time_piece,
+            ))
+
+    for _, _, _, _, time_piece in sorted(normalized, key=lambda item: item[:4]):
+        candidate = [*current, time_piece]
+        if current and not _fits_window(candidate):
+            windows.append(_window_for(current))
+            current = [time_piece]
+        else:
+            current = candidate
+        if not _fits_window(current):
+            raise ValueError("Una finestra non puo rispettare i limiti richiesti")
 
     if current:
         windows.append(_window_for(current))

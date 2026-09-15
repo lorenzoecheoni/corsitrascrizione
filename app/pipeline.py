@@ -126,60 +126,77 @@ def _verified_material_result(
 
     # Canonicalize with the same report-aware speaker evidence used by export.
     # Context-free surname resolution would invent an identity when the report
-    # documents another person with the same surname.
-    if content is not None:
+    # documents another person with the same surname. Only a real analysis
+    # model carries speaker evidence; anything else skips reconciliation.
+    def reconcile(active: list[tuple[str, ReportMaterial]]):
+        if not isinstance(content, AcademyContent):
+            return None
         speaker_context = content.model_copy(update={
-            "materials": [material for _, material in persistable],
+            "materials": [material for _, material in active],
             "slides": list(analysis.slides),
         })
-        reconciliation = reconcile_speakers_detailed(speaker_context)
-        canonical_names = [speaker.display_name for speaker in reconciliation.speakers]
-        corrected = lambda value: correct_speaker_name_mentions(
-            value,
-            canonical_names,
-            reconciliation.canonical_by_key,
-            ambiguous_aliases=reconciliation.ambiguous_aliases,
+        return reconcile_speakers_detailed(speaker_context)
+
+    # Equivalence is a fixed point: omitting an ambiguous group changes the
+    # speaker evidence the survivors reconcile against, which can create a
+    # collision visible only in a later pass. Repeat on the surviving set
+    # until stable, so the export can never reject what was persisted.
+    active = list(persistable)
+    while True:
+        reconciliation = reconcile(active)
+        canonical_names = ([speaker.display_name for speaker in reconciliation.speakers]
+                           if reconciliation is not None else [])
+
+        def corrected(value: str) -> str:
+            if reconciliation is None:
+                return value
+            return correct_speaker_name_mentions(
+                value, canonical_names, reconciliation.canonical_by_key,
+                ambiguous_aliases=reconciliation.ambiguous_aliases,
+            )
+
+        records = []
+        for original_title, material in active:
+            canonical_title = corrected(canonical_material_title(material.titolo))
+            speakers = ([material.relatore] if material.relatore else [])
+            if reconciliation is not None:
+                speakers = rewrite_speaker_references(speakers, reconciliation.canonical_by_key)
+            source = (material.url, material.file)
+            # The conflict key mirrors what the export compares after its own
+            # canonicalization: title, canonical relatore and page count.
+            metadata = (canonical_title, speakers[0] if speakers else None, material.pagine)
+            records.append((original_title, material, canonical_title, source, metadata))
+
+        sources_by_title: dict[str, set[tuple[str | None, str | None]]] = {}
+        metadata_by_source: dict[tuple[str | None, str | None], set[tuple[str, str | None, int | None]]] = {}
+        for _, _, canonical_title, source, metadata in records:
+            sources_by_title.setdefault(canonical_title, set()).add(source)
+            metadata_by_source.setdefault(source, set()).add(metadata)
+        ambiguous_titles = {title for title, sources in sources_by_title.items() if len(sources) > 1}
+        ambiguous_sources = {source for source, metadata in metadata_by_source.items() if len(metadata) > 1}
+        newly_omitted = {
+            original_title
+            for original_title, _, canonical_title, source, _ in records
+            if canonical_title in ambiguous_titles or source in ambiguous_sources
+        }
+        if not newly_omitted:
+            break
+        omitted_original_titles |= newly_omitted
+        failures.extend(
+            "MATERIALE_NON_RAGGIUNGIBILE"
+            for _ in range(len(ambiguous_titles) + len(ambiguous_sources))
         )
-    else:
-        reconciliation = None
-        corrected = lambda value: value
-
-    records = []
-    for original_title, material in persistable:
-        canonical_title = corrected(canonical_material_title(material.titolo))
-        speakers = ([material.relatore] if material.relatore else [])
-        if reconciliation is not None:
-            speakers = rewrite_speaker_references(speakers, reconciliation.canonical_by_key)
-        canonical = material.model_copy(update={
-            "titolo": canonical_title,
-            "relatore": speakers[0] if speakers else None,
-        })
-        source = (canonical.url, canonical.file)
-        metadata = (canonical.titolo, canonical.relatore, canonical.pagine)
-        records.append((original_title, canonical, source, metadata))
-
-    sources_by_title: dict[str, set[tuple[str | None, str | None]]] = {}
-    metadata_by_source: dict[tuple[str | None, str | None], set[tuple[str, str | None, int | None]]] = {}
-    for _, material, source, metadata in records:
-        sources_by_title.setdefault(material.titolo, set()).add(source)
-        metadata_by_source.setdefault(source, set()).add(metadata)
-    ambiguous_titles = {title for title, sources in sources_by_title.items() if len(sources) > 1}
-    ambiguous_sources = {source for source, metadata in metadata_by_source.items() if len(metadata) > 1}
-    for original_title, material, source, _ in records:
-        if material.titolo in ambiguous_titles or source in ambiguous_sources:
-            omitted_original_titles.add(original_title)
-    failures.extend(
-        "MATERIALE_NON_RAGGIUNGIBILE"
-        for _ in range(len(ambiguous_titles) + len(ambiguous_sources))
-    )
+        active = [entry for entry in active if entry[0] not in omitted_original_titles]
 
     accepted: dict[tuple[tuple[str | None, str | None], tuple[str, str | None, int | None]], ReportMaterial] = {}
     accepted_title_by_original: dict[str, str] = {}
-    for original_title, material, source, metadata in records:
+    for original_title, material, canonical_title, source, metadata in records:
         if original_title in omitted_original_titles:
             continue
-        accepted[(source, metadata)] = material
-        accepted_title_by_original[original_title] = material.titolo
+        # Persist the original relatore: its honorific feeds the exported
+        # speaker role, while the export canonicalizes the display name.
+        accepted[(source, metadata)] = material.model_copy(update={"titolo": canonical_title})
+        accepted_title_by_original[original_title] = canonical_title
     materials = sorted(accepted.values(), key=lambda item: (
         item.titolo, item.url or "", item.file or "", item.relatore or "", item.pagine or 0,
     ))

@@ -457,3 +457,43 @@ def test_surname_only_material_stays_ambiguous_when_report_documents_another_per
     assert payload["video"][0]["materiali"][0]["titolo"] != "Slide · Luigi Morra"
     assert any(check["codice"] == "ALIAS_RELATORE_AMBIGUO"
                for check in payload["verifiche_richieste"])
+
+
+def test_material_reconciliation_iterates_to_a_stable_fixed_point(components, tmp_path, monkeypatch):
+    sources = [
+        f"Slide · Mario Rossi | {HOST}/first.pptx",
+        f"Slide · Mario Rossi | {HOST}/second.pptx",
+        f"Slide · Dottor Rossi | {HOST}/third.pptx",
+        f"Slide · Elena Rossi | {HOST}/fourth.pptx",
+    ]
+    _material_pipeline(components, sources)
+    _document_speaker(components, "Elena Rossi")
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    # Pass one removes the colliding Mario pair; only then does Dottor Rossi
+    # collapse onto Elena Rossi. Without a fixed point the survivors would be
+    # persisted and the offline export would reject them as incoherent.
+    assert report.materials == []
+    assert report.material_failures and set(report.material_failures) == {WARNING}
+    assert report.slides[0].material_title is None and report.slides[0].page is None
+    responses = _saved_exports(report, tmp_path, monkeypatch)
+    assert responses["json"].json()["video"][0]["materiali"] == []
+
+
+def test_persisted_material_honorific_still_feeds_the_exported_speaker_role(
+        components, tmp_path, monkeypatch):
+    _material_pipeline(components, [f"Slide · Dottor Morra | {HOST}/deck.pptx"])
+    _document_speaker(components, "Luigi Morra")
+
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+
+    assert len(report.materials) == 1
+    assert report.materials[0].titolo == "Slide · Luigi Morra"
+    assert report.materials[0].relatore == "Dottor Morra"
+    payload = _saved_exports(report, tmp_path, monkeypatch)["json"].json()
+    material = payload["video"][0]["materiali"][0]
+    assert material["titolo"] == "Slide · Luigi Morra"
+    assert material["relatore"] == "Luigi Morra"
+    speaker = next(person for person in payload["relatori"] if person["nome"] == "Luigi Morra")
+    assert "Dottor" in (speaker["ruolo"] or "")

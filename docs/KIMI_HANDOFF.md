@@ -2,10 +2,10 @@
 
 Aggiornato: 16 settembre 2026.
 
-> **ATTENZIONE — STATO WIP, NON DISTRIBUIRE.** Il branch contiene anche l'ultimo
-> tentativo incompleto successivo al commit verificato `1bf98c5`. Non va unito in
-> `main` né distribuito finché i problemi elencati in “Stato dell'ultimo WIP” non
-> sono stati risolti e revisionati.
+> **STATO: i tre problemi del WIP sono risolti nel commit in testa al branch.**
+> Prima del merge serve una nuova revisione indipendente del commit finale e la
+> suite completa verde; restano vietati force-push, modifiche ai corsi Academy e
+> analisi reali fuori dal GUID Governance.
 
 ## Repository e revisione
 
@@ -33,15 +33,15 @@ Dopo la revisione del commit `1bf98c5`, sono stati riprodotti tre ulteriori dife
 2. Due URL equivalenti (`/deck.pptx` e `/%64eck.pptx`) con metadati in conflitto.
 3. Attribuzione impropria di `Slide · Dottor Morra` a Luigi quando il report documenta Luis Morra.
 
-Le tre riproduzioni dirette passano e il gruppo mirato ha prodotto **788 test superati**, ma la revisione ha trovato ancora questi problemi aperti:
+Le tre riproduzioni dirette passavano e il gruppo mirato aveva prodotto **788 test superati**, ma la revisione aveva trovato tre problemi aperti, **tutti risolti nel commit in testa al branch**:
 
-1. **Riconciliazione a cascata dopo le omissioni.** Se un primo gruppo ambiguo viene eliminato, i materiali rimasti possono diventare nuovamente equivalenti solo al secondo passaggio e rendere JSON/Markdown/TXT non esportabili. Serve un calcolo a punto fisso sul set finale accettato.
-2. **Qualifica del relatore persa.** Canonicalizzando `material.relatore`, prefissi come `Dottor` non devono sparire: la qualifica deve continuare ad alimentare il campo `ruolo` nell'export.
-3. **Copertura del test di sicurezza da ripristinare.** `tests/test_security.py::test_http_failed_job_has_safe_correlated_event[report-temporary_failure]` usa un `SimpleNamespace` privo di `model_copy`; il WIP fallisce troppo presto nella fase materiali e non raggiunge più la falla report che il test deve controllare.
+1. **Riconciliazione a cascata dopo le omissioni — RISOLTO.** `_verified_material_result` ora itera a punto fisso: ricalcola la riconciliazione sul solo insieme superstite e ripete il controllo collisioni finché non emergono nuove ambiguità. L'export vede esattamente l'insieme stabile persistito e non può più rifiutarlo. Riprodotto da `test_material_reconciliation_iterates_to_a_stable_fixed_point`, che fallisce sul WIP e passa con la correzione.
+2. **Qualifica del relatore persa — RISOLTO.** Il materiale persistito conserva il `relatore` originale: l'onorifico (`Dottor`, `Avvocato`…) continua ad alimentare il campo `ruolo` nell'export, che canonicalizza il nome visibile. Coperto da `test_persisted_material_honorific_still_feeds_the_exported_speaker_role`.
+3. **Copertura del test di sicurezza — RISOLTO.** La riconciliazione speaker si attiva solo con un vero `AcademyContent`; il mock `SimpleNamespace` del test attraversa la fase materiali e raggiunge di nuovo la falla report controllata da `test_http_failed_job_has_safe_correlated_event[report-temporary_failure]`.
 
-Ultimo risultato ampio osservato dalla review sul WIP: **1.674 passati, 4 esclusi, 2 falliti**. I due fallimenti sono il noto caso Python 3.13 e il test di sicurezza appena descritto. Questo WIP non è quindi pronto per merge o deploy.
+Risultato ampio dopo la correzione, in ambiente indipendente (Python 3.12): **1.736 passati, 4 esclusi, 0 falliti**. L'unico test escluso resta quello che richiede FFmpeg reale; il noto caso Python 3.13 non si manifesta su 3.12 e resta da ricontrollare sul container.
 
-Per continuare, confrontare il commit WIP in testa al branch con `7e7885af8ef71f20910b28bea12f68ddd22ca215` e partire dai tre punti aperti sopra. Non scartare il lavoro: contiene test completi per le riproduzioni dirette.
+Prima del merge: rieseguire la revisione indipendente sul commit finale e la suite completa. Poi valgono i gate già elencati sotto (deploy Railway, due analisi reali Governance).
 
 ## Risultato implementato
 

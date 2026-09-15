@@ -185,6 +185,59 @@ def test_word_evidence_order_does_not_depend_on_provider_envelope_order():
     )
 
 
+def test_equal_start_atoms_from_one_source_preserve_supplied_word_order():
+    from app.analysis_chunks import split_transcript_windows
+
+    first = TranscriptWord(text="Prima.", start_seconds=0, end_seconds=1.2,
+                           diarization_label="A", confidence=.9)
+    second = TranscriptWord(text="Seconda", start_seconds=0, end_seconds=.8,
+                            diarization_label="A", confidence=.9)
+    third = TranscriptWord(text="Terza.", start_seconds=91, end_seconds=92,
+                           diarization_label="A", confidence=.9)
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=100, diarization_label="A", text="provider text",
+        source_utterance_id="assembly-u000001", words=[first, second, third],
+    )
+
+    pieces = [segment for window in split_transcript_windows([source]) for segment in window.segments]
+
+    assert [piece.source_utterance_id for piece in pieces] == ["assembly-u000001"] * 3
+    assert [word for piece in pieces for word in piece.words] == [first, second, third]
+    assert pieces[0].words[0] is first
+    assert pieces[1].words[0] is second
+    assert pieces[2].words[0] is third
+
+
+def test_equal_start_sources_preserve_input_order_and_window_containment():
+    from app.analysis_chunks import split_transcript_windows
+
+    first = TranscriptWord(text="Prima.", start_seconds=0, end_seconds=2,
+                           diarization_label="A", confidence=.9)
+    second = TranscriptWord(text="Seconda.", start_seconds=0, end_seconds=1,
+                            diarization_label="B", confidence=.9)
+    first_source = TranscriptSegment(
+        start_seconds=0, end_seconds=20, diarization_label="A", text="provider first",
+        source_utterance_id="assembly-u000001", words=[first],
+    )
+    second_source = TranscriptSegment(
+        start_seconds=0, end_seconds=20, diarization_label="B", text="provider second",
+        source_utterance_id="assembly-u000002", words=[second],
+    )
+
+    windows = split_transcript_windows([first_source, second_source])
+    pieces = [segment for window in windows for segment in window.segments]
+
+    assert [piece.source_utterance_id for piece in pieces] == [
+        "assembly-u000001", "assembly-u000002",
+    ]
+    assert pieces[0].words[0] is first
+    assert pieces[1].words[0] is second
+    assert all(
+        window.start_seconds <= word.start_seconds <= word.end_seconds <= window.end_seconds
+        for window in windows for segment in window.segments for word in segment.words
+    )
+
+
 def test_materialize_interventions_aligns_measured_pause_and_covers_entire_duration():
     from app.analysis_chunks import WindowAnalysis, materialize_interventions, split_transcript_windows
     from app.media import SilenceInterval

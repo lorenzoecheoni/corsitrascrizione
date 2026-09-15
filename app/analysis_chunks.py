@@ -212,7 +212,9 @@ def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[Tran
                 time_piece.start_seconds, time_piece.end_seconds, source_index, piece_index, time_piece,
             ))
 
-    for _, _, _, _, time_piece in sorted(normalized, key=lambda item: item[:4]):
+    for _, _, _, _, time_piece in sorted(
+        normalized, key=lambda item: (item[0], item[2], item[3], item[1]),
+    ):
         candidate = [*current, time_piece]
         if current and not _fits_window(candidate):
             windows.append(_window_for(current))

@@ -12,7 +12,6 @@ from fastapi.templating import Jinja2Templates
 from app.academy import AcademyGenerationError
 from app.academy_prompt import CONTRACT_VERSION, PROMPT_VERSION
 from app.auth import SESSION_COOKIE, SESSION_TTL_SECONDS, credentials_are_valid, issue_session
-from app.boundaries import has_complete_boundary_evidence
 from app.bunny import (
     BunnyAuthError,
     BunnyCatalogTooLarge,
@@ -30,7 +29,11 @@ from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report as build_course_intermediate_report, sign_course_selection
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
 from app.intermediate_report import build_intermediate_report
-from app.inventory import InventoryError, material_sources_for_video, organize_catalog, propose_matches
+from app.inventory import (
+    InventoryError,
+    organize_catalog,
+    propose_matches,
+)
 from app.jobs import JobRecord, JobState
 from app.reporting import format_timestamp, render_markdown, render_text
 from app.selection import sign_selection
@@ -141,12 +144,22 @@ def get_course(request: Request, course_id: str):
         raise HTTPException(404, "Corso non trovato") from None
 
 
+def _requires_granular_reanalysis(report) -> bool:
+    if report.analysis_profile != 2:
+        return True
+    try:
+        build_intermediate_report(report, UUID(int=0))
+    except ValueError:
+        return True
+    return False
+
+
 @router.get("/", response_class=HTMLResponse)
 def home(request: Request) -> HTMLResponse:
     saved_reports = request.app.state.store.list_completed()
     boundary_reanalysis_job_ids = {
         job.id for job in saved_reports
-        if job.report is not None and not has_complete_boundary_evidence(job.report)
+        if job.report is not None and _requires_granular_reanalysis(job.report)
     }
     try:
         catalog = request.app.state.bunny.list_videos()
@@ -645,12 +658,15 @@ def create_job(request: Request, confirmation: str = Form("")) -> RedirectRespon
 @router.get("/jobs/{job_id}", response_class=HTMLResponse)
 def job_page(request: Request, job_id: str) -> HTMLResponse:
     job = get_job(request, job_id)
-    report_text = render_text(job.report) if job.state == JobState.COMPLETED and job.report else ""
-    boundary_reanalysis_required = bool(
-        job.state == JobState.COMPLETED
-        and job.report is not None
-        and not has_complete_boundary_evidence(job.report)
-    )
+    report_text = ""
+    boundary_reanalysis_required = False
+    if job.state == JobState.COMPLETED and job.report is not None:
+        boundary_reanalysis_required = job.report.analysis_profile != 2
+        try:
+            report_text = render_text(job.report)
+        except ValueError:
+            report_text = "Report granulare non valido: rianalisi necessaria"
+            boundary_reanalysis_required = True
     return templates.TemplateResponse(request, "job.html", {
         "job": job,
         "report_text": report_text,
@@ -694,7 +710,11 @@ def export_report(request: Request, job_id: str, extension: str) -> Response:
         raise HTTPException(409, "Il report non è ancora disponibile")
     renderer, media_type = ((render_markdown, "text/markdown") if extension == "md"
                             else (render_text, "text/plain"))
-    return Response(renderer(job.report), media_type=media_type,
+    try:
+        body = renderer(job.report)
+    except ValueError:
+        raise HTTPException(409, "Report granulare non valido: rianalisi necessaria") from None
+    return Response(body, media_type=media_type,
                     headers={"Content-Disposition": f'attachment; filename="report-{job.id}.{extension}"'})
 
 
@@ -713,9 +733,9 @@ def json_report(request: Request, job_id: str) -> Response:
     job = get_job(request, job_id)
     if job.state != JobState.COMPLETED or job.report is None:
         raise HTTPException(409, "Il report non è ancora disponibile")
-    if not has_complete_boundary_evidence(job.report):
+    if job.report.analysis_profile != 2:
         raise HTTPException(
-            409, "Rianalisi necessaria per verificare i confini sull’audio",
+            409, "Rianalisi necessaria per il formato granulare",
         )
     settings = request.app.state.settings
     try:
@@ -727,15 +747,9 @@ def json_report(request: Request, job_id: str) -> Response:
     except BunnyUrlError:
         raise HTTPException(409, "Il report non contiene un riferimento Bunny valido") from None
     try:
-        courses = request.app.state.inventory.fetch()
-    except InventoryError:
-        courses = []
-    material_sources = material_sources_for_video(
-        courses, reference.video_id, job.report.bunny_title,
-    )
-    report = build_intermediate_report(
-        job.report, reference.video_id, material_sources=material_sources,
-    )
+        report = build_intermediate_report(job.report, reference.video_id)
+    except ValueError:
+        raise HTTPException(409, "Report granulare non valido: rianalisi necessaria") from None
     return Response(
         report.model_dump_json(indent=2, by_alias=True, exclude_none=True),
         media_type="application/json",

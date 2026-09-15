@@ -7,13 +7,14 @@ transcript text.
 from collections.abc import Sequence
 from dataclasses import replace
 import json
-import math
+import re
 from typing import Annotated, Literal, Mapping
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from app.boundaries import BoundaryAlignment, SemanticIntervention, align_intervention_boundaries
 from app.bunny import BunnyVideoMetadata
+from app.chapters import plan_semantic_timeline
 from app.media import SilenceInterval
 from app.models import (
     Confidence,
@@ -25,12 +26,15 @@ from app.models import (
     SlideChange,
     UnitConfidence,
 )
-from app.transcription import TranscriptionResult, TranscriptSegment
+from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionResult
 
 
 MAX_WINDOW_SECONDS = 600
 MAX_WINDOW_CHARS = 12_000
 MAX_PREVIOUS_CONTEXT_CHARS = 3_000
+MAX_SLIDE_HINT_CHARS = 1_600
+ATOM_MAX_SECONDS = 90
+ATOM_MAX_CHARS = 3_000
 MAX_CONSOLIDATION_CHARS = 30_000
 MAX_VISUAL_CONTEXT_CHARS = 18_000
 MAX_FAST_REPORT_CHARS = 30_000
@@ -94,11 +98,25 @@ class WindowInterventionDraft(ReportModel):
         default_factory=list, max_length=7
     )
     confidenza: UnitConfidence
+    # Local legacy callers retain the fallback; the SDK emits a required field
+    # without a non-null JSON Schema default in the provider's strict schema.
+    confine_motivo: Literal["inizio_blocco", "cambio_tema", "slide_e_tema", "cambio_relatore"] = Field(
+        default_factory=lambda: "cambio_tema"
+    )
+    slide_indizio_seconds: Nonnegative | None = None
 
     @model_validator(mode="after")
-    def validate_key_points(self) -> "WindowInterventionDraft":
+    def validate_key_points(self, info: ValidationInfo) -> "WindowInterventionDraft":
         if self.tipo == "intervento" and not 3 <= len(self.punti_chiave) <= 7:
             raise ValueError("un intervento richiede da 3 a 7 punti_chiave")
+        distinct = {" ".join(point.split()).casefold() for point in self.punti_chiave if point.strip()}
+        if self.tipo == "intervento" and (len(distinct) < 3 or len(distinct) != len(self.punti_chiave)):
+            raise ValueError("un intervento richiede almeno tre punti_chiave distinti e non vuoti")
+        if (self.confine_motivo == "slide_e_tema") != (self.slide_indizio_seconds is not None):
+            raise ValueError("slide_indizio_seconds richiede il motivo slide_e_tema e viceversa")
+        if (self.slide_indizio_seconds is not None and info.context is not None
+                and self.slide_indizio_seconds not in info.context.get("slide_hint_seconds", ())):
+            raise ValueError("slide_indizio_seconds deve appartenere alle slide fornite nella finestra")
         return self
 
 
@@ -142,86 +160,86 @@ def _fits_window(segments: list[TranscriptSegment]) -> bool:
     window = _window_for(segments)
     return (
         window.end_seconds - window.start_seconds <= MAX_WINDOW_SECONDS
-        # Reserve room for the preceding group's context in the same request.
-        and len(window.to_payload()) <= MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS - 32
+        # Reserve room for preceding context and title/time slide hints.
+        and len(window.to_payload()) <= MAX_WINDOW_CHARS - MAX_PREVIOUS_CONTEXT_CHARS - MAX_SLIDE_HINT_CHARS - 32
     )
 
 
-def _split_oversized_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
-    """Split only the text, retaining the source segment's timing and label."""
-    if not segment.text:
-        return [segment] if _fits_window([segment]) else []
-    pieces: list[TranscriptSegment] = []
-    offset = 0
-    while offset < len(segment.text):
-        low, high = 1, len(segment.text) - offset
-        best = 0
-        while low <= high:
-            size = (low + high) // 2
-            piece = segment.model_copy(update={"text": segment.text[offset:offset + size]})
-            if _fits_window([piece]):
-                best = size
-                low = size + 1
-            else:
-                high = size - 1
-        if best == 0:
-            raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
-        pieces.append(segment.model_copy(update={"text": segment.text[offset:offset + best]}))
-        offset += best
-    return pieces
+def _segment_from_words(source: TranscriptSegment, words: Sequence[TranscriptWord]) -> TranscriptSegment:
+    # Ordered word starts do not imply ordered ends when speech overlaps.
+    return source.model_copy(update={
+        "start_seconds": min(word.start_seconds for word in words),
+        "end_seconds": max(word.end_seconds for word in words),
+        "text": " ".join(word.text for word in words),
+        "words": list(words),
+    })
 
 
-def _split_long_segment(segment: TranscriptSegment) -> list[TranscriptSegment]:
-    """Bound a provider utterance in time while preserving its text exactly once."""
-    duration = segment.end_seconds - segment.start_seconds
-    part_count = max(1, math.ceil(duration / MAX_WINDOW_SECONDS))
-    pieces: list[TranscriptSegment] = []
-    for index in range(part_count):
-        text_start = len(segment.text) * index // part_count
-        text_end = len(segment.text) * (index + 1) // part_count
-        start = segment.start_seconds + duration * index / part_count
-        end = (
-            segment.end_seconds
-            if index == part_count - 1
-            else segment.start_seconds + duration * (index + 1) / part_count
-        )
-        pieces.append(segment.model_copy(update={
-            "start_seconds": start,
-            "end_seconds": end,
-            "text": segment.text[text_start:text_end],
-        }))
-    return pieces
+def split_transcript_atoms(
+    segment: TranscriptSegment,
+    *,
+    max_seconds: float = ATOM_MAX_SECONDS,
+    max_chars: int = ATOM_MAX_CHARS,
+) -> list[TranscriptSegment]:
+    """Split a provider utterance only at recorded word boundaries."""
+    if not segment.words:
+        raise ValueError("Un segmento richiede parole per la divisione editoriale")
+    atoms: list[TranscriptSegment] = []
+    start = 0
+    while start < len(segment.words):
+        candidates: list[int] = []
+        chars = 0
+        for index in range(start, len(segment.words)):
+            word = segment.words[index]
+            chars += len(word.text) + (index > start)
+            if (word.end_seconds - segment.words[start].start_seconds > max_seconds
+                    or chars > max_chars):
+                break
+            candidates.append(index)
+        if not candidates:
+            candidates = [start]
+        sentence_ends = [
+            index for index in candidates
+            if re.search(r"[.!?…][\"'’)]*$", segment.words[index].text)
+        ]
+        end = sentence_ends[-1] if sentence_ends else candidates[-1]
+        atoms.append(_segment_from_words(segment, segment.words[start:end + 1]))
+        start = end + 1
+    return atoms
 
 
 def split_transcript_windows(segments: Sequence[TranscriptSegment]) -> list[TranscriptWindow]:
     """Return chronological payload-sized windows without retaining transcript data."""
-    ordered = sorted(segments, key=lambda segment: (segment.start_seconds, segment.end_seconds))
     windows: list[TranscriptWindow] = []
     current: list[TranscriptSegment] = []
+    normalized: list[tuple[float, float, int, int, TranscriptSegment]] = []
 
-    for segment in ordered:
+    for source_index, segment in enumerate(segments):
         time_pieces = (
-            _split_long_segment(segment)
-            if segment.end_seconds - segment.start_seconds > MAX_WINDOW_SECONDS
+            split_transcript_atoms(segment)
+            if (segment.words
+                or segment.end_seconds - segment.start_seconds > ATOM_MAX_SECONDS
+                or not _fits_window([segment]))
             else [segment]
         )
-        for time_piece in time_pieces:
-            pieces = (
-                [time_piece]
-                if _fits_window([time_piece])
-                else _split_oversized_segment(time_piece)
-            )
-            if not pieces:
+        for piece_index, time_piece in enumerate(time_pieces):
+            if not _fits_window([time_piece]):
                 raise ValueError("Un segmento non puo essere serializzato entro il limite della finestra")
-            for piece in pieces:
-                candidate = [*current, piece]
-                if current and not _fits_window(candidate):
-                    windows.append(_window_for(current))
-                    current = [piece]
-                else:
-                    current = candidate
-                if not _fits_window(current):
-                    raise ValueError("Una finestra non puo rispettare i limiti richiesti")
+            normalized.append((
+                time_piece.start_seconds, time_piece.end_seconds, source_index, piece_index, time_piece,
+            ))
+
+    for _, _, _, _, time_piece in sorted(
+        normalized, key=lambda item: (item[0], item[2], item[3], item[1]),
+    ):
+        candidate = [*current, time_piece]
+        if current and not _fits_window(candidate):
+            windows.append(_window_for(current))
+            current = [time_piece]
+        else:
+            current = candidate
+        if not _fits_window(current):
+            raise ValueError("Una finestra non puo rispettare i limiti richiesti")
 
     if current:
         windows.append(_window_for(current))
@@ -280,8 +298,9 @@ def materialize_interventions(
     analyses: Sequence[WindowAnalysis],
     speaker_names: Mapping[str, str],
     silence_intervals: Sequence[SilenceInterval],
+    slides: Sequence[SlideChange] = (),
 ) -> BoundaryAlignment:
-    """Validate AI groupings, join split utterances, then align them to audio."""
+    """Join continuing topic units, plan all blocks/chapters, then align to audio."""
     if len(windows) != len(analyses):
         raise ValueError("La partizione degli interventi non è valida")
 
@@ -315,6 +334,8 @@ def materialize_interventions(
                 punti_chiave=tuple(draft.punti_chiave),
                 confidenza=draft.confidenza,
                 segments=tuple(selected),
+                boundary_reason=draft.confine_motivo,
+                slide_hint_seconds=draft.slide_indizio_seconds,
             )
             previous_sources = (
                 {segment.source_utterance_id for segment in groups[-1].segments
@@ -348,21 +369,21 @@ def materialize_interventions(
                     # confidence verification instead of losing the report.
                     groups.append(replace(current, confidenza=min(.7, current.confidenza)))
                 else:
-                    groups[-1] = SemanticIntervention(
-                        tipo=previous.tipo,
+                    groups[-1] = replace(
+                        previous,
                         relatori=tuple(dict.fromkeys((*previous.relatori, *current.relatori))),
-                        titolo=previous.titolo,
-                        sintesi=previous.sintesi,
-                        punti_chiave=previous.punti_chiave,
-                        confidenza=previous.confidenza,
+                        sintesi=" ".join(dict.fromkeys((previous.sintesi, current.sintesi))),
+                        punti_chiave=tuple(dict.fromkeys((*previous.punti_chiave, *current.punti_chiave)))[:7],
+                        confidenza=min(previous.confidenza, current.confidenza),
                         segments=(*previous.segments, *current.segments),
                     )
             else:
                 groups.append(current)
 
+    plan = plan_semantic_timeline(groups, slides)
     return align_intervention_boundaries(
         duration_seconds=duration_seconds,
-        semantic_groups=groups,
+        semantic_groups=plan.groups,
         silence_intervals=silence_intervals,
     )
 

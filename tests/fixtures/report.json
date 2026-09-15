@@ -3,6 +3,82 @@
   "duration_seconds": 3720,
   "detected_language": "it",
   "synopsis": "Sessione introduttiva sulle funzionalità della piattaforma Academy.",
+  "analysis_profile": 2,
+  "audio_boundary_version": 1,
+  "speech_blocks": [
+    {
+      "id": "b001", "start_seconds": 0, "end_seconds": 3720,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Il ciclo dei contenuti Academy",
+      "sinossi": "Il blocco segue preparazione, revisione, approvazione, pubblicazione e monitoraggio dei contenuti."
+    }
+  ],
+  "interventions": [
+    {
+      "id": "i001", "start_seconds": 0, "end_seconds": 600,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Preparare un contenuto", "sintesi": "Obiettivi, destinatari e struttura della bozza.",
+      "punti_chiave": ["Obiettivi", "Destinatari", "Struttura"], "confidenza": 0.95,
+      "block_id": "b001", "chapter_number": 1, "chapters_in_block": 5,
+      "boundary_origin": {"motivo_editoriale": "inizio_blocco", "regola_audio": "no_pause"}
+    },
+    {
+      "id": "i002", "start_seconds": 600, "end_seconds": 1320,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Revisionare la bozza", "sintesi": "Controlli di chiarezza, completezza e accessibilità della bozza.",
+      "punti_chiave": ["Chiarezza", "Completezza", "Accessibilità"], "confidenza": 0.95,
+      "block_id": "b001", "chapter_number": 2, "chapters_in_block": 5,
+      "boundary_origin": {"motivo_editoriale": "cambio_tema", "regola_audio": "short_pause"}
+    },
+    {
+      "id": "i003", "start_seconds": 1320, "end_seconds": 2040,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Approvare i contenuti", "sintesi": "Ruoli, osservazioni e decisione finale sul contenuto.",
+      "punti_chiave": ["Responsabilità", "Osservazioni", "Approvazione"], "confidenza": 0.95,
+      "block_id": "b001", "chapter_number": 3, "chapters_in_block": 5,
+      "boundary_origin": {"motivo_editoriale": "cambio_tema", "regola_audio": "short_pause"}
+    },
+    {
+      "id": "i004", "start_seconds": 2040, "end_seconds": 2880,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Pubblicare il contenuto", "sintesi": "Pianificazione dell'uscita e verifica della visibilità.",
+      "punti_chiave": ["Calendario", "Visibilità", "Verifica"], "confidenza": 0.95,
+      "block_id": "b001", "chapter_number": 4, "chapters_in_block": 5,
+      "boundary_origin": {"motivo_editoriale": "cambio_tema", "regola_audio": "short_pause"}
+    },
+    {
+      "id": "i005", "start_seconds": 2880, "end_seconds": 3720,
+      "tipo": "intervento", "relatori": ["Marco Rossi"],
+      "titolo": "Monitorare e aggiornare", "sintesi": "Raccolta dei riscontri e manutenzione dei contenuti pubblicati.",
+      "punti_chiave": ["Riscontri", "Indicatori", "Aggiornamenti"], "confidenza": 0.95,
+      "block_id": "b001", "chapter_number": 5, "chapters_in_block": 5,
+      "boundary_origin": {"motivo_editoriale": "cambio_tema", "regola_audio": "short_pause"}
+    }
+  ],
+  "boundaries": [
+    {
+      "previous_intervention_id": "i001", "next_intervention_id": "i002", "boundary_seconds": 600,
+      "words_before": ["la", "bozza", "è", "ora", "pronta"], "words_after": ["vediamo", "come", "revisionare", "il", "contenuto"],
+      "pause_before": false, "pause_after": false, "rule": "short_pause"
+    },
+    {
+      "previous_intervention_id": "i002", "next_intervention_id": "i003", "boundary_seconds": 1320,
+      "words_before": ["la", "revisione", "è", "ora", "conclusa"], "words_after": ["vediamo", "come", "approvare", "il", "contenuto"],
+      "pause_before": false, "pause_after": false, "rule": "short_pause"
+    },
+    {
+      "previous_intervention_id": "i003", "next_intervention_id": "i004", "boundary_seconds": 2040,
+      "words_before": ["il", "contenuto", "è", "stato", "approvato"], "words_after": ["vediamo", "come", "pubblicare", "il", "contenuto"],
+      "pause_before": false, "pause_after": false, "rule": "short_pause"
+    },
+    {
+      "previous_intervention_id": "i004", "next_intervention_id": "i005", "boundary_seconds": 2880,
+      "words_before": ["il", "contenuto", "è", "stato", "pubblicato"], "words_after": ["vediamo", "come", "monitorare", "il", "contenuto"],
+      "pause_before": false, "pause_after": false, "rule": "short_pause"
+    }
+  ],
+  "materials": [],
+  "material_failures": [],
   "speakers": [
     {
       "id": "presentatore",

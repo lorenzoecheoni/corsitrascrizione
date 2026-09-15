@@ -8,13 +8,14 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.116,<1",
-  "google-auth>=2.40,<3",
+  "google-auth[requests]>=2.40,<3",
   "httpx>=0.28,<1",
   "jinja2>=3.1,<4",
   "openai>=1.99,<3",
   "pillow>=11,<13",
   "imagehash>=4.3,<5",
   "pydantic-settings>=2.10,<3",
+  "pypdf>=6,<7",
   "python-multipart>=0.0.20,<1",
   "uvicorn[standard]>=0.35,<1",
 ]
@@ -32,3 +33,6 @@ markers = ["live: richiede credenziali reali e accesso a Bunny/OpenAI"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/app", "/pyproject.toml", "/README.md", "/uv.lock", "/.gitignore"]

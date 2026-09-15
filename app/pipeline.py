@@ -6,18 +6,31 @@ from concurrent.futures import CancelledError, FIRST_EXCEPTION, ThreadPoolExecut
 from pathlib import Path
 from threading import Event
 from time import monotonic
+from urllib.parse import urlsplit
+from collections import Counter
 
 from app.analysis import AnalysisError, OpenAIAnalyzer
 from app.boundaries import has_complete_boundary_evidence
 from app.assemblyai import AssemblyAITranscriber, WordEvidenceError
 from app.bunny import (BunnyAuthError, BunnyClient, BunnyNotFoundError, BunnyUrlError,
-                       BunnyPlaybackError, BunnyReadinessError, parse_bunny_url, read_metadata)
+                       BunnyPlaybackError, BunnyReadinessError, BunnyVideoMetadata, parse_bunny_url, read_metadata)
 from app.config import Settings
 from app.costs import estimate_cost
 from app.jobs import JobCancelled
+from app.inventory import InventoryError
 from app.logging_config import log_event
 from app.media import FFmpegProcessor, MediaError, MediaProtectedError, SilenceEvidenceError, temporary_workspace
-from app.models import AcademyReport, APIUsage, ProviderUsage
+from app.material_registry import AnalysisInventoryContext, canonical_material_title
+from app.materials import (
+    MaterialAnalysis, MaterialError, MaterialInternalError, MaterialProcessor,
+    _validate_url, validate_persisted_material,
+)
+from app.models import AcademyContent, AcademyReport, APIUsage, ProviderUsage, ReportMaterial, SlideChange
+from app.reporting import (
+    correct_speaker_name_mentions,
+    reconcile_speakers_detailed,
+    rewrite_speaker_references,
+)
 from app.transcription import OpenAITranscriber, TranscriptionError
 
 
@@ -60,6 +73,156 @@ class PipelineCancelled(JobCancelled):
     """Cancellation acknowledged after temporary artifacts have been removed."""
 
 
+def _verified_material_result(
+    context: AnalysisInventoryContext, analysis: MaterialAnalysis,
+    slide_snapshot: tuple[str, ...], workspace: Path, allowed_hosts: Sequence[str],
+    content: AcademyContent | None = None,
+) -> MaterialAnalysis:
+    """Validate the internal processor contract before any result is persisted."""
+    candidates = {}
+    for source in context.material_sources:
+        if " | " in source:
+            title, url = source.split(" | ", 1)
+            candidates.setdefault(("url", url), set()).add(canonical_material_title(title))
+        elif source.startswith(("https://", "http://")):
+            candidates.setdefault(("url", source), set()).add(
+                canonical_material_title(Path(urlsplit(source).path).name or source))
+        else:
+            path = Path(source)
+            candidates.setdefault(("file", str(path)), set()).add(canonical_material_title(path.stem))
+
+    failures: list[str] = []
+    original_materials: list[ReportMaterial] = []
+    persistable: list[tuple[str, ReportMaterial]] = []
+    omitted_original_titles: set[str] = set()
+    # Revalidate models as model_copy/in-place assignment bypasses validators.
+    for item in analysis.materials:
+        if item.pagine is not None and type(item.pagine) is not int:
+            raise MaterialInternalError()
+        material = ReportMaterial.model_validate(item.model_dump())
+        key = ("url", material.url) if material.url is not None else ("file", material.file)
+        if key not in candidates or material.titolo not in candidates[key]:
+            raise MaterialInternalError()
+        if material.file is not None and Path(material.file).resolve().is_relative_to(workspace.resolve()):
+            raise MaterialInternalError()
+        if material.url is not None:
+            try:
+                _validate_url(material.url, allowed_hosts)
+            except (MaterialError, ValueError):
+                raise MaterialInternalError() from None
+            url = urlsplit(material.url)
+            if url.username is not None or url.password is not None:
+                raise MaterialInternalError()
+        original_materials.append(material)
+        try:
+            # Use exactly the offline export grammar before promotion. A
+            # successful fetch cannot establish a different durable source.
+            normalized = validate_persisted_material(material)
+        except ValueError:
+            omitted_original_titles.add(material.titolo)
+            failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+            continue
+        persistable.append((material.titolo, normalized))
+
+    # Canonicalize with the same report-aware speaker evidence used by export.
+    # Context-free surname resolution would invent an identity when the report
+    # documents another person with the same surname. Only a real analysis
+    # model carries speaker evidence; anything else skips reconciliation.
+    def reconcile(active: list[tuple[str, ReportMaterial]]):
+        if not isinstance(content, AcademyContent):
+            return None
+        speaker_context = content.model_copy(update={
+            "materials": [material for _, material in active],
+            "slides": list(analysis.slides),
+        })
+        return reconcile_speakers_detailed(speaker_context)
+
+    # Equivalence is a fixed point: omitting an ambiguous group changes the
+    # speaker evidence the survivors reconcile against, which can create a
+    # collision visible only in a later pass. Repeat on the surviving set
+    # until stable, so the export can never reject what was persisted.
+    active = list(persistable)
+    while True:
+        reconciliation = reconcile(active)
+        canonical_names = ([speaker.display_name for speaker in reconciliation.speakers]
+                           if reconciliation is not None else [])
+
+        def corrected(value: str) -> str:
+            if reconciliation is None:
+                return value
+            return correct_speaker_name_mentions(
+                value, canonical_names, reconciliation.canonical_by_key,
+                ambiguous_aliases=reconciliation.ambiguous_aliases,
+            )
+
+        records = []
+        for original_title, material in active:
+            canonical_title = corrected(canonical_material_title(material.titolo))
+            speakers = ([material.relatore] if material.relatore else [])
+            if reconciliation is not None:
+                speakers = rewrite_speaker_references(speakers, reconciliation.canonical_by_key)
+            source = (material.url, material.file)
+            # The conflict key mirrors what the export compares after its own
+            # canonicalization: title, canonical relatore and page count.
+            metadata = (canonical_title, speakers[0] if speakers else None, material.pagine)
+            records.append((original_title, material, canonical_title, source, metadata))
+
+        sources_by_title: dict[str, set[tuple[str | None, str | None]]] = {}
+        metadata_by_source: dict[tuple[str | None, str | None], set[tuple[str, str | None, int | None]]] = {}
+        for _, _, canonical_title, source, metadata in records:
+            sources_by_title.setdefault(canonical_title, set()).add(source)
+            metadata_by_source.setdefault(source, set()).add(metadata)
+        ambiguous_titles = {title for title, sources in sources_by_title.items() if len(sources) > 1}
+        ambiguous_sources = {source for source, metadata in metadata_by_source.items() if len(metadata) > 1}
+        newly_omitted = {
+            original_title
+            for original_title, _, canonical_title, source, _ in records
+            if canonical_title in ambiguous_titles or source in ambiguous_sources
+        }
+        if not newly_omitted:
+            break
+        omitted_original_titles |= newly_omitted
+        failures.extend(
+            "MATERIALE_NON_RAGGIUNGIBILE"
+            for _ in range(len(ambiguous_titles) + len(ambiguous_sources))
+        )
+        active = [entry for entry in active if entry[0] not in omitted_original_titles]
+
+    accepted: dict[tuple[tuple[str | None, str | None], tuple[str, str | None, int | None]], ReportMaterial] = {}
+    accepted_title_by_original: dict[str, str] = {}
+    for original_title, material, canonical_title, source, metadata in records:
+        if original_title in omitted_original_titles:
+            continue
+        # Persist the original relatore: its honorific feeds the exported
+        # speaker role, while the export canonicalizes the display name.
+        accepted[(source, metadata)] = material.model_copy(update={"titolo": canonical_title})
+        accepted_title_by_original[original_title] = canonical_title
+    materials = sorted(accepted.values(), key=lambda item: (
+        item.titolo, item.url or "", item.file or "", item.relatore or "", item.pagine or 0,
+    ))
+
+    counts = Counter(material.titolo for material in original_materials)
+    verified = {material.titolo: material for material in original_materials}
+    slides = []
+    for snapshot, matched in zip(slide_snapshot, analysis.slides, strict=True):
+        title, page = matched.material_title, matched.page
+        if title is None and page is None:
+            pass
+        elif (title not in verified or counts[title] != 1
+              or type(page) is not int or verified[title].pagine is None
+              or not 1 <= page <= verified[title].pagine):
+            raise MaterialInternalError()
+        elif title in omitted_original_titles:
+            title, page = None, None
+        else:
+            title = accepted_title_by_original[title]
+        slides.append(SlideChange.model_validate_json(snapshot).model_copy(update={
+            "material_title": title, "page": page,
+        }))
+    failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in analysis.failures)
+    return MaterialAnalysis(tuple(materials), tuple(slides), tuple(failures))
+
+
 class _LinkedCancellation:
     """Read-only Event view that wakes when either source event is set."""
 
@@ -89,6 +252,8 @@ class AnalysisPipeline:
         transcriber: OpenAITranscriber, analyzer: OpenAIAnalyzer,
         *, fast_transcriber: AssemblyAITranscriber | None = None,
         speaker_hint_provider: Callable[[object], Sequence[str]] | None = None,
+        context_provider: Callable[[BunnyVideoMetadata], AnalysisInventoryContext] | None = None,
+        material_processor: MaterialProcessor | None = None,
         temp_root: Path | None = None,
     ) -> None:
         self.settings = settings
@@ -98,6 +263,8 @@ class AnalysisPipeline:
         self.fast_transcriber = fast_transcriber
         self.analyzer = analyzer
         self.speaker_hint_provider = speaker_hint_provider
+        self.context_provider = context_provider
+        self.material_processor = material_processor
         self.temp_root = temp_root if temp_root is not None else settings.temp_root
 
     def _run_fast_media_and_transcription(
@@ -159,9 +326,9 @@ class AnalysisPipeline:
         phase = "validation"
         started = monotonic()
 
-        def next_phase(value: str) -> None:
+        def next_phase(value: str, *, error_code: str = "ok") -> None:
             nonlocal phase, started
-            log_event(phase, elapsed_seconds=monotonic() - started)
+            log_event(phase, elapsed_seconds=monotonic() - started, error_code=error_code)
             phase, started = value, monotonic()
 
         def check_cancelled() -> None:
@@ -182,10 +349,22 @@ class AnalysisPipeline:
             next_phase("metadata")
             metadata = read_metadata(self.bunny, str(ref.video_id), event)
             progress(5, "Metadati letti")
+            context = AnalysisInventoryContext((), ())
+            material_failures: list[str] = []
             speaker_name_hints: Sequence[str] = ()
-            if self.speaker_hint_provider is not None:
+            if self.context_provider is not None:
+                try:
+                    context = self.context_provider(metadata)
+                except InventoryError:
+                    material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                check_cancelled()
+                speaker_name_hints = context.speaker_hints
+                material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in context.material_failures)
+            elif self.speaker_hint_provider is not None:
                 try:
                     speaker_name_hints = self.speaker_hint_provider(metadata)
+                except CancelledError:
+                    raise
                 except Exception:
                     # Inventory names improve spelling only; the report must
                     # remain available when the optional sheet cannot be read.
@@ -250,14 +429,39 @@ class AnalysisPipeline:
                         media.silence_intervals if media.silence_measured else None
                     ),
                 }
-                if self.speaker_hint_provider is not None:
+                if self.context_provider is not None or self.speaker_hint_provider is not None:
                     analysis_options["speaker_name_hints"] = speaker_name_hints
                 content = analyze(metadata, transcript, media.frame_candidates, **analysis_options)
-                progress(92, "Preparazione del report")
-                next_phase("report")
+                progress(92, "Verifica dei materiali del corso")
+                next_phase("materials")
+                # AI output cannot promote materials or create verified links.
+                # Strings in a tuple form a deep immutable observation snapshot.
+                # The processor receives entirely separate models/nested lists.
+                slide_snapshot = tuple(slide.model_dump_json(exclude={"material_title", "page"})
+                                       for slide in content.slides)
+                slides = [SlideChange.model_validate_json(snapshot) for snapshot in slide_snapshot]
+                material_analysis = MaterialAnalysis((), tuple(slides), ())
+                if self.material_processor is not None:
+                    try:
+                        material_analysis = self.material_processor.process(
+                            context.material_sources, [slide.model_copy(deep=True) for slide in slides], workspace, event,
+                        )
+                    except MaterialError:
+                        material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
+                check_cancelled()
+                material_analysis = _verified_material_result(
+                    context, material_analysis, slide_snapshot, workspace, self.settings.parsed_material_allowed_hosts,
+                    content,
+                )
+                materials = material_analysis.materials
+                material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in material_analysis.failures)
+                slides = material_analysis.slides
+                progress(96, "Preparazione del report")
+                next_phase("report", error_code="MATERIALE_NON_RAGGIUNGIBILE" if material_failures else "ok")
                 usage = APIUsage(transcription=transcript.usage,
                                  responses=getattr(content, "usage", ProviderUsage()))
-                report = AcademyReport(**content.model_dump(exclude={"usage"}), bunny_title=metadata.title,
+                report = AcademyReport(**content.model_dump(exclude={"usage", "materials", "material_failures", "slides"}),
+                    materials=materials, material_failures=material_failures, slides=slides, bunny_title=metadata.title,
                     usage=usage, cost=estimate_cost(
                         metadata.duration_seconds, media.downloaded_bytes, usage=usage,
                         transcription_provider=transcript.provider,

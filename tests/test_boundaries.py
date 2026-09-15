@@ -116,6 +116,31 @@ def test_word_deduplication_applies_only_to_copies_of_the_same_source_utterance(
     assert result.boundaries[0].words_before == ["eco", "eco"]
 
 
+def test_word_aligned_atoms_preserve_each_word_once_for_boundary_evidence():
+    from app.analysis_chunks import split_transcript_atoms
+
+    words = [TranscriptWord(
+        text=f"parola-{index}", start_seconds=index * 10, end_seconds=index * 10 + .4,
+        diarization_label="A", confidence=.9,
+    ) for index in range(12)]
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=111, diarization_label="A",
+        text=" ".join(word.text for word in words), source_utterance_id="assembly-u000001",
+        words=words,
+    )
+    split_group = SemanticIntervention(
+        tipo="intervento", relatori=("Mario Rossi",), titolo="Tema", sintesi="Sintesi",
+        punti_chiave=("Uno", "Due", "Tre"), confidenza=.9,
+        segments=tuple(split_transcript_atoms(source, max_seconds=90)),
+    )
+
+    result = align_intervention_boundaries(140, [split_group, group(120, 139)], [])
+
+    assert result.boundaries[0].words_before == [
+        "parola-7", "parola-8", "parola-9", "parola-10", "parola-11",
+    ]
+
+
 def test_absence_of_words_in_adjacent_second_sets_pause_flags():
     texts = ("uno", "due", "tre", "quattro", "cinque")
     result = align_intervention_boundaries(
@@ -235,3 +260,155 @@ def test_completeness_rejects_words_on_a_generated_pause_side(boundary_index, wo
     setattr(report.boundaries[boundary_index], words_field, ["inventata"] * 5)
 
     assert not has_complete_boundary_evidence(report)
+
+
+@pytest.mark.parametrize("end,start,silences,expected,rule", [
+    (540.2, 543, [SilenceInterval(540.3, 542.9)], 541, "long_pause"),
+    (540.1, 541.5, [SilenceInterval(540.2, 541.4)], 541, "short_pause"),
+    (540.4, 541, [], 540, "no_pause"),
+])
+def test_chapters_in_same_block_share_audio_cut_and_origin_without_pause(end, start, silences, expected, rule):
+    groups = [
+        replace(group(0, end), block_id="b001", chapter_number=1, chapters_in_block=2,
+                boundary_reason="inizio_blocco"),
+        replace(group(start, 1080), block_id="b001", chapter_number=2, chapters_in_block=2,
+                boundary_reason="slide_e_tema", slide_hint_seconds=545),
+    ]
+    result = align_intervention_boundaries(1080, groups, silences)
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, expected), (expected, 1080)]
+    assert len(result.blocks) == 1
+    assert (result.blocks[0].start_seconds, result.blocks[0].end_seconds) == (0, 1080)
+    assert result.interventions[1].boundary_origin.model_dump() == {
+        "motivo_editoriale": "slide_e_tema", "regola_audio": rule, "slide_indizio_seconds": 545,
+    }
+
+
+def test_bunny_fractional_duration_floors_export_and_terminal_provider_rounding():
+    original = group(0, 5789.496)
+    result = align_intervention_boundaries(5789.248, [original], [])
+    assert result.interventions[-1].end_seconds == 5789
+    assert original.segments[-1].words[-1].end_seconds == 5789.496
+    assert has_complete_boundary_evidence(report_for(result, 5789.248))
+    rounded_up = align_intervention_boundaries(5789.9, [group(0, 5789.496)], [])
+    assert rounded_up.interventions[-1].end_seconds == 5789
+    assert has_complete_boundary_evidence(report_for(rounded_up, 5789.9))
+
+
+@pytest.mark.parametrize("duration,word_start,word_end,expected", [
+    (1080.9, 1080.8, 1080.9, 1080),
+    (5789.248, 5789.148, 5789.496, 5789),
+])
+def test_terminal_word_in_bunny_fractional_tail_preserves_raw_evidence(duration, word_start, word_end, expected):
+    terminal_word = TranscriptWord(
+        text="Conclusione.", start_seconds=word_start, end_seconds=word_end,
+        diarization_label="A", confidence=.99,
+    )
+    first_word = TranscriptWord(
+        text="Apertura.", start_seconds=0, end_seconds=.4,
+        diarization_label="A", confidence=.99,
+    )
+    source = TranscriptSegment(
+        start_seconds=0, end_seconds=word_end, text="Apertura. Conclusione.",
+        diarization_label="A", source_utterance_id="u1", words=[first_word, terminal_word],
+    )
+    original = replace(group(0, 1), segments=(source,), block_id="b001",
+                       chapter_number=1, chapters_in_block=1)
+    before = source.model_dump()
+
+    result = align_intervention_boundaries(duration, [original], [])
+
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, expected)]
+    assert [(block.start_seconds, block.end_seconds) for block in result.blocks] == [(0, expected)]
+    assert source.model_dump() == before
+    assert source.words[0] is first_word
+    assert source.words[-1] is terminal_word
+    assert (terminal_word.start_seconds, terminal_word.end_seconds) == (word_start, word_end)
+    assert has_complete_boundary_evidence(report_for(result, duration))
+    assert result == align_intervention_boundaries(duration, [original], [])
+
+
+def test_terminal_word_after_raw_bunny_is_accepted_with_earlier_speech_and_tolerated_skew():
+    source = group(0, 5788).segments[0]
+    terminal_word = TranscriptWord(text="Conclusione.", start_seconds=5789.3,
+                                   end_seconds=5789.496, diarization_label="A", confidence=.9)
+    source = source.model_copy(update={"words": [*source.words, terminal_word], "end_seconds": 5789.496})
+    original = replace(group(0, 5788), segments=(source,), block_id="b001",
+                       chapter_number=1, chapters_in_block=1)
+    before = source.model_dump()
+
+    result = align_intervention_boundaries(5789.248, [original], [])
+
+    assert [(item.start_seconds, item.end_seconds) for item in result.interventions] == [(0, 5789)]
+    assert [(block.start_seconds, block.end_seconds) for block in result.blocks] == [(0, 5789)]
+    assert source.model_dump() == before
+    assert source.words[-1] is terminal_word
+    assert (terminal_word.start_seconds, terminal_word.end_seconds) == (5789.3, 5789.496)
+    assert has_complete_boundary_evidence(report_for(result, 5789.248))
+    assert result == align_intervention_boundaries(5789.248, [original], [])
+
+
+def test_terminal_group_after_fractional_bunny_end_without_earlier_speech_is_rejected():
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(5789.248, [group(0, 5788), group(5789.3, 5789.496)], [])
+
+
+def test_terminal_provider_skew_above_one_second_is_rejected_despite_earlier_speech():
+    source = group(0, 5788).segments[0]
+    terminal_word = TranscriptWord(text="Conclusione.", start_seconds=5789.3,
+                                   end_seconds=5790.3, diarization_label="A", confidence=.9)
+    source = source.model_copy(update={"words": [*source.words, terminal_word], "end_seconds": 5790.3})
+    with pytest.raises(ValueError, match="tempi vocali"):
+        align_intervention_boundaries(5789.248, [replace(group(0, 5788), segments=(source,))], [])
+
+
+def test_standalone_terminal_subsecond_group_cannot_collapse_exported_interval():
+    with pytest.raises(ValueError):
+        align_intervention_boundaries(1080.9, [group(0, 1080), group(1080.8, 1080.9)], [])
+
+
+@pytest.mark.parametrize("changes", [
+    {"chapter_number": 3}, {"chapters_in_block": 3}, {"block_id": "b002"},
+])
+def test_block_alignment_rejects_invalid_child_partition(changes):
+    first = replace(group(0, 540), block_id="b001", chapter_number=1, chapters_in_block=2)
+    second = replace(group(540, 1080), block_id="b001", chapter_number=2, chapters_in_block=2)
+    with pytest.raises(ValueError, match="blocch"):
+        align_intervention_boundaries(1080, [first, replace(second, **changes)], [])
+
+
+def test_completeness_rejects_slide_origin_after_floored_bunny_end():
+    planned = replace(group(0, 539), block_id="b001", chapter_number=1,
+                      chapters_in_block=1, boundary_reason="inizio_blocco")
+    result = align_intervention_boundaries(540.9, [planned], [])
+    report = report_for(result, 540.9)
+    report.analysis_profile = 2
+    report.interventions[0].boundary_origin.slide_indizio_seconds = 540.5
+    assert not has_complete_boundary_evidence(report)
+
+
+@pytest.mark.parametrize("profile,expected", [(1, True), (2, False)])
+@pytest.mark.parametrize("extra", ["slide", "block", "chapter_origin"])
+def test_new_endpoint_checks_preserve_legacy_boundary_eligibility(profile, expected, extra):
+    from app.models import ChapterBoundaryOrigin, SlideChange, SpeechBlock
+
+    report = report_for(align_intervention_boundaries(40, [group(0, 39)], []))
+    report.analysis_profile = profile
+    if extra == "slide":
+        report.slides = [SlideChange(timestamp_seconds=50, title="Storica", confidence="alta")]
+    elif extra == "block":
+        report.speech_blocks = [SpeechBlock(id="b001", start_seconds=0, end_seconds=41,
+                                           tipo="intervento", titolo="Tema", sinossi="Sintesi")]
+    else:
+        report.interventions[0].boundary_origin = ChapterBoundaryOrigin(
+            motivo_editoriale="slide_e_tema", regola_audio="no_pause", slide_indizio_seconds=40.5,
+        )
+    assert has_complete_boundary_evidence(report) is expected
+
+
+def test_short_pause_adds_half_measured_duration_to_last_word():
+    # The detected silence can begin before the provider's last word ends.
+    # Anchor the half-pause rule to that last word, not the detector midpoint.
+    result = align_intervention_boundaries(
+        40, [group(0, 20.4), group(22, 39)], [SilenceInterval(19.1, 21)],
+    )
+    assert result.boundaries[0].boundary_seconds == 21

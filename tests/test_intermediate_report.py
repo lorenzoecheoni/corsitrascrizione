@@ -1,11 +1,10 @@
 import json
+from itertools import permutations
 from pathlib import Path
 import socket
-import threading
-import time
+import tempfile
 from uuid import UUID
 
-import httpx
 import pytest
 
 from app import intermediate_report
@@ -25,6 +24,308 @@ from app.reporting import correct_speaker_name_mentions, render_markdown, render
 
 
 TARGET_GUID = UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+
+from granular_support import UNSAFE_MATERIAL_SOURCES, conflicting_material_report, governance_report
+
+
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+def test_all_original_material_identities_are_validated_before_source_deduplication(order):
+    report = conflicting_material_report()
+    report.materials = [report.materials[index] for index in order]
+    before = report.model_dump_json()
+    with pytest.raises(ValueError):
+        build_intermediate_report(report, TARGET_GUID)
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,value", [("pagine", 1), ("titolo", "Deck B"), ("relatore", "Luigi Morra")])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("source", ["https://www.assoholding.it/governance.pptx", "https://WWW.ASSOHOLDING.IT:443/governance.pptx"])
+def test_same_normalized_source_cannot_have_conflicting_metadata(field, value, reverse, source):
+    report = governance_report()
+    report.slides[0].page = 1
+    report.materials.append(report.materials[0].model_copy(update={
+        "url": source, field: value,
+    }))
+    if reverse:
+        report.materials.reverse()
+    with pytest.raises(ValueError):
+        build_intermediate_report(report, TARGET_GUID)
+
+
+def test_equivalent_persisted_materials_deduplicate_deterministically_without_io(monkeypatch):
+    report = governance_report()
+    original = report.materials[0]
+    report.materials = [original, original.model_copy(update={
+        "titolo": "Slide · Furio D'Andrea", "relatore": "Furio D’Andrea",
+        "url": "https://WWW.ASSOHOLDING.IT:443/governance%2Epptx",
+    }), original.model_copy(update={
+        "titolo": "Deck B", "url": "https://www.assoholding.it/B.pdf", "pagine": 4,
+    })]
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Persisted export must use no filesystem or network resolution")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+    results = []
+    for order in permutations(report.materials):
+        variant = report.model_copy(update={"materials": list(order)})
+        before = variant.model_dump_json()
+        result = build_intermediate_report(variant, TARGET_GUID)
+        assert variant.model_dump_json() == before
+        assert [(item.titolo, item.url, item.pagine) for item in result.video[0].materiali] == [
+            ("Deck B", "https://www.assoholding.it/B.pdf", 4),
+            ("Slide · Furio D'Andrea", "https://www.assoholding.it/governance.pptx", 18),
+        ]
+        assert result.video[0].slide[0].materiale == "Slide · Furio D'Andrea"
+        assert result.video[0].slide[0].pagina == 2
+        results.append(result.model_dump_json(by_alias=True))
+    assert len(set(results)) == 1
+
+
+def test_concurrent_exports_of_equivalent_material_records_leave_source_unchanged():
+    from concurrent.futures import ThreadPoolExecutor
+
+    report = governance_report()
+    report.materials.append(report.materials[0].model_copy(update={
+        "url": "https://WWW.ASSOHOLDING.IT:443/governance.pptx", "relatore": "Furio D’Andrea",
+    }))
+    before = report.model_dump_json()
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outputs = list(executor.map(
+            lambda _: build_intermediate_report(report, TARGET_GUID).model_dump_json(by_alias=True),
+            range(16),
+        ))
+    assert len(set(outputs)) == 1
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,source", UNSAFE_MATERIAL_SOURCES)
+def test_profile2_revalidates_persisted_material_source_syntax_offline(field, source):
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": None, field: source})
+    before = report.model_dump_json()
+    with pytest.raises(ValueError) as caught:
+        build_intermediate_report(report, TARGET_GUID)
+    assert "PRIVATE_SOURCE_SENTINEL" not in str(caught.value)
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("field,source,expected", [
+    ("url", "https://www.assoholding.it/wp-content/uploads/deck.pptx", "https://www.assoholding.it/wp-content/uploads/deck.pptx"),
+    ("url", "https://WWW.ASSOHOLDING.IT:443/slides/deck%20Furio.pdf", "https://www.assoholding.it/slides/deck%20Furio.pdf"),
+    ("file", "furio.pptx", "furio.pptx"),
+    ("file", "materials/Governance Furio.pdf", "materials/Governance Furio.pdf"),
+    ("file", "/data/materials/Furio D'Andrea.pptx", "/data/materials/Furio D'Andrea.pptx"),
+])
+def test_profile2_accepts_supported_persisted_material_sources_without_accessing_them(monkeypatch, field, source, expected):
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": None, field: source})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Stored source verification must be syntactic only")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("socket.getaddrinfo", forbidden)
+    monkeypatch.setattr(Path, "resolve", forbidden)
+    monkeypatch.setattr(Path, "is_file", forbidden)
+    result = build_intermediate_report(report, TARGET_GUID)
+    assert getattr(result.video[0].materiali[0], field) == expected
+    assert result.video[0].slide[0].pagina == 2
+
+
+@pytest.mark.parametrize("directory", [
+    "archive/material-library", "archive/workspace", "archive/media-archive",
+    "archive/workspaces", "archive/.worktrees", "archive/.superpowers",
+    "archive/material-match-guides", "archive/deck-pages-reference", "archive/split-collections",
+    "archive/bunny-video-archive", "archive/material-random", "archive/workspace-a1b2c3d4",
+])
+@pytest.mark.parametrize("root", ["", "/data/"])
+def test_durable_archive_names_are_not_scratch_evidence(monkeypatch, directory, root):
+    report = governance_report()
+    source = f"{root}{directory}/Furio D'Andrea.pptx"
+    report.materials[0] = report.materials[0].model_copy(update={"url": None, "file": source})
+    before = report.model_dump_json()
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Archived material checks must not access filesystem or network")
+    with monkeypatch.context() as offline:
+        offline.setattr("socket.socket.connect", forbidden)
+        offline.setattr("socket.getaddrinfo", forbidden)
+        for method in ("resolve", "is_file", "stat"):
+            offline.setattr(Path, method, forbidden)
+        result = build_intermediate_report(report, TARGET_GUID)
+    assert result.video[0].materiali[0].file == source
+    assert result.video[0].slide[0].pagina == 2
+    assert report.model_dump_json() == before
+
+
+@pytest.mark.parametrize("prefix", ["bunny-video-", "material-", "material-match-", "deck-pages-", "media-", "split-"])
+def test_actual_generated_scratch_names_are_rejected_even_outside_os_scratch_roots(monkeypatch, prefix):
+    # Same tempfile API and prefixes used by app.media/app.materials, not a
+    # handwritten example that might cease to match their generated paths.
+    with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+        scratch_name = Path(directory).name
+    report = governance_report()
+    report.materials[0] = report.materials[0].model_copy(update={
+        "url": None, "file": f"/data/{scratch_name}/PRIVATE_SOURCE_SENTINEL.pptx",
+    })
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Scratch rejection must be syntactic only")
+    with monkeypatch.context() as offline:
+        offline.setattr("socket.socket.connect", forbidden)
+        offline.setattr("socket.getaddrinfo", forbidden)
+        for method in ("resolve", "is_file", "stat"):
+            offline.setattr(Path, method, forbidden)
+        with pytest.raises(ValueError) as caught:
+            build_intermediate_report(report, TARGET_GUID)
+    assert "PRIVATE_SOURCE_SENTINEL" not in str(caught.value)
+
+
+def test_intermediate_json_exposes_blocks_chapters_cost_and_one_public_preview():
+    report = governance_report()
+    before = report.model_dump_json()
+    result = build_intermediate_report(report, TARGET_GUID)
+    video = result.video[0]
+    assert video.durata_secondi == 5789
+    assert [block.id for block in video.blocchi_parlato] == ["v1-b001", "v1-b002"]
+    assert [item.id for item in video.interventi] == [f"v1-i{index:03d}" for index in range(1, 7)]
+    assert [item.blocco for item in video.interventi] == ["v1-b001"] * 3 + ["v1-b002"] * 3
+    assert [item.id for item in video.interventi if item.accesso == "pubblico"] == ["v1-i001"]
+    assert video.interventi[-1].end_seconds == video.blocchi_parlato[-1].end_seconds == 5789
+    assert video.costo_stimato.model_dump() == {
+        "valuta": "USD", "minimo": .123456, "massimo": .789012, "banda_bunny": .012345,
+        "trascrizione": .234567, "analisi": .345678, "criterio": "Costi persistiti per richiesta.",
+    }
+    payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert set(payload) == {"versione", "stato", "corso", "relatori", "video", "verifiche_richieste"}
+    assert payload["video"][0]["interventi"][1]["confine_inizio"] == {
+        "motivo_editoriale": "slide_e_tema", "regola_audio": "short_pause", "slide_indizio": "0:09:59",
+    }
+    assert video.slide[0].materiale == video.materiali[0].titolo == "Slide · Furio D'Andrea"
+    assert video.slide[0].pagina == 2
+    assert video.materiali[0].pagine == 18
+    assert video.materiali[0].relatore == "Furio D'Andrea"
+    assert result.stato == "verificato"
+    checks = result.verifiche_richieste
+    assert {check.codice for check in checks} >= {"INTERVENTO_LUNGO", "SLIDE_NON_ABBINATA", "MATERIALE_NON_RAGGIUNGIBILE", "CONFINE"}
+    boundaries = [check for check in checks if check.codice == "CONFINE"]
+    assert [check.intervento for check in boundaries] == [f"v1-i{index:03d}" for index in range(2, 7)]
+    assert "termina v1-i001" in boundaries[0].messaggio
+    assert "si conclude qui il tema" in boundaries[0].messaggio
+    assert all(check.livello == "avviso" for check in checks)
+    assert result.model_dump_json(by_alias=True) == build_intermediate_report(report, TARGET_GUID).model_dump_json(by_alias=True)
+    assert report.model_dump_json() == before
+
+
+def test_profile2_export_sorts_blocks_chapters_and_boundary_evidence_stably():
+    report = governance_report()
+    expected = build_intermediate_report(report, TARGET_GUID).model_dump_json(by_alias=True)
+    report.speech_blocks.reverse()
+    report.interventions.reverse()
+    report.boundaries.reverse()
+    assert build_intermediate_report(report, TARGET_GUID).model_dump_json(by_alias=True) == expected
+
+
+@pytest.mark.parametrize("missing", ["material_title", "page"])
+def test_profile2_warns_for_either_missing_slide_link_part(missing):
+    report = governance_report()
+    setattr(report.slides[0], missing, None)
+    checks = build_intermediate_report(report, TARGET_GUID).verifiche_richieste
+    assert any(check.codice == "SLIDE_NON_ABBINATA" and check.campo == "slide[0]" for check in checks)
+
+
+@pytest.mark.parametrize("length,expected", [(1200, False), (1201, True)])
+def test_long_intervention_warning_threshold_is_strict(length, expected):
+    video = make_video([make_intervention(0, length, relatori=["Luigi Morra"])])
+    checks = intermediate_report.build_verifications(video, [], [])
+    assert any(check.codice == "INTERVENTO_LUNGO" for check in checks) == expected
+
+
+@pytest.mark.parametrize("kind", ["saluti", "pausa", "logistica"])
+def test_public_preview_skips_nondidactic_segments_and_includes_900_seconds(kind):
+    report = make_report([
+        make_intervention(0, 600, tipo=kind), make_intervention(600, 1500), make_intervention(1500, 2100),
+    ])
+    assert intermediate_report.choose_public_intervention(intermediate_report.normalize_interventions(report)) == "v1-i002"
+
+
+def test_profile2_without_valid_preview_fails_without_inventing_chapters():
+    report = governance_report()
+    for chapter in report.interventions:
+        chapter.tipo = "saluti"
+        chapter.punti_chiave = []
+    with pytest.raises(ValueError, match="pubblico"):
+        build_intermediate_report(report, TARGET_GUID)
+
+
+def test_profile2_cannot_publish_an_oversized_preview_fallback():
+    report = governance_report()
+    chapter = report.interventions[0].model_copy(update={"end_seconds": 5789, "chapters_in_block": 1})
+    report.interventions = [chapter]
+    report.speech_blocks = [report.speech_blocks[0].model_copy(update={"end_seconds": 5789})]
+    report.boundaries = []
+    with pytest.raises(ValueError, match="pubblico"):
+        build_intermediate_report(report, TARGET_GUID)
+
+
+@pytest.mark.parametrize("defect", ["unknown_reference", "empty_id", "missing_origin"])
+def test_profile2_rejects_broken_stored_provenance_before_rewriting_ids(defect):
+    report = governance_report()
+    if defect == "unknown_reference":
+        for chapter in report.interventions[:3]:
+            chapter.block_id = "v1-b001"
+    elif defect == "empty_id":
+        report.speech_blocks[0].id = ""
+        for chapter in report.interventions[:3]:
+            chapter.block_id = ""
+    else:
+        report.interventions[1].boundary_origin = None
+    with pytest.raises(ValueError):
+        build_intermediate_report(report, TARGET_GUID)
+
+
+def test_profile2_ignores_raw_inventory_and_deduplicates_persisted_material_sources(monkeypatch):
+    report = governance_report()
+    report.materials.append(report.materials[0].model_copy())
+    def forbidden(*args):
+        raise AssertionError("Download must not probe materials")
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    result = build_intermediate_report(report, TARGET_GUID,
+        material_sources=["Unverified | https://8.8.8.8/private?token=SECRET"])
+    assert len(result.video[0].materiali) == 1
+    assert "SECRET" not in result.model_dump_json()
+
+
+def test_raw_inventory_material_title_cannot_bypass_ascii_canonicalization():
+    report = make_report([make_intervention(0, 600, relatori=["Furio D’Andrea"])])
+    material = build_intermediate_report(report, TARGET_GUID,
+        material_sources=["Slide · Furio D ’ Andrea | https://example.test/slide.pptx"]).video[0].materiali[0]
+    assert material.titolo == "Slide · Furio D'Andrea"
+
+
+@pytest.mark.parametrize("value", ["Slide · Furio D’Andrea", "missing.pdf", "unrecognized.txt"])
+def test_export_material_parser_rejects_bare_non_sources(value):
+    assert parse_material_source(value) is None
+
+
+def test_profile2_markdown_and_text_render_the_same_persisted_contract():
+    for rendered in (render_markdown(governance_report()), render_text(governance_report())):
+        for text in ("Blocchi parlato", "v1-b001", "v1-i002", "Capitolo 2/3", "slide_e_tema", "short_pause",
+                     "0:09:59", "Slide · Furio D'Andrea", "pagina 2", "INTERVENTO_LUNGO", "CONFINE",
+                     "SLIDE_NON_ABBINATA", "USD", "0.123456", "0.789012", "pubblico", "iscritti"):
+            assert text in rendered
+
+
+@pytest.mark.parametrize("critical", ["speaker", "timing"])
+def test_profile2_only_critical_identity_or_timeline_warnings_require_verification(critical):
+    report = governance_report()
+    if critical == "speaker":
+        report.interventions[0].relatori = []
+    else:
+        report.duration_seconds = 5790
+    result = build_intermediate_report(report, TARGET_GUID)
+    assert result.stato == "da_verificare"
+    assert {check.codice for check in result.verifiche_richieste if check.livello == "critico"} == {
+        "RELATORE_NON_IDENTIFICATO" if critical == "speaker" else "TEMPI_INCOERENTI",
+    }
 
 
 def report_with_boundary_evidence() -> AcademyReport:
@@ -98,7 +399,7 @@ def test_boundary_builder_rejects_incomplete_evidence_and_keeps_distinct_pairs()
         intermediate_report.build_boundary_verifications(report, mapping)
 
 
-def test_main_builder_rejects_incomplete_boundaries_before_material_checks():
+def test_main_builder_rejects_incomplete_boundaries_before_material_parsing(monkeypatch):
     report = make_report([
         make_intervention(0, 10), make_intervention(10, 20),
     ], duration=20)
@@ -106,16 +407,17 @@ def test_main_builder_rejects_incomplete_boundaries_before_material_checks():
 
     checked_urls = []
 
-    def record_material_check(url):
-        checked_urls.append(url)
-        return True
+    def record_material_check(source):
+        checked_urls.append(source)
+        raise AssertionError("Must validate boundaries before parsing sources")
+
+    monkeypatch.setattr(intermediate_report, "parse_material_source", record_material_check)
 
     with pytest.raises(ValueError, match="confini"):
         build_intermediate_report(
             report,
             TARGET_GUID,
             material_sources=["https://materials.example.test/dispensa.pdf"],
-            material_url_checker=record_material_check,
         )
     assert checked_urls == []
 
@@ -226,119 +528,17 @@ def test_provider_summary_normalization_preserves_explicit_personal_names(summar
     assert intermediate_report.normalize_interventions(report)[0].sintesi == summary
 
 
-def test_malformed_optional_material_url_is_retained_with_nonblocking_warning():
+def test_malformed_optional_material_url_is_rejected_with_nonblocking_warning():
     source = "https://[::1/dispensa.pdf"
     report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
 
     result = build_intermediate_report(report, TARGET_GUID, material_sources=[source])
 
-    assert result.video[0].materiali[0].url == source
-    assert result.video[0].materiali[0].titolo == source
+    assert result.video[0].materiali == []
     assert result.stato == "verificato"
-    assert [check.codice for check in result.verifiche_richieste if check.campo == f"materiali:{source}"] == [
+    assert [check.codice for check in result.verifiche_richieste if check.campo == "materiali:MATERIALE_NON_RAGGIUNGIBILE"] == [
         "MATERIALE_NON_RAGGIUNGIBILE",
     ]
-
-
-@pytest.mark.parametrize("phase", ["headers", "redirects", "tls_handshake"])
-def test_material_probe_cancels_slow_headers_within_five_seconds_and_closes_socket(monkeypatch, phase):
-    # Route this public literal to a local deterministic server at the socket
-    # boundary; the production URL validator and real HTTP transport still run.
-    stopped = threading.Event()
-    peer_closed = threading.Event()
-    existing_threads = set(threading.enumerate())
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    listener.settimeout(.1)
-    original_connect = socket.socket.connect
-    original_getaddrinfo = socket.getaddrinfo
-
-    def literal_address(host, port, *args, **kwargs):
-        if host == "93.184.216.34":
-            return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (host, port))]
-        return original_getaddrinfo(host, port, *args, **kwargs)
-
-    def local_connect(sock, address):
-        if address[0] == "93.184.216.34":
-            address = listener.getsockname()
-        return original_connect(sock, address)
-
-    monkeypatch.setattr(socket.socket, "connect", local_connect)
-    monkeypatch.setattr(socket, "getaddrinfo", literal_address)
-
-    def accept_connection():
-        while not stopped.is_set():
-            try:
-                connection, _ = listener.accept()
-                connection.settimeout(.1)
-                return connection
-            except TimeoutError:
-                continue
-        return None
-
-    def read_request(connection):
-        request = b""
-        while b"\r\n\r\n" not in request and not stopped.is_set():
-            try:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    return
-                request += chunk
-            except TimeoutError:
-                continue
-
-    def serve_slow_headers():
-        if phase == "redirects":
-            first = accept_connection()
-            if first is None:
-                return
-            with first:
-                read_request(first)
-                if stopped.wait(2.5):
-                    return
-                first.sendall(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        connection = accept_connection()
-        if connection is None:
-            return
-        with connection:
-            if phase != "tls_handshake":
-                read_request(connection)
-                connection.sendall(b"HTTP/1.1 200 OK\r\nX-Slow: ")
-            finish = time.monotonic() + 6
-            while not stopped.is_set():
-                try:
-                    if connection.recv(1) == b"":
-                        peer_closed.set()
-                        return
-                except TimeoutError:
-                    if phase == "tls_handshake":
-                        continue
-                    try:
-                        connection.sendall(b"x" if time.monotonic() < finish else b"\r\nContent-Length: 0\r\n\r\n")
-                    except OSError:
-                        peer_closed.set()
-                        return
-                except OSError:
-                    peer_closed.set()
-                    return
-
-    server = threading.Thread(target=serve_slow_headers, daemon=True)
-    server.start()
-    try:
-        started = time.monotonic()
-        scheme = "https" if phase == "tls_handshake" else "http"
-        reachable = intermediate_report._material_url_is_reachable(f"{scheme}://93.184.216.34/slow.pdf")
-        elapsed = time.monotonic() - started
-        assert elapsed <= 5.0, f"caller blocked for {elapsed:.3f}s"
-        assert reachable is False
-        assert peer_closed.wait(.5), "cancelled probe left its socket connected"
-    finally:
-        stopped.set()
-        server.join(1)
-        listener.close()
-    assert not server.is_alive()
-    assert set(threading.enumerate()) <= existing_threads
 
 
 @pytest.mark.parametrize("label", ["Relatore A", "Relatore 12", "Speaker_01", "provider-F", "voce C2"])
@@ -358,9 +558,9 @@ def test_timeline_only_normalized_names_preserve_the_first_spelling_and_known_al
 
     result = build_intermediate_report(report, TARGET_GUID)
 
-    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio d'Andrea"]
+    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio D'Andrea"]
     assert [item.relatori for item in result.video[0].interventi] == [
-        ["Jose Nunez"], ["Jose Nunez", "Furio d'Andrea"], ["Furio d'Andrea"],
+        ["Jose Nunez"], ["Jose Nunez", "Furio D'Andrea"], ["Furio D'Andrea"],
     ]
     assert "Fulvio" not in render_markdown(report)
     assert "Fulvio" not in render_text(report)
@@ -446,6 +646,10 @@ def make_video(
 def report_with_reconciled_speakers() -> AcademyReport:
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     report = AcademyReport.model_validate(data)
+    # This helper exercises the legacy conversion with its own flat timeline.
+    report.analysis_profile = 1
+    report.speech_blocks = []
+    report.boundaries = []
     report.audio_boundary_version = 1
     report.speakers = [
         SpeakerProfile(
@@ -507,17 +711,17 @@ def test_builder_wraps_one_video_and_reconciles_registry_speakers() -> None:
     data = result.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert data["versione"] == 1
     assert data["corso"] == {
-        "titolo": "Webinar con Furio d'Andrea",
-        "sinossi_corso": "Furio d'Andrea presenta la sinossi.",
+        "titolo": "Webinar con Furio D'Andrea",
+        "sinossi_corso": "Furio D'Andrea presenta la sinossi.",
     }
     assert [(item["chiave"], item["ordine"]) for item in data["video"]] == [("v1", 1)]
     assert [item["nome"] for item in data["relatori"]] == [
-        "Vincenzo Manfredi", "Gaetano De Vito", "Furio d'Andrea",
+        "Vincenzo Manfredi", "Gaetano De Vito", "Furio D'Andrea",
         "Antonio Sibilia", "Luigi Morra",
     ]
     assert {item.get("slug") for item in data["relatori"]} == {
         "vincenzo-manfredi", "gaetano-de-vito", "antonio-sibilia",
-        "luigi-morra", None,
+        "luigi-morra", "furio-dandrea",
     }
     assert [item["id"] for item in data["video"][0]["interventi"]] == [
         "v1-i001", "v1-i002", "v1-i003", "v1-i004", "v1-i005",
@@ -539,12 +743,12 @@ def test_registered_speakers_receive_fixed_slugs_and_timeline_names_are_audio_on
     speakers = result.model_dump(mode="json", exclude_none=True)["relatori"]
 
     assert registered_slug("GAETANO de Vito") == "gaetano-de-vito"
-    assert registered_slug("Furio d'Andrea") is None
+    assert registered_slug("Furio d'Andrea") == "furio-dandrea"
     assert speakers[1]["origine_nome"] == ["audio"]
     assert speakers[1]["confidenza"] == .65
 
 
-def test_role_split_and_furio_registry_warning_request_missing_qualification() -> None:
+def test_role_split_and_furio_registry_entry_avoid_unregistered_warning() -> None:
     report = report_with_reconciled_speakers()
     report.interventions[1].relatori = ["Gaetano De Vito"]
     report.speakers.append(SpeakerProfile(
@@ -571,9 +775,7 @@ def test_role_split_and_furio_registry_warning_request_missing_qualification() -
     )
     assert gaetano["ruolo"] == "Public Policy and Advocacy Director"
     assert gaetano["organizzazione"] == "Assoholding"
-    assert len(furio_warnings) == 1
-    assert "Furio d'Andrea" in furio_warnings[0]["messaggio"]
-    assert "qualifica" in furio_warnings[0]["messaggio"].casefold()
+    assert furio_warnings == []
 
 
 @pytest.mark.parametrize("organization", ["Ass Holding", "Asso Holding", "Assoholding"])
@@ -583,9 +785,9 @@ def test_role_split_accepts_every_explicit_assoholding_spelling(organization: st
     )
 
 
-def test_role_split_rejects_assholding_without_the_required_space() -> None:
+def test_role_split_canonicalizes_assholding_without_the_required_space() -> None:
     assert split_role_organization("Direttore di Assholding") == (
-        "Direttore di Assholding", None,
+        "Direttore", "Assoholding",
     )
 
 
@@ -606,9 +808,503 @@ def test_furio_is_canonical_when_furio_and_fulvio_are_both_candidate_names() -> 
 
     assert correct_speaker_name_mentions(
         "Furio d'Andrea e Fulvio D'Andrea", ["Furio d'Andrea", "Fulvio D'Andrea"]
-    ) == "Furio d'Andrea e Furio d'Andrea"
-    assert names.count("Furio d'Andrea") == 1
+    ) == "Furio D'Andrea e Furio D'Andrea"
+    assert names.count("Furio D'Andrea") == 1
     assert "Fulvio D'Andrea" not in names
+
+
+def test_governance_aliases_collapse_to_registry_people_and_rewrite_references() -> None:
+    names = [
+        "Avvocato Furio D'Andrea", "Luigi Morra", "Dottor Morra",
+        "Antonio Sibilia", "Dott. Sibilia", "Dottore Gaetano de Vito",
+        "prof. vincenzo MANFREDI",
+    ]
+    report = make_report([
+        make_intervention(
+            index * 120, (index + 1) * 120, relatori=[name],
+            titolo=f"Intervento di {name}", sintesi=f"{name} tratta la governance.",
+        )
+        for index, name in enumerate(names)
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio", display_name="Avv. Furio D'Andrea",
+            role="Responsabile legale di ASSOHOLDING", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Avv. Furio D'Andrea."}],
+        ),
+        SpeakerProfile(
+            id="luigi", display_name="Luigi Morra", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Luigi Morra."}],
+        ),
+        SpeakerProfile(
+            id="antonio", display_name="Antonio Sibilia", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Antonio Sibilia."}],
+        ),
+    ]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [(person.nome, person.slug) for person in result.relatori] == [
+        ("Furio D'Andrea", "furio-dandrea"),
+        ("Luigi Morra", "luigi-morra"),
+        ("Antonio Sibilia", "antonio-sibilia"),
+        ("Gaetano De Vito", "gaetano-de-vito"),
+        ("Vincenzo Manfredi", "vincenzo-manfredi"),
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Furio D'Andrea"], ["Luigi Morra"], ["Luigi Morra"],
+        ["Antonio Sibilia"], ["Antonio Sibilia"], ["Gaetano De Vito"],
+        ["Vincenzo Manfredi"],
+    ]
+    assert result.relatori[0].ruolo == "Responsabile legale"
+    assert result.relatori[0].organizzazione == "Assoholding"
+    assert all(
+        title not in name
+        for item in result.video[0].interventi
+        for name in item.relatori
+        for title in ("Avvocato", "Avv.", "Dottor", "Dott.", "Prof.")
+    )
+    assert all(
+        check.codice != "ALIAS_RELATORE_AMBIGUO"
+        for check in result.verifiche_richieste
+    )
+
+
+def test_compatible_explicit_role_keeps_its_evidenced_organization() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Furio d'Andrea"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio-a", display_name="Furio d'Andrea",
+            role="Responsabile legale", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Furio si presenta."}],
+        ),
+        SpeakerProfile(
+            id="furio-b", display_name="Avv. Furio D’Andrea",
+            role="Responsabile legale di Asso Holding", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica completa in slide."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Responsabile legale"
+    assert speaker.organizzazione == "Assoholding"
+
+
+def test_professional_qualification_and_moderator_role_are_preserved_separately() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Furio d'Andrea"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio-generic", display_name="Furio d'Andrea",
+            role="Relatore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Presentazione."}],
+        ),
+        SpeakerProfile(
+            id="furio-video", display_name="Furio D’Andrea",
+            role="moderatore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+        SpeakerProfile(
+            id="furio-professional", display_name="Furio D’Andrea",
+            role="Avvocato", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica professionale."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione is None
+
+
+def test_honorific_qualification_beats_generic_explicit_role_after_alias_merge() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Dottor Morra", role="Relatore", confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Presentazione."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.nome == "Luigi Morra"
+    assert speaker.ruolo == "Dottor"
+
+
+def test_honorific_qualification_combines_with_explicit_video_role() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Avvocato Luigi Morra", role="moderatore",
+        confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione is None
+
+
+def test_honorific_qualification_combines_with_video_role_from_separate_evidence() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="luigi-qualification", display_name="Dottor Morra", role="Relatore",
+            confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica esplicita."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Dottor; moderatore"
+
+
+def test_organization_qualification_combines_with_compatible_video_role() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="luigi-professional", display_name="Luigi Morra",
+            role="Avvocato di Assoholding", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica esplicita."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Avvocato; moderatore"
+    assert speaker.organizzazione == "Assoholding"
+
+
+@pytest.mark.parametrize("role,expected_role,expected_organization", [
+    ("Commercialista; revisore legale", "Commercialista; revisore legale", None),
+    ("Avvocato; docente universitario", "Avvocato; docente universitario", None),
+    (
+        "Commercialista; revisore legale di Assoholding",
+        "Commercialista; revisore legale", "Assoholding",
+    ),
+    (
+        "Commercialista di Assoholding; revisore legale",
+        "Commercialista; revisore legale", "Assoholding",
+    ),
+    (
+        "Commercialista; revisore legale di Assoholding; moderatore",
+        "Commercialista; revisore legale; moderatore", "Assoholding",
+    ),
+    (
+        " Commercialista ; revisore legale ; commercialista ; REVISORE LEGALE ; ",
+        "Commercialista; revisore legale", None,
+    ),
+    (
+        "revisore legale; Commercialista; revisore legale",
+        "revisore legale; Commercialista", None,
+    ),
+    (
+        "Commercialista; moderatore; revisore legale; MODERATORE",
+        "Commercialista; revisore legale; moderatore", None,
+    ),
+    (
+        "Relatore; Commercialista; revisore legale",
+        "Commercialista; revisore legale", None,
+    ),
+])
+def test_single_source_explicit_qualification_bundle_is_preserved(
+    role: str, expected_role: str, expected_organization: str | None,
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Dottor Morra", role=role, confidence="alta",
+        evidence=[{"kind": "slide", "note": "Qualifiche esplicite nella stessa fonte."}],
+    )]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == expected_role
+    assert speaker.organizzazione == expected_organization
+
+
+@pytest.mark.parametrize("first_role,second_role", [
+    ("Commercialista; revisore legale", "Avvocato; docente universitario"),
+    ("Avvocato; docente universitario", "Commercialista; revisore legale"),
+])
+def test_conflicting_source_bundles_keep_the_first_complete_qualification(
+    first_role: str, second_role: str,
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id=f"luigi-{index}", display_name="Luigi Morra", role=role,
+            confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifiche esplicite nella fonte."}],
+        )
+        for index, role in enumerate((first_role, second_role))
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == first_role
+
+
+@pytest.mark.parametrize("professional_role,expected_role,expected_organization", [
+    ("Commercialista", "Commercialista; moderatore", None),
+    ("Commercialista di Assoholding", "Commercialista; moderatore", "Assoholding"),
+    (
+        "Commercialista; revisore legale",
+        "Commercialista; revisore legale; moderatore", None,
+    ),
+    (
+        "Commercialista; revisore legale di Assoholding",
+        "Commercialista; revisore legale; moderatore", "Assoholding",
+    ),
+])
+@pytest.mark.parametrize("order", list(permutations(range(3))))
+def test_role_specificity_is_independent_from_evidence_order(
+    professional_role: str, expected_role: str, expected_organization: str | None,
+    order: tuple[int, int, int],
+) -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    profiles = [
+        SpeakerProfile(
+            id="luigi-fallback", display_name="Dottor Morra", role="Relatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Titolo onorifico."}],
+        ),
+        SpeakerProfile(
+            id="luigi-video", display_name="Luigi Morra", role="moderatore",
+            confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Modera il video."}],
+        ),
+        SpeakerProfile(
+            id="luigi-professional", display_name="Luigi Morra",
+            role=professional_role, confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica specifica."}],
+        ),
+    ]
+    report.speakers = [profiles[index] for index in order]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == expected_role
+    assert speaker.organizzazione == expected_organization
+
+
+def test_honorific_remains_fallback_and_incompatible_specific_role_keeps_first() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Dott. Antonio Sibilia"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="antonio-first", display_name="Dott. Antonio Sibilia",
+            role="Amministratore", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Prima qualifica."}],
+        ),
+        SpeakerProfile(
+            id="antonio-conflict", display_name="Antonio Sibilia",
+            role="Sindaco", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Seconda qualifica."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Amministratore"
+
+    report.speakers = []
+    fallback = build_intermediate_report(report, TARGET_GUID).relatori[0]
+    assert fallback.ruolo == "Dott."
+
+
+def test_surname_only_alias_stays_unresolved_when_report_contains_a_collision() -> None:
+    report = make_report([
+        make_intervention(0, 120, relatori=["Luigi Morra"]),
+        make_intervention(120, 240, relatori=["Mario Morra"]),
+        make_intervention(240, 360, relatori=["Dottor Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id=name, display_name=name, confidence="alta",
+            evidence=[{"kind": "introduzione", "note": f"Presentazione di {name}."}],
+        )
+        for name in ("Luigi Morra", "Mario Morra")
+    ]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [speaker.nome for speaker in result.relatori] == [
+        "Luigi Morra", "Mario Morra", "Morra",
+    ]
+    assert result.video[0].interventi[2].relatori == ["Morra"]
+    warnings = [
+        check for check in result.verifiche_richieste
+        if check.codice == "ALIAS_RELATORE_AMBIGUO"
+    ]
+    assert len(warnings) == 1
+    assert "Morra" in warnings[0].messaggio
+
+
+def test_unresolved_case_and_punctuation_variants_share_one_stable_display() -> None:
+    names = [
+        "Luigi Morra", "Mario Morra", "Dottor Morra", "Dott. MORRA",
+        "Rossi", "ROSSI",
+    ]
+    report = make_report([
+        make_intervention(index * 120, (index + 1) * 120, relatori=[name])
+        for index, name in enumerate(names)
+    ])
+    report.speakers = []
+
+    reconciliation = intermediate_report.reconcile_speakers_detailed(report)
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert reconciliation.ambiguous_aliases == ["Morra"]
+    assert [speaker.nome for speaker in result.relatori] == [
+        "Luigi Morra", "Mario Morra", "Morra", "Rossi",
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Luigi Morra"], ["Mario Morra"], ["Morra"], ["Morra"],
+        ["Rossi"], ["Rossi"],
+    ]
+    assert [
+        warning.messaggio for warning in result.verifiche_richieste
+        if warning.codice == "ALIAS_RELATORE_AMBIGUO"
+    ] == [
+        "L'alias relatore Morra corrisponde a più persone: "
+        "mantenere l'identità separata fino alla verifica nel Registro."
+    ]
+
+
+def test_dotted_initial_stays_distinct_from_apostrophe_surname_variants() -> None:
+    names = [
+        "Furio D’Andrea", "Domenico Andrea", "Dott. D. Andrea",
+        "DOTT. d .   ANDREA", "D'Andrea", "D ’ Andrea",
+    ]
+    report = make_report([
+        make_intervention(index * 120, (index + 1) * 120, relatori=[name])
+        for index, name in enumerate(names)
+    ])
+    report.speakers = []
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [(speaker.nome, speaker.slug) for speaker in result.relatori] == [
+        ("Furio D'Andrea", "furio-dandrea"),
+        ("Domenico Andrea", None),
+        ("D. Andrea", None),
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Furio D'Andrea"], ["Domenico Andrea"], ["D. Andrea"],
+        ["D. Andrea"], ["Furio D'Andrea"], ["Furio D'Andrea"],
+    ]
+    assert all(
+        check.codice != "ALIAS_RELATORE_AMBIGUO" or "D. Andrea" not in check.messaggio
+        for check in result.verifiche_richieste
+    )
+    assert any(
+        check.codice == "RELATORE_NON_NEL_REGISTRO"
+        and "D. Andrea" in check.messaggio
+        for check in result.verifiche_richieste
+    )
+
+
+def test_resolved_material_alias_rewrites_title_and_speaker_with_complete_map() -> None:
+    from app.models import ReportMaterial
+
+    report = make_report([
+        make_intervention(0, 600, relatori=["Luigi Morra"]),
+    ])
+    report.speakers = []
+    report.materials = [ReportMaterial(
+        titolo="Slide · Dott. Morra", relatore="Dott. Morra", file="morra.pptx",
+    )]
+
+    material = build_intermediate_report(report, TARGET_GUID).video[0].materiali[0]
+
+    assert material.titolo == "Slide · Luigi Morra"
+    assert material.relatore == "Luigi Morra"
+
+
+def test_granular_export_rewrites_block_chapter_slide_and_material_references() -> None:
+    from app.models import ChapterBoundaryOrigin, ReportMaterial, SpeechBlock
+
+    chapter = make_intervention(
+        0, 600, relatori=["Avv. Furio d'Andrea", "Furio D’Andrea"],
+        titolo="Capitolo di Fulvio D'Andrea",
+        sintesi="Fulvio D'Andrea illustra la governance.",
+        punti_chiave=[
+            "Poteri illustrati da Fulvio D'Andrea",
+            "Deleghe secondo Fulvio D'Andrea",
+            "Controlli riepilogati da Fulvio D'Andrea",
+        ],
+    ).model_copy(update={
+        "block_id": "b001", "chapter_number": 1, "chapters_in_block": 1,
+        "boundary_origin": ChapterBoundaryOrigin(
+            motivo_editoriale="inizio_blocco", regola_audio="long_pause",
+        ),
+    })
+    report = make_report([chapter], duration=600)
+    report.analysis_profile = 2
+    report.speakers = []
+    report.speech_blocks = [SpeechBlock(
+        id="b001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Avvocato Furio D'Andrea"],
+        titolo="Blocco di Fulvio D'Andrea",
+        sinossi="Fulvio D'Andrea tratta gli assetti.",
+    )]
+    report.materials = [ReportMaterial(
+        titolo="Slide · Fulvio D'Andrea", relatore="Avv. Furio D'Andrea",
+        file="furio.pptx", pagine=18,
+    )]
+    report.slides = report.slides[:1]
+    report.slides[0].title = "Fulvio D'Andrea in apertura"
+    report.slides[0].visible_content = ["Relazione di Fulvio D'Andrea"]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+    video = result.video[0]
+
+    assert video.blocchi_parlato[0].relatori == ["Furio D'Andrea"]
+    assert video.blocchi_parlato[0].titolo == "Blocco di Furio D'Andrea"
+    assert video.blocchi_parlato[0].sinossi == "Furio D'Andrea tratta gli assetti."
+    assert video.interventi[0].relatori == ["Furio D'Andrea"]
+    assert video.interventi[0].titolo == "Capitolo di Furio D'Andrea"
+    assert video.interventi[0].sintesi == "Furio D'Andrea illustra la governance."
+    assert video.interventi[0].punti_chiave == [
+        "Poteri illustrati da Furio D'Andrea",
+        "Deleghe secondo Furio D'Andrea",
+        "Controlli riepilogati da Furio D'Andrea",
+    ]
+    assert video.interventi[0].blocco == "v1-b001"
+    assert video.slide[0].titolo == "Furio D'Andrea in apertura"
+    assert video.slide[0].testo_principale == "Relazione di Furio D'Andrea"
+    assert video.materiali[0].relatore == "Furio D'Andrea"
+    assert video.materiali[0].titolo == "Slide · Furio D'Andrea"
+    assert "Furio D’Andrea" not in result.model_dump_json()
 
 
 def test_builder_filters_generic_formal_speaker_profiles() -> None:
@@ -747,7 +1443,7 @@ def test_access_selects_only_first_intervention_between_eight_and_fifteen_minute
     assert [item.accesso for item in result] == ["iscritti", "pubblico", "iscritti"]
 
 
-def test_access_falls_back_to_first_eight_minute_intervention() -> None:
+def test_access_includes_exactly_fifteen_minutes() -> None:
     report = make_report([
         make_intervention(0, 900, relatori=["Vincenzo Manfredi"]),
         make_intervention(900, 2100, relatori=["Vincenzo Manfredi"]),
@@ -759,7 +1455,7 @@ def test_access_falls_back_to_first_eight_minute_intervention() -> None:
     assert [item.accesso for item in result] == ["pubblico", "iscritti", "iscritti"]
 
 
-def test_access_falls_back_to_longest_substantive_intervention() -> None:
+def test_access_has_no_fallback_when_all_interventions_are_too_short() -> None:
     report = make_report([
         make_intervention(0, 300, relatori=["Vincenzo Manfredi"]),
         make_intervention(300, 720, relatori=["Vincenzo Manfredi"]),
@@ -768,7 +1464,7 @@ def test_access_falls_back_to_longest_substantive_intervention() -> None:
 
     result = build_intermediate_report(report, TARGET_GUID).video[0].interventi
 
-    assert [item.accesso for item in result] == ["iscritti", "pubblico", "iscritti"]
+    assert [item.accesso for item in result] == ["iscritti", "iscritti", "iscritti"]
 
 
 def test_choose_public_intervention_returns_none_without_substantive_segments() -> None:
@@ -802,6 +1498,8 @@ def test_gap_overlap_or_end_beyond_duration_is_critical_timeline_verification(
         make_intervention(0, 10, relatori=["Vincenzo Manfredi"]),
         make_intervention(second_start, second_end, relatori=["Vincenzo Manfredi"]),
     ], duration=duration)
+    # Exercise inconsistent input directly, before legacy endpoint clamping.
+    video.interventi[-1].end_seconds = second_end
 
     checks = intermediate_report.build_verifications(video, [], [])
 
@@ -904,14 +1602,16 @@ def test_parse_material_source_extracts_only_a_declared_url_and_title() -> None:
     }
 
 
-def test_file_material_is_retained_and_warned_without_network_access() -> None:
+def test_file_material_is_retained_and_warned_without_network_access(tmp_path) -> None:
     report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+    source = tmp_path / "dispensa.pdf"
+    source.write_bytes(b"%PDF")
 
-    result = build_intermediate_report(report, TARGET_GUID, material_sources=["dispensa.pdf"])
+    result = build_intermediate_report(report, TARGET_GUID, material_sources=[str(source)])
 
     assert result.video[0].materiali[0].model_dump(exclude_none=True) == {
         "titolo": "dispensa",
-        "file": "dispensa.pdf",
+        "file": str(source),
         "accesso": "iscritti",
     }
     assert any(
@@ -920,17 +1620,22 @@ def test_file_material_is_retained_and_warned_without_network_access() -> None:
     )
 
 
-def test_unreachable_url_checker_warns_but_does_not_block_report_creation() -> None:
+def test_unverified_legacy_material_warns_without_any_network_request(monkeypatch) -> None:
     report = make_report([make_intervention(0, 120, relatori=["Vincenzo Manfredi"])])
+    attempts = []
+    def forbidden(*args, **kwargs):
+        attempts.append(args)
+        raise AssertionError("Legacy metadata conversion must remain offline")
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
 
     result = build_intermediate_report(
         report,
         TARGET_GUID,
-        material_sources=["Slide | https://example.test/unavailable.pdf"],
-        material_url_checker=lambda url: False,
+        material_sources=["Slide | https://93.184.216.34/unavailable.pdf"],
     )
 
     assert result.stato == "verificato"
+    assert attempts == []
     assert any(
         check.codice == "MATERIALE_NON_RAGGIUNGIBILE"
         for check in result.verifiche_richieste
@@ -947,163 +1652,17 @@ def test_empty_material_sources_leave_materials_and_slide_links_empty() -> None:
     assert all("materiale" not in slide and "pagina" not in slide for slide in data["video"][0]["slide"])
 
 
-def test_parse_material_source_strips_trailing_prose_punctuation_and_whitespace() -> None:
+def test_parse_material_source_rejects_trailing_ambiguous_prose() -> None:
     material = parse_material_source(
         " \n\t https://example.test/materiali/dispensa.pdf).,| \n"
     )
 
-    assert material is not None
-    assert material.model_dump(exclude_none=True) == {
-        "titolo": "dispensa.pdf",
-        "url": "https://example.test/materiali/dispensa.pdf",
-        "accesso": "iscritti",
-    }
+    assert material is None
 
 
-def test_parse_material_source_strips_mixed_title_url_separators() -> None:
+def test_parse_material_source_rejects_mixed_title_url_separators() -> None:
     material = parse_material_source(
         "Slide | - \t https://example.test/materiali/dispensa.pdf"
     )
 
-    assert material is not None
-    assert material.titolo == "Slide"
-
-
-def test_material_url_checker_rejects_private_direct_targets_before_any_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        intermediate_report.httpx,
-        "AsyncClient",
-        lambda **kwargs: pytest.fail("private URL must not create an HTTP client"),
-    )
-
-    assert intermediate_report._material_url_is_reachable("http://127.0.0.1/private") is False
-
-
-def test_material_url_checker_rejects_private_dns_answers_before_any_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        socket,
-        "getaddrinfo",
-        lambda *args, **kwargs: [
-            (2, 1, 6, "", ("10.0.0.12", 80)),
-        ],
-    )
-    monkeypatch.setattr(
-        intermediate_report.httpx,
-        "AsyncClient",
-        lambda **kwargs: pytest.fail("private DNS answer must not create an HTTP client"),
-    )
-
-    assert intermediate_report._material_url_is_reachable("https://materials.example.test/doc.pdf") is False
-
-
-def test_material_url_checker_rejects_credentials_before_any_request(monkeypatch) -> None:
-    monkeypatch.setattr(
-        intermediate_report.httpx,
-        "AsyncClient",
-        lambda **kwargs: pytest.fail("credential URL must not create an HTTP client"),
-    )
-
-    assert intermediate_report._material_url_is_reachable(
-        "https://user:password@materials.example.test/doc.pdf"
-    ) is False
-
-
-def test_material_url_checker_rejects_private_redirect_without_fetching_it(monkeypatch) -> None:
-    requests: list[str] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(str(request.url))
-        return httpx.Response(
-            302,
-            headers={"location": "http://127.0.0.1/private"},
-            request=request,
-    )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
-
-    assert intermediate_report._material_url_is_reachable("http://93.184.216.34/doc.pdf") is False
-    assert requests == ["http://93.184.216.34/doc.pdf"]
-
-
-def test_material_url_checker_enforces_one_wall_clock_deadline_across_redirects(monkeypatch) -> None:
-    now = [0.0]
-    requests: list[str] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(str(request.url))
-        now[0] += 3.0
-        if len(requests) == 1:
-            return httpx.Response(302, headers={"location": "/next"}, request=request)
-        return httpx.Response(200, request=request)
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
-
-    assert intermediate_report._material_url_is_reachable("http://93.184.216.34/start") is False
-    assert requests == [
-        "http://93.184.216.34/start",
-        "http://93.184.216.34/next",
-    ]
-
-
-def test_material_url_checker_fails_closed_for_rebinding_hostname_without_request(monkeypatch) -> None:
-    resolutions: list[str] = []
-
-    def rebinding_resolver(host: str, *args, **kwargs):
-        resolutions.append(host)
-        address = "93.184.216.34" if len(resolutions) == 1 else "10.0.0.12"
-        return [(2, 1, 6, "", (address, 443))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", rebinding_resolver)
-    monkeypatch.setattr(
-        intermediate_report.httpx,
-        "AsyncClient",
-        lambda **kwargs: pytest.fail("hostname must not be resolved or requested"),
-    )
-
-    assert intermediate_report._material_url_is_reachable(
-        "https://materials.example.test/document.pdf"
-    ) is False
-    assert resolutions == []
-
-
-def test_material_url_checker_does_not_wait_for_a_blocking_hostname_resolver(monkeypatch) -> None:
-    now = [0.0]
-    resolutions: list[str] = []
-
-    def blocking_resolver(host: str, *args, **kwargs):
-        resolutions.append(host)
-        now[0] += 10.0
-        return [(2, 1, 6, "", ("93.184.216.34", 443))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", blocking_resolver)
-    monkeypatch.setattr(intermediate_report.time, "monotonic", lambda: now[0])
-    monkeypatch.setattr(
-        intermediate_report.httpx,
-        "AsyncClient",
-        lambda **kwargs: pytest.fail("hostname must not start an HTTP request"),
-    )
-
-    assert intermediate_report._material_url_is_reachable(
-        "https://materials.example.test/document.pdf"
-    ) is False
-    assert resolutions == []
-    assert now[0] < 5.0
-
-
-def test_material_url_checker_uses_the_validated_public_literal_ip(monkeypatch) -> None:
-    requests: list[str] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(str(request.url))
-        return httpx.Response(200, request=request)
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
-    monkeypatch.setattr(intermediate_report.httpx, "AsyncClient", lambda **kwargs: client)
-
-    assert intermediate_report._material_url_is_reachable(
-        "http://93.184.216.34/document.pdf"
-    ) is True
-    assert requests == ["http://93.184.216.34/document.pdf"]
+    assert material is None

@@ -32,6 +32,7 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `ASSEMBLYAI_REGION` | `eu` (predefinito) per endpoint europeo, oppure `global` |
 | `APP_PASSWORD` | Password lunga e casuale condivisa esclusivamente con il team |
 | `DATABASE_PATH` | File SQLite dei report; in produzione Railway usare `/data/bunny-video-report.sqlite3` su volume persistente |
+| `MATERIAL_ALLOWED_HOSTS` | `www.assoholding.it` per impostazione predefinita; eventuali altri hostname esatti, separati da virgole, senza URL, porte o wildcard |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 
@@ -61,13 +62,51 @@ I limiti configurabili sono `MEDIA_RUNTIME_SECONDS=21600` (sei ore per estrazion
 
 Il target operativo è costituito da video di **1-4 ore**; i video brevi sono accettati per il collaudo e quelli oltre quattro ore vengono rifiutati. Serve audio decodificabile. Si elabora un video alla volta; gli altri rimangono in coda. La pagina del singolo lavoro e quella del gruppo aggiornano automaticamente stato e barre ogni tre secondi; `Aggiorna ora` resta disponibile come controllo manuale. Ogni report può essere scaricato come **JSON (.json)**, **Markdown (.md)** o **testo (.txt)**, copiato oppure stampato/salvato come PDF dal browser.
 
-Il JSON è un documento fattuale relativo a un solo video. Contiene GUID Bunny, titoli, durata, lingua, sinossi, relatori con evidenze, timeline degli interventi (`inizio` e `fine` in `h:mm:ss`), e ogni cambio slide con titolo, testo principale fino a 500 caratteri e confidenza numerica. Non contiene transcript, video, audio, immagini, moduli, lezioni, quiz o scelte editoriali dell'Academy.
+Il JSON usa il contratto intermedio Academy v1.1: la busta mantiene `"versione": 1` e contiene un solo video con `chiave: "v1"` e `ordine: 1`. Include GUID Bunny, titoli, lingua, sinossi, relatori con evidenze, blocchi fattuali di parlato (`blocchi_parlato`), capitoli in `interventi`, slide, materiali verificati e `costo_stimato` in USD. Gli identificativi cronologici sono stabili (`v1-b001`, `v1-i001`, ecc.). `inizio`, `fine` e gli indizi visivi sono espressi in `h:mm:ss`.
+
+La durata autorevole proviene soltanto da `length` di Bunny, normalizzato per difetto al secondo intero. Durate FFmpeg o del provider di trascrizione non la sostituiscono; blocchi, capitoli e slide non possono superarla. Ogni blocco conserva il parlato fattuale anche quando è lungo: i suoi capitoli lo coprono interamente, senza buchi o sovrapposizioni. Pause e logistica fra blocchi restano segmenti espliciti. Un cambio slide può suggerire una chiusura tematica; il taglio resta verificato sulle parole e sul silenzio, con motivazione editoriale in `confine_inizio` e prova compatta `CONFINE`.
+
+I capitoli didattici preferiscono 8–10 minuti, puntano a 8–15 e tollerano fino a 20; un'unità indivisibile rimane lunga con un avviso. Solo il primo capitolo `intervento` idoneo di 480–900 secondi ha `accesso: "pubblico"`; gli altri sono `iscritti`. Se manca un candidato idoneo, il nuovo export segnala la necessità di rianalisi. Il tool propone capitoli, ma non crea corsi, moduli, lezioni o quiz nell'Academy.
+
+I download JSON/Markdown/TXT dei nuovi report `analysis_profile: 2` usano esclusivamente i dati persistiti: non rileggono Bunny o l'inventario, non scaricano nuovamente materiali e non ricalcolano l'analisi. I report storici di profilo 1 restano leggibili e scaricabili in Markdown/TXT; il loro JSON restituisce `409 Rianalisi necessaria per il formato granulare`. Un profilo 2 malformato restituisce `409 Report granulare non valido: rianalisi necessaria` in tutti e tre i formati. Gli avvisi validi restano visibili negli export.
 
 Nomi e ruoli richiedono evidenze testuali o visive; in caso di dubbio compaiono etichette generiche e incertezze. L'identità dei relatori non viene dedotta biometricamente dalla voce. Il report richiede revisione umana prima dell'uso editoriale.
 
+Le persone riconosciute usano nome e slug del Registro. In particolare la grafia canonica è esattamente `Furio D'Andrea` (apostrofo ASCII), con slug `furio-dandrea`, anche nei riferimenti di blocchi, capitoli, sintesi e materiali (`Slide · Furio D'Andrea`). Varianti di apostrofo, maiuscole e onorifici convergono su quella voce; la qualifica resta nel ruolo. Un cognome senza nome viene unito solo quando la corrispondenza è univoca.
+
+## Materiali verificati e limiti
+
+Il lavoro può leggere URL reali dall'inventario, hyperlink Google Sheets quando il service account è configurato, sorgenti curate per GUID e file PDF/PPTX realmente disponibili. Un'etichetta come `Slide relatore` non diventa un file. I PPTX vengono letti con `zipfile`/XML nell'ordine della presentazione; i PDF con la dipendenza dichiarata `pypdf>=6,<7`, inclusa in `uv.lock`. L'estrazione legge il testo: non aggiunge OCR alle pagine PDF composte soltanto da immagini.
+
+Il recupero remoto ammette solo HTTPS sulla porta 443 e gli host esatti di `MATERIAL_ALLOWED_HOSTS=www.assoholding.it`. Rifiuta credenziali, query e frammenti negli URL, indirizzi IP e destinazioni private. Ogni redirect (massimo cinque) ripete i controlli DNS e di host; la connessione usa gli indirizzi pubblici verificati e non usa proxy, cookie o credenziali implicite. Il contenuto dei documenti non viene eseguito. Collegamenti esterni, azioni attive, macro, allegati e PDF cifrati non sono supportati.
+
+Limiti applicativi per il trattamento dei materiali:
+
+| Risorsa | Limite |
+| --- | --- |
+| Sorgenti per lavoro | 32 |
+| File scaricato o locale | 50 MiB |
+| Download / estrazione / abbinamento | 20 secondi per fase, in processi controllati |
+| Pagine per deck | 1.000 |
+| Elementi archivio PPTX | 10.000 |
+| Dati decompressi PPTX o stream PDF decodificati | 100 MiB complessivi per deck |
+| Singolo XML o stream PDF decodificato | 10 MiB |
+| Testo estratto | 100.000 caratteri per pagina; 2.000.000 per deck |
+| Processo di lavoro | 15 secondi CPU; 512 MiB di spazio di indirizzamento su Linux; limite memoria non disponibile in modo affidabile su macOS |
+
+Il decoder PDF ammette soltanto filtri testuali gestiti e limitati (Flate, LZW, ASCII85, ASCIIHex e RunLength). Non decodifica le immagini per estrarre testo e blocca decoder esterni come JBIG2, inclusi gli stream oggetto; dati o filtri non supportati causano un errore controllato del materiale. L'abbinamento titolo/OCR–pagina richiede punteggio almeno 0,55, margine almeno 0,10 sul secondo candidato e ordine delle pagine non decrescente. Se non c'è evidenza sufficiente, `materiale` e `pagina` restano assenti.
+
+Le verifiche aggiuntive sono avvisi e non bloccano gli export:
+
+- `INTERVENTO_LUNGO`: capitolo didattico oltre 20 minuti conservato senza un taglio forzato.
+- `SLIDE_NON_ABBINATA`: slide senza materiale e pagina sufficientemente certi.
+- `ALIAS_RELATORE_AMBIGUO`: alias anagrafico non risolto in modo univoco.
+
+`MATERIALE_NON_RAGGIUNGIBILE` segnala una sorgente assente, non accessibile o non elaborabile. Un materiale fallito non interrompe il report; cancellazione ed errori interni del programma conservano il loro comportamento di errore. Solo `RELATORE_NON_IDENTIFICATO` e `TEMPI_INCOERENTI` rendono il report `da_verificare`.
+
 ## Dati temporanei, persistenza e riavvio
 
-Il database SQLite conserva soltanto metadati sicuri dei lavori, appartenenza ai gruppi e JSON strutturato dei report finali. Non contiene chiavi, cookie, token, trascrizioni, prompt, video, audio o immagini delle slide. Il catalogo Bunny non viene memorizzato. In modalità veloce l'app scrive soltanto frame temporanei; nel fallback scrive anche segmenti audio temporanei. Tutti vengono rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline; l'artefatto AssemblyAI viene cancellato via API in uscita.
+Il database SQLite conserva soltanto metadati sicuri dei lavori, appartenenza ai gruppi e JSON strutturato dei report finali: blocchi, capitoli, sintesi, metadati materiali/pagine, evidenze compatte dei confini e consumo API. Non conserva deck, testo integrale dei deck, video, audio, immagini, transcript o word timing; non contiene chiavi, cookie, token o prompt. Le prove `CONFINE` conservano al massimo cinque parole per lato, senza la sequenza completa dei tempi. Il catalogo Bunny non viene memorizzato. In modalità veloce l'app scrive frame e deck temporanei; nel fallback scrive anche segmenti audio temporanei. Tutti vengono rimossi al completamento, errore o annullamento cooperativo. Il transcript resta soltanto in memoria durante la pipeline; l'artefatto AssemblyAI viene cancellato via API in uscita.
 
 I report completati restano nell'archivio senza scadenza e sopravvivono ai riavvii quando `DATABASE_PATH` si trova sul volume persistente. L'eliminazione autenticata rimuove esclusivamente il record locale e non chiama mai Bunny. Un lavoro trovato in coda o in elaborazione all'avvio non può essere ripreso senza i file temporanei: viene marcato come fallito con l'indicazione di rilanciare l'analisi. Dopo un riavvio può essere necessario effettuare nuovamente il login.
 
@@ -142,7 +181,7 @@ Con le variabili runtime Railway già configurate, la prova live esplicita usa 9
 RUN_LIVE_SYNTHETIC_ANALYSIS=1 railway run .venv/bin/pytest -q -m live tests/test_live_diagnostics.py -k chunked_long_report
 ```
 
-La prova percorre finestre e consolidamento reali senza immagini, verifica tutti i limiti di payload e richiede sinossi e almeno un relatore. Stampa solo stato, richieste, token, durata, tempo trascorso e conteggi del risultato; non stampa chiavi, payload, trascrizione, testo del modello o corpi di risposta. Non rilanciare il video reale “Governance delle holding e conferimenti a realizzo controllato” senza conferma esplicita: trascrizione e analisi generano un nuovo costo API.
+La prova percorre finestre e consolidamento reali senza immagini, con una parola temporizzata per ogni token del testo sintetico. Verifica limiti di payload, profilo 2, copertura dei blocchi, capitoli, confini e limite temporale Bunny; non dipende dalla densità delle finestre o dalla lunghezza della prosa generata. Stampa solo stato, richieste, token, durata, tempo trascorso e conteggi del risultato. Non stampa chiavi, payload, trascrizione, testo del modello o corpi di risposta. Non rilanciare il video reale “Governance delle holding e conferimenti a realizzo controllato” senza conferma esplicita: trascrizione e analisi generano un nuovo costo API.
 
 Il test live è **opt-in e a pagamento**. Compilare in `.env` le variabili obbligatorie e `BUNNY_SAMPLE_VIDEO_URL` con un video autorizzato; fornire anche la chiave token se necessaria. Impostare `RUN_LIVE_BUNNY=1` nel file e caricarlo come dati, senza eseguirlo come script shell:
 
@@ -150,7 +189,7 @@ Il test live è **opt-in e a pagamento**. Compilare in `.env` le variabili obbli
 .venv/bin/python -c 'from dotenv import load_dotenv; load_dotenv(".env"); import pytest; raise SystemExit(pytest.main(["tests/test_live_bunny.py", "-m", "live", "-q", "--tb=no"]))'
 ```
 
-Se l'opt-in o una variabile obbligatoria manca, il test viene saltato. Non usare `--showlocals`, debugger o registrazioni HTTP con credenziali reali. Il test non stampa URL, transcript, report o segreti e non effettua modifiche su Bunny. Lasciare `RUN_LIVE_BUNNY=0` al termine.
+Se l'opt-in o una variabile obbligatoria (compresa `ASSEMBLYAI_API_KEY`) manca, il test viene saltato. Il collaudo usa un database e uno spazio temporaneo dedicati: verifica la durata letta da Bunny, la copertura fattuale, gli ID stabili su export ripetuti, un'anteprima pubblica idonea, l'assenza di dati transitori e i download autenticati JSON/Markdown/TXT. Un report malformato fa fallire il test. Questo singolo lavoro non prova la ripetibilità fra due analisi complete: quel confronto richiede due collaudi reali autorizzati sulla stessa revisione. Non usare `--showlocals`, debugger o registrazioni HTTP con credenziali reali. Il test non stampa URL, transcript, report o segreti e non effettua modifiche su Bunny. Lasciare `RUN_LIVE_BUNNY=0` al termine.
 
 Prima della messa online: eseguire la build Docker e il controllo FFmpeg sopra; provare prima un video breve e poi uno di almeno un'ora; verificare almeno dieci timestamp fra interventi, capitoli e slide; controllare presentatore, assenza del moderatore e due relatori. Provare annullamento e riavvio, aprire MD/TXT e controllare visivamente la stampa PDF. Registrare costo e durata del collaudo senza conservare contenuti sensibili nei log.
 

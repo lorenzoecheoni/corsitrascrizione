@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 import re
+import pytest
 from time import monotonic, sleep
 from types import SimpleNamespace
 
@@ -26,6 +27,147 @@ from app.transcription import TranscriptSegment, TranscriptWord, TranscriptionRe
 
 VIDEO_ID = "00000000-0000-0000-0000-000000000001"
 SOURCE = f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}"
+
+
+@pytest.mark.parametrize("mode", ["success", "signed", "fetch_failure", "bug",
+    "worker_fetch_bug", "worker_parse_bug", "worker_match_bug", "contract", "mutation",
+    "worker_fetch_missing", "worker_parse_missing", "worker_match_missing"])
+def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkeypatch, caplog, mode):
+    from app.materials import MaterialError, MaterialProcessor
+    from app.media import AudioChunk, FrameCandidate, MediaArtifacts
+    from app.models import AcademyContent, SlideChange
+    from test_materials import write_test_pptx
+
+    caplog.set_level("INFO")
+    workspace_root = tmp_path / "ephemeral"
+    workspace_root.mkdir()
+    database = tmp_path / "reports.sqlite3"
+    settings = Settings(bunny_library_id=123, bunny_stream_api_key="TEST_ONLY_BUNNY",
+        bunny_cdn_hostname="cdn.example.invalid", openai_api_key="TEST_ONLY_OPENAI",
+        app_password="TEST_ONLY_PASSWORD", temp_root=str(workspace_root),
+        database_path=str(database), _env_file=None)
+    content = AcademyContent.model_validate(_course_video_report("Corso materiali").model_dump(
+        exclude={"cost", "usage", "bunny_title"}))
+    content.audio_boundary_version = 1
+    content.slides = [SlideChange(timestamp_seconds=0, title="Decisioni assembleari", confidence="alta")]
+    def extract(url, workspace, progress, cancellation_event):
+        audio, frame = workspace / "audio.m4a", workspace / "frame.jpg"
+        audio.write_bytes(b"PRIVATE-MEDIA")
+        frame.write_bytes(b"PRIVATE-FRAME")
+        progress(600)
+        return MediaArtifacts([AudioChunk(audio, 0, 600)], [FrameCandidate(frame, 0)],
+            1024, silence_measured=True)
+    def analyze(metadata, transcript, frames, **options):
+        assert options["speaker_name_hints"] == ("Furio D'Andrea",)
+        assert frames[0].path.exists()
+        return content
+    monkeypatch.setattr(main, "FFmpegProcessor", lambda **kwargs: SimpleNamespace(extract=extract))
+    monkeypatch.setattr(main, "OpenAIAnalyzer", lambda client: SimpleNamespace(analyze=analyze))
+    monkeypatch.setattr(main, "OpenAITranscriber", lambda client: SimpleNamespace(
+        transcribe=lambda *args, **kwargs: TranscriptionResult(
+            text="PRIVATE-TRANSCRIPT", segments=[], audio_seconds=600)))
+    app = main.create_app(settings)
+    app.state.bunny.get_metadata = lambda video_id: BunnyVideoMetadata(video_id=video_id,
+        title="Corso materiali", duration_seconds=600, status=3, available_resolutions=[240])
+    app.state.bunny.select_hls_url = lambda metadata, **kwargs: "https://cdn.example.invalid/video"
+    fetches = []
+    source = "https://www.assoholding.it/furio.pptx" + ("?token=SIGNED-SECRET" if mode == "signed" else "")
+    course = InventoryCourse(id="0:2", foglio="Formazione", gid="0", posizione_foglio=0,
+        riga=2, titolo="Corso materiali", relatori_attesi=["Furio D'Andrea"],
+        materiali=["Slide · Furio D'Andrea | " + source], guid_esplicito=VIDEO_ID)
+    def inventory_fetch():
+        fetches.append(True)
+        return [course]
+    app.state.inventory.fetch = inventory_fetch
+    try:
+        assert isinstance(getattr(app.state.pipeline, "material_processor", None), MaterialProcessor)
+        assert app.state.pipeline.material_processor.allowed_hosts == ("www.assoholding.it",)
+        def fetch(url, workspace, allowed_hosts, cancellation_event):
+            assert url == source
+            deck = write_test_pptx(workspace / "private.pptx", [
+                ["PRIVATE-DECK-TEXT"], ["Decisioni assembleari"],
+            ])
+            if mode == "bug":
+                raise TypeError("PRIVATE-BUG-DIAGNOSTIC")
+            if mode == "fetch_failure":
+                raise MaterialError() from RuntimeError("PRIVATE-RESPONSE")
+            return deck
+        app.state.pipeline.material_processor.fetcher = fetch
+        if mode.startswith("worker_"):
+            import app.materials as module
+            original_worker = module._run_worker
+            def worker(stage, *args, **kwargs):
+                if stage == mode.split("_")[1]:
+                    if mode.endswith("_missing"):
+                        return
+                    raise TypeError("PRIVATE-WORKER-DIAGNOSTIC")
+                return original_worker(stage, *args, **kwargs)
+            monkeypatch.setattr(module, "_run_worker", worker)
+            if mode.startswith("worker_fetch_"):
+                app.state.pipeline.material_processor.fetcher = module.fetch_deck
+        if mode in {"contract", "mutation"}:
+            from app.materials import MaterialAnalysis
+            original_process = app.state.pipeline.material_processor.process
+            def process(sources, slides, workspace, cancellation_event):
+                result = original_process(sources, slides, workspace, cancellation_event)
+                if mode == "contract":
+                    result.slides[0].page = 999
+                else:
+                    slides[0].visible_content.append("PRIVATE-DECK-TEXT")
+                    slides[0].title = "PRIVATE-DECK-TEXT"
+                return MaterialAnalysis(result.materials, result.slides, result.failures)
+            app.state.pipeline.material_processor.process = process
+        with TestClient(app) as client:
+            client.post("/login", data={"username": "team", "password": settings.app_password})
+            preview = client.post("/preview", data={"source_url": SOURCE,
+                                                   "csrf_token": app.state.csrf_token})
+            confirmation = re.search(r'name="confirmation" value="([^"]+)"', preview.text)[1]
+            response = client.post("/jobs", data={"confirmation": confirmation,
+                "csrf_token": app.state.csrf_token}, follow_redirects=False)
+            assert response.status_code == 303
+            location = response.headers["location"]
+            deadline = monotonic() + 10
+            while monotonic() < deadline:
+                status = client.get("/api" + location).json()
+                if status["state"] in {"completed", "failed", "cancelled"}:
+                    break
+                sleep(.02)
+            assert fetches == [True]
+            if mode == "bug" or mode.startswith("worker_") or mode == "contract":
+                assert status["state"] == "failed" and status["report"] is None
+                assert status["progress"] < 100
+            else:
+                assert status["state"] == "completed" and status["progress"] == 100
+                report = AcademyReport.model_validate(status["report"])
+                assert report.cost.estimated_high_usd > 0
+                if mode in {"success", "mutation"}:
+                    assert report.materials[0].relatore == "Furio D'Andrea"
+                    assert report.materials[0].url == source
+                    assert report.slides[0].page == 2
+                    assert report.slides[0].title == "Decisioni assembleari"
+                    assert report.slides[0].visible_content == []
+                else:
+                    assert report.materials == []
+                    assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
+                    assert report.slides[0].page is None
+            assert list(workspace_root.iterdir()) == []
+            for private in ("PRIVATE-DECK-TEXT", "PRIVATE-BUG-DIAGNOSTIC", "PRIVATE-TRANSCRIPT",
+                            "PRIVATE-RESPONSE", "PRIVATE-WORKER-DIAGNOSTIC", "SIGNED-SECRET"):
+                assert private not in json.dumps(status) + caplog.text
+                assert private.encode() not in database.read_bytes()
+            from app.jobs import JobStore
+            from uuid import UUID
+            reopened = JobStore(str(database))
+            try:
+                persisted = reopened.get(UUID(location.rsplit("/", 1)[1]))
+                assert persisted.state.value == status["state"]
+                assert (persisted.report.model_dump() if persisted.report else None) == status["report"]
+            finally:
+                reopened._connection.close()
+    finally:
+        app.state.runner.shutdown()
+        app.state.store._connection.close()
+        app.state.openai.close()
 
 
 class OfflineOpenAI:
@@ -258,6 +400,11 @@ with pytest.MonkeyPatch.context() as patch:
 
 def _course_video_report(title):
     report = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    # The course tests construct a separate legacy timeline below.
+    report.analysis_profile = 1
+    report.audio_boundary_version = None
+    report.speech_blocks = []
+    report.boundaries = []
     report.title = title
     report.bunny_title = title
     report.duration_seconds = 600

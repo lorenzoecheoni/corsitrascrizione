@@ -1,7 +1,7 @@
 import json
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -15,6 +15,9 @@ from app.media import (
     SilenceInterval,
 )
 from app.models import AcademyContent, BoundaryEvidence, Intervention
+from app.material_registry import AnalysisInventoryContext, MaterialSourceFailure
+from app.materials import DeckPage, MaterialAnalysis, MaterialError, MaterialProcessor
+from app.models import ReportMaterial, SlideChange
 from app.pipeline import AnalysisPipeline, PipelineCancelled, PipelineError
 from app.transcription import (
     TranscriptSegment, TranscriptWord, TranscriptionError, TranscriptionResult,
@@ -31,6 +34,8 @@ def components(tmp_path):
                         app_password="team-secret", _env_file=None)
     data = json.loads(Path("tests/fixtures/report.json").read_text())
     data.pop("cost")
+    # This pipeline fixture supplies its own legacy, single-segment analysis.
+    data.update(analysis_profile=1, speech_blocks=[], boundaries=[])
     content = AcademyContent.model_validate(data)
     content.audio_boundary_version = 1
     metadata = BunnyVideoMetadata(video_id=UUID(int=1), title="Corso di prova", duration_seconds=3600,
@@ -91,12 +96,14 @@ def components(tmp_path):
             )],
         )
 
-    def analyze(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback):
+    def analyze(meta, transcript, frames, *, silence_intervals, cancellation_event, progress_callback,
+                speaker_name_hints=()):
         assert cancellation_event is state.event
         assert silence_intervals == []
         assert transcript.text == "private raw transcript"
         assert frames[0].path.exists()
         stage("analysis")
+        state.speaker_name_hints = speaker_name_hints
         progress_callback("slides", 2, 5)
         progress_callback("transcript", 7, 10)
         return content
@@ -105,6 +112,439 @@ def components(tmp_path):
                                       SimpleNamespace(extract=extract), SimpleNamespace(transcribe=transcribe),
                                       SimpleNamespace(analyze=analyze), temp_root=tmp_path)
     return state
+
+
+MATERIAL_SOURCE = "Slide Furio D’Andrea | https://www.assoholding.it/furio.pptx"
+
+
+def material_context(components, failures=()):
+    def context(metadata):
+        assert metadata is components.metadata
+        assert components.calls == ["metadata"]
+        components.calls.append("context")
+        return AnalysisInventoryContext(("Furio D'Andrea",), (MATERIAL_SOURCE,), failures)
+    components.pipeline.context_provider = context
+    components.content.slides = [SlideChange(
+        timestamp_seconds=0, title="Decisioni assembleari", confidence="alta",
+    )]
+
+
+def test_pipeline_materials_persist_verified_links_and_cleanup(components, tmp_path, caplog):
+    caplog.set_level("INFO")
+    material_context(components)
+    def fetch(url, workspace, allowed_hosts, cancellation_event):
+        assert components.calls[-1] == "analysis"
+        assert cancellation_event is components.event
+        assert workspace.is_relative_to(components.workspace)
+        deck = workspace / "furio.pptx"
+        deck.write_bytes(b"PRIVATE-DECK-BYTES")
+        return deck
+    components.pipeline.material_processor = MaterialProcessor(
+        fetcher=fetch,
+        extractor=lambda *args, **kwargs: [
+            DeckPage(1, "Poteri e responsabilità PRIVATE-DECK-TEXT"),
+            DeckPage(2, "Decisioni assembleari"),
+        ],
+    )
+    updates = []
+    report = components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert components.calls.count("context") == 1
+    assert components.speaker_name_hints == ("Furio D'Andrea",)
+    assert report.materials == [ReportMaterial(
+        titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
+        url="https://www.assoholding.it/furio.pptx", pagine=2,
+    )]
+    assert report.slides[0].material_title == "Slide · Furio D'Andrea"
+    assert report.slides[0].page == 2
+    assert report.material_failures == []
+    assert list(tmp_path.iterdir()) == []
+    assert updates == sorted(updates) and updates[-1] == 100
+    assert any(92 <= value < 98 for value in updates)
+    for private in ("PRIVATE-DECK", "Poteri e responsabilità", "SIGNED-SECRET", "PRIVATE",
+                    "private raw transcript", "Traceback"):
+        assert private not in report.model_dump_json() + caplog.text
+
+
+@pytest.mark.parametrize("failure_stage", ["fetch", "parse"])
+def test_pipeline_material_failure_nonfatal_and_safe(components, tmp_path, caplog, failure_stage):
+    caplog.set_level("INFO")
+    material_context(components)
+    def fail():
+        raise MaterialError() from RuntimeError("https://user:password@host/?secret RAW-RESPONSE")
+    def fetch(url, workspace, allowed_hosts, cancellation_event):
+        (workspace / "private.pptx").write_bytes(b"RAW-RESPONSE")
+        if failure_stage == "fetch":
+            fail()
+        return workspace / "private.pptx"
+    def extract(*args, **kwargs):
+        fail()
+    components.pipeline.material_processor = MaterialProcessor(fetcher=fetch, extractor=extract)
+    updates = []
+    report = components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert report.materials == []
+    assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
+    assert report.slides[0].page is None
+    assert updates[-1] == 100 and updates == sorted(updates)
+    assert list(tmp_path.iterdir()) == []
+    assert any(record.msg.get("phase") == "materials"
+               and record.msg.get("error_code") == "MATERIALE_NON_RAGGIUNGIBILE"
+               for record in caplog.records if isinstance(record.msg, dict))
+    for private in ("RAW-RESPONSE", "password", "SIGNED-SECRET", "Traceback"):
+        assert private not in report.model_dump_json() + caplog.text
+
+
+@pytest.mark.parametrize("signal", ["raise", "event"])
+def test_pipeline_cancels_inside_materials_and_cleans(components, tmp_path, signal):
+    material_context(components)
+    def process(sources, slides, workspace, cancellation_event):
+        (workspace / "private.pptx").write_bytes(b"private")
+        assert cancellation_event is components.event
+        if signal == "raise":
+            raise CancelledError()
+        cancellation_event.set()
+        return MaterialAnalysis((), tuple(slides), ())
+    components.pipeline.material_processor = SimpleNamespace(process=process)
+    updates = []
+    with pytest.raises(PipelineCancelled):
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert 100 not in updates
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_stage", ["processor", "fetcher", "extractor"])
+def test_pipeline_unexpected_material_error_fails_safely(components, tmp_path, caplog, failure_stage):
+    caplog.set_level("INFO")
+    material_context(components)
+    def fail(*args, **kwargs):
+        raise RuntimeError("PRIVATE-DECK-TEXT https://user:password@host/?SIGNED-SECRET")
+    def fetch(url, workspace, allowed_hosts, cancellation_event):
+        deck = workspace / "private.pptx"
+        deck.write_bytes(b"PRIVATE-DECK-TEXT")
+        if failure_stage == "fetcher":
+            fail()
+        return deck
+    components.pipeline.material_processor = (
+        SimpleNamespace(process=fail) if failure_stage == "processor"
+        else MaterialProcessor(fetcher=fetch, extractor=fail)
+    )
+    updates = []
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert caught.value.code == "temporary_failure"
+    assert 100 not in updates
+    assert list(tmp_path.iterdir()) == []
+    for private in ("PRIVATE-DECK-TEXT", "password", "SIGNED-SECRET", "Traceback"):
+        assert private not in str(caught.value) + caplog.text
+
+
+def test_pipeline_propagates_only_source_failure_codes(components, tmp_path):
+    material_context(components, (MaterialSourceFailure(
+        inventory_reference="PRIVATE-INVENTORY-REFERENCE", reason="dichiarazione_ambigua",
+    ),))
+    components.pipeline.material_processor = SimpleNamespace(process=lambda sources, slides, workspace,
+        cancellation_event: MaterialAnalysis((), tuple(slides), ()))
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
+    assert "PRIVATE-INVENTORY-REFERENCE" not in report.model_dump_json()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_pipeline_never_promotes_analyzer_material_claims(components):
+    components.content.materials = [ReportMaterial(titolo="Unverified", url="https://unverified.test/deck")]
+    components.content.material_failures = ["UNTRUSTED-RESPONSE"]
+    components.content.slides[0].page = 999
+    components.content.slides[0].material_title = "Unverified"
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert report.materials == [] and report.material_failures == []
+    assert all(slide.page is None and slide.material_title is None for slide in report.slides)
+
+
+@pytest.mark.parametrize("suffix", ["?token=SIGNED-SECRET", "#PRIVATE"])
+def test_pipeline_omits_sensitive_material_urls_without_inventing_public_url(components, suffix):
+    material_context(components)
+    components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (MATERIAL_SOURCE + suffix,))
+    material = ReportMaterial(titolo="Slide · Furio D'Andrea",
+        url="https://www.assoholding.it/furio.pptx" + suffix, pagine=2)
+    def process(sources, slides, workspace, cancellation_event):
+        return MaterialAnalysis((material,), tuple(slide.model_copy(update={
+            "material_title": material.titolo, "page": 2}) for slide in slides), ())
+    components.pipeline.material_processor = SimpleNamespace(process=process)
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert report.materials == []
+    assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
+    assert report.slides[0].material_title is None and report.slides[0].page is None
+    assert "SIGNED-SECRET" not in report.model_dump_json()
+    assert "furio.pptx" not in report.model_dump_json()
+
+
+def test_pipeline_context_constructor_and_inventory_outage(components):
+    from app.inventory import InventoryError
+    def unavailable(metadata):
+        components.calls.append("context")
+        raise InventoryError("PRIVATE-INVENTORY-RESPONSE")
+    old = components.pipeline
+    pipeline = AnalysisPipeline(old.settings, old.bunny, old.media, old.transcriber, old.analyzer,
+        context_provider=unavailable, material_processor=MaterialProcessor(), temp_root=old.temp_root)
+    report = pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert components.calls.count("context") == 1
+    assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
+    assert "PRIVATE-INVENTORY-RESPONSE" not in report.model_dump_json()
+
+
+@pytest.mark.parametrize("mode", ["fetch", "parse", "match"])
+def test_internal_worker_typeerror_fails_pipeline_and_cleans(components, tmp_path, monkeypatch, caplog, mode):
+    import app.materials as module
+    from test_materials import write_test_pptx
+    caplog.set_level("INFO")
+    material_context(components)
+    def worker(stage, source, output, **options):
+        if stage == mode:
+            raise TypeError("PRIVATE-WORKER-ERROR https://user:secret@host/?token")
+        if stage == "fetch":
+            write_test_pptx(output, [["Decisioni assembleari"]])
+        elif stage == "parse":
+            output.write_text('[{"number": 1, "text": "Decisioni assembleari"}]')
+        else:
+            raise AssertionError("unexpected worker phase")
+    monkeypatch.setattr(module, "_run_worker", worker)
+    components.pipeline.material_processor = MaterialProcessor()
+    updates = []
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert caught.value.code == "temporary_failure"
+    assert 100 not in updates and list(tmp_path.iterdir()) == []
+    assert "PRIVATE-WORKER-ERROR" not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("mode", ["parse", "match"])
+def test_invalid_worker_success_payload_is_internal_failure(components, tmp_path, monkeypatch, mode):
+    import app.materials as module
+    from test_materials import write_test_pptx
+    material_context(components)
+    def worker(stage, source, output, **options):
+        if stage == "fetch":
+            write_test_pptx(output, [["Decisioni assembleari"]])
+        elif stage == "parse":
+            output.write_text(json.dumps([{"number": 0 if mode == "parse" else 1,
+                                           "text": "Decisioni assembleari"}]))
+        else:
+            output.write_text(json.dumps([["Slide · Furio D'Andrea", 999]]))
+    monkeypatch.setattr(module, "_run_worker", worker)
+    components.pipeline.material_processor = MaterialProcessor()
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert caught.value.code == "temporary_failure"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", ["fetch", "parse", "match", "connection_valueerror"])
+def test_missing_worker_output_and_downloader_bug_fail_job_safely(components, tmp_path, monkeypatch, caplog, mode):
+    import app.materials as module
+    from test_materials import write_test_pptx, dns
+    caplog.set_level("INFO")
+    material_context(components)
+    def connection(*args, **kwargs):
+        raise ValueError("PRIVATE-INTERNAL-CONNECTION-BUG")
+    def worker(stage, source, output, **kwargs):
+        if stage == mode:
+            return
+        if stage == "fetch":
+            if mode == "connection_valueerror":
+                module._download_https(source, output, ("www.assoholding.it",),
+                                       resolver=dns, connection_factory=connection)
+            else:
+                write_test_pptx(output, [["Decisioni assembleari"]])
+        elif stage == "parse":
+            output.write_text('[{"number":1,"text":"Decisioni assembleari"}]')
+        else:
+            raise AssertionError("unexpected worker phase")
+    monkeypatch.setattr(module, "_run_worker", worker)
+    components.pipeline.material_processor = MaterialProcessor()
+    updates = []
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert caught.value.code == "temporary_failure"
+    assert list(tmp_path.iterdir()) == [] and 100 not in updates
+    assert "PRIVATE-INTERNAL-CONNECTION-BUG" not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("mutation", ["scalars", "nested"])
+def test_material_processor_cannot_mutate_slide_observations(components, mutation):
+    material_context(components)
+    components.content.slides[0].visible_content = ["Observed content"]
+    original = components.content.slides[0].model_dump()
+    def process(sources, slides, workspace, cancellation_event):
+        if mutation == "scalars":
+            slides[0].title = "PRIVATE-DECK-TEXT"
+            slides[0].timestamp_seconds = 777
+            slides[0].confidence = "bassa"
+        else:
+            slides[0].visible_content.append("PRIVATE-DECK-TEXT")
+        material = ReportMaterial(titolo="Slide · Furio D'Andrea",
+            url="https://www.assoholding.it/furio.pptx", pagine=2)
+        slides[0].material_title, slides[0].page = material.titolo, 2
+        return MaterialAnalysis((material,), tuple(slides), ())
+    components.pipeline.material_processor = SimpleNamespace(process=process)
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert report.slides[0].model_dump(exclude={"material_title", "page"}) == {
+        key: value for key, value in original.items() if key not in {"material_title", "page"}}
+    assert components.content.slides[0].model_dump() == original
+    assert report.slides[0].page == 2
+    assert "PRIVATE-DECK-TEXT" not in report.model_dump_json()
+
+
+@pytest.mark.parametrize("violation", [
+    "absent_source", "outside_url", "workspace_file", "undeclared_file", "page_out_of_range",
+    "bool_page", "float_page", "missing_pages", "missing_material", "unknown_title",
+    "title_without_page", "page_without_title", "duplicate_title_ref", "invented_public_url",
+    "declared_disallowed_host", "duplicate_sensitive_ref", "sensitive_bad_page", "bool_pages",
+])
+def test_processor_contract_violations_fail_safely(components, tmp_path, caplog, violation):
+    caplog.set_level("INFO")
+    material_context(components)
+    if violation == "invented_public_url":
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (MATERIAL_SOURCE + "?token=PRIVATE",))
+    if violation in {"declared_disallowed_host", "sensitive_bad_page"}:
+        source = ("Slide · Furio D'Andrea | https://outside.test/PRIVATE.pptx"
+                  if violation == "declared_disallowed_host" else MATERIAL_SOURCE + "?token=PRIVATE")
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (source,))
+    if violation == "duplicate_title_ref":
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (
+            MATERIAL_SOURCE, "Slide · Furio D'Andrea | https://www.assoholding.it/second.pptx"))
+    if violation == "duplicate_sensitive_ref":
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (
+            MATERIAL_SOURCE, MATERIAL_SOURCE + "?token=PRIVATE"))
+    def process(sources, slides, workspace, cancellation_event):
+        deck = workspace / "PRIVATE-DECK.pptx"
+        deck.write_bytes(b"PRIVATE-DECK-TEXT")
+        material = ReportMaterial(titolo="Slide · Furio D'Andrea",
+            url="https://www.assoholding.it/furio.pptx", pagine=2)
+        updates = {
+            "absent_source": {"url": None},
+            "outside_url": {"url": "https://outside.test/PRIVATE.pptx"},
+            "workspace_file": {"url": None, "file": str(deck)},
+            "undeclared_file": {"url": None, "file": "/PRIVATE/undeclared.pptx"},
+            "missing_pages": {"pagine": None},
+            "bool_pages": {"pagine": True},
+            "declared_disallowed_host": {"url": "https://outside.test/PRIVATE.pptx"},
+            "sensitive_bad_page": {"url": "https://www.assoholding.it/furio.pptx?token=PRIVATE"},
+        }
+        material = material.model_copy(update=updates.get(violation, {}))
+        materials = (material,)
+        slide = slides[0].model_copy(update={"material_title": material.titolo, "page": 2})
+        if violation in {"page_out_of_range", "sensitive_bad_page"}:
+            slide.page = 999
+        elif violation == "bool_page":
+            slide.page = True
+        elif violation == "bool_pages":
+            slide.page = 1
+        elif violation == "float_page":
+            slide.page = 1.5
+        elif violation == "missing_material":
+            materials = ()
+        elif violation == "unknown_title":
+            slide.material_title = "PRIVATE-UNKNOWN"
+        elif violation == "title_without_page":
+            slide.page = None
+        elif violation == "page_without_title":
+            slide.material_title = None
+        elif violation == "duplicate_title_ref":
+            materials += (material.model_copy(update={"url": "https://www.assoholding.it/second.pptx"}),)
+        elif violation == "duplicate_sensitive_ref":
+            materials += (material.model_copy(update={"url": material.url + "?token=PRIVATE"}),)
+        return MaterialAnalysis(materials, (slide,), ())
+    components.pipeline.material_processor = SimpleNamespace(process=process)
+    updates = []
+    with pytest.raises(PipelineError) as caught:
+        components.pipeline.run(SOURCE, lambda p, m: updates.append(p), components.event)
+    assert caught.value.code == "temporary_failure"
+    assert list(tmp_path.iterdir()) == [] and 100 not in updates
+    assert "PRIVATE" not in str(caught.value) + caplog.text
+
+
+def test_processor_contract_rejects_even_declared_workspace_files(tmp_path):
+    from app.pipeline import _verified_material_result
+    from app.materials import MaterialInternalError
+    source = tmp_path / "private.pptx"
+    source.write_bytes(b"private deck")
+    material = ReportMaterial(titolo="private", file=str(source), pagine=1)
+    context = AnalysisInventoryContext((), (str(source),))
+    with pytest.raises(MaterialInternalError, match="^MATERIAL_INTERNAL_ERROR$"):
+        _verified_material_result(context, MaterialAnalysis((material,), (), ()), (), tmp_path,
+                                  ("www.assoholding.it",))
+
+
+def test_pipeline_accepts_exact_declared_external_file_and_preserves_source(components, tmp_path):
+    from tempfile import TemporaryDirectory
+    from test_materials import write_test_pptx
+    # A persisted local source must be an archive, outside OS scratch roots.
+    with TemporaryDirectory(prefix="durable-archive-", dir=Path.cwd()) as archive:
+        source = write_test_pptx(Path(archive) / "declared.pptx", [["Decisioni assembleari"]])
+        material_context(components)
+        components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (str(source),))
+        components.pipeline.material_processor = MaterialProcessor()
+        report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+        assert report.materials == [ReportMaterial(titolo="declared", file=str(source), pagine=1)]
+        assert report.slides[0].material_title == "declared" and report.slides[0].page == 1
+        assert source.is_file() and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("error", [CancelledError(), TypeError("PRIVATE-CONTEXT")])
+def test_pipeline_context_cancellation_and_programming_error_are_not_swallowed(components, tmp_path, error):
+    def context(metadata):
+        components.calls.append("context")
+        raise error
+    components.pipeline.context_provider = context
+    expected = PipelineCancelled if isinstance(error, CancelledError) else PipelineError
+    with pytest.raises(expected) as caught:
+        components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert components.calls == ["metadata", "context"]
+    assert list(tmp_path.iterdir()) == []
+    assert "PRIVATE-CONTEXT" not in str(caught.value)
+
+
+def test_concurrent_material_jobs_keep_context_progress_and_cancellation_isolated(components, tmp_path):
+    pipeline = components.pipeline
+    pipeline.bunny.get_metadata = lambda video_id: components.metadata.model_copy(update={"video_id": UUID(video_id)})
+    pipeline.bunny.select_hls_url = lambda *args, **kwargs: "https://cdn.example.com/video"
+    def extract(url, workspace, progress, cancellation_event):
+        frame = workspace / "frame.jpg"
+        frame.write_bytes(b"private")
+        progress(3600)
+        return MediaArtifacts([], [FrameCandidate(frame, 0)], 100, silence_measured=True)
+    pipeline.media.extract = extract
+    pipeline.transcriber.transcribe = lambda *args, **kwargs: TranscriptionResult(
+        text="private", audio_seconds=3600, segments=[])
+    pipeline.analyzer.analyze = lambda *args, **kwargs: components.content.model_copy(deep=True)
+    pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (
+        f"{metadata.video_id} | https://www.assoholding.it/{metadata.video_id}.pptx",))
+    barrier = Barrier(2)
+    first, second = Event(), Event()
+    seen_workspaces = []
+    def process(sources, slides, workspace, cancellation_event):
+        seen_workspaces.append(workspace)
+        (workspace / "private.pptx").write_bytes(b"private")
+        barrier.wait(timeout=3)
+        if cancellation_event is first:
+            cancellation_event.set()
+        title, url = sources[0].split(" | ")
+        return MaterialAnalysis((ReportMaterial(titolo=title, pagine=1,
+            url=url),), tuple(slides), ())
+    pipeline.material_processor = SimpleNamespace(process=process)
+    first_updates, second_updates = [], []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        cancelled = executor.submit(pipeline.run, SOURCE, lambda p, m: first_updates.append(p), first)
+        completed = executor.submit(pipeline.run, SOURCE.replace(str(UUID(int=1)), str(UUID(int=2))),
+            lambda p, m: second_updates.append(p), second)
+        with pytest.raises(PipelineCancelled):
+            cancelled.result(timeout=5)
+        report = completed.result(timeout=5)
+    assert report.materials[0].titolo == str(UUID(int=2))
+    assert len(set(seen_workspaces)) == 2
+    assert first_updates == sorted(first_updates) and 100 not in first_updates
+    assert second_updates == sorted(second_updates) and second_updates[-1] == 100
+    assert not second.is_set()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_pipeline_cleans_media_and_reports_monotonic_stage_progress(components, tmp_path):

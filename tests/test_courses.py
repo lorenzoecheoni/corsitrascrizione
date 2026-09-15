@@ -30,6 +30,8 @@ def stored_course():
 
 def report(title, duration, *, generic=False, speaker=True):
     data = json.loads(Path("tests/fixtures/report.json").read_text())
+    # Multi-video course assembly exercises the established flat contract.
+    data.update(analysis_profile=1, audio_boundary_version=None, speech_blocks=[], boundaries=[])
     data["title"] = title
     data["bunny_title"] = title
     data["duration_seconds"] = duration
@@ -107,6 +109,11 @@ def test_unknown_speaker_is_omitted_and_creates_critical_verification(tmp_path):
 
 def test_legacy_report_without_interventions_requires_reanalysis(tmp_path):
     legacy = AcademyReport.model_validate_json(Path("tests/fixtures/report.json").read_text())
+    legacy.analysis_profile = 1
+    legacy.audio_boundary_version = None
+    legacy.interventions = []
+    legacy.speech_blocks = []
+    legacy.boundaries = []
     store, jobs = completed_jobs(tmp_path, [legacy])
 
     with pytest.raises(CourseAssemblyError, match="rianalizzato"):

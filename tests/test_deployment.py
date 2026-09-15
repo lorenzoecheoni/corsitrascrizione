@@ -58,7 +58,7 @@ def test_assemblyai_is_optional_eu_fast_path_and_secret_is_not_represented():
     try:
         assert services.assemblyai is not None
         assert services.pipeline.fast_transcriber is services.assemblyai
-        assert services.pipeline.speaker_hint_provider is not None
+        assert services.pipeline.context_provider is services.inventory_context_provider
         assert "assembly-secret" not in repr(settings)
     finally:
         services.runner.shutdown(wait=True)

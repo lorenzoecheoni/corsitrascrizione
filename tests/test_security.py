@@ -94,7 +94,7 @@ def failing_pipeline(settings, sentinels, tmp_path, phase):
             )],
         ))),
         SimpleNamespace(analyze=stage("analysis", SimpleNamespace(
-            model_dump=lambda: {"title": sentinels.transcript}))), temp_root=tmp_path,
+            slides=[], model_dump=lambda **kwargs: {"title": sentinels.transcript}))), temp_root=tmp_path,
     )
 
 

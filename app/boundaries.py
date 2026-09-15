@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 import math
 
 from app.media import SilenceInterval
-from app.models import AcademyContent, BoundaryEvidence, Intervention, InterventionKind
+from app.models import (
+    AcademyContent, BoundaryEvidence, BoundaryReason, ChapterBoundaryOrigin,
+    Intervention, InterventionKind, SpeechBlock,
+)
 from app.transcription import TranscriptSegment, TranscriptWord
 
 
@@ -18,12 +21,30 @@ class SemanticIntervention:
     punti_chiave: tuple[str, ...]
     confidenza: float
     segments: tuple[TranscriptSegment, ...] = field(repr=False)
+    block_id: str | None = None
+    chapter_number: int | None = None
+    chapters_in_block: int | None = None
+    boundary_reason: BoundaryReason = "cambio_tema"
+    slide_hint_seconds: float | None = None
+    long: bool = False
+
+    @property
+    def raw_duration(self) -> float:
+        start, end = _speech_extent(_group_words(self))
+        return end - start
 
 
 @dataclass(frozen=True)
 class BoundaryAlignment:
     interventions: list[Intervention]
     boundaries: list[BoundaryEvidence]
+    blocks: list[SpeechBlock] = field(default_factory=list)
+
+
+def bunny_end_second(duration_seconds: float) -> int:
+    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        raise ValueError("Durata Bunny non valida")
+    return math.floor(duration_seconds)
 
 
 def nearest_second(value: float) -> int:
@@ -87,12 +108,51 @@ def _pause_group() -> SemanticIntervention:
     )
 
 
-def _intervention(index: int, group: SemanticIntervention, start: int, end: int) -> Intervention:
+def _intervention(index: int, group: SemanticIntervention, start: int, end: int,
+                  rule: str) -> Intervention:
     return Intervention(
         id=f"i{index:03d}", start_seconds=start, end_seconds=end,
         tipo=group.tipo, relatori=list(group.relatori), titolo=group.titolo,
         sintesi=group.sintesi, punti_chiave=list(group.punti_chiave), confidenza=group.confidenza,
+        block_id=group.block_id, chapter_number=group.chapter_number,
+        chapters_in_block=group.chapters_in_block,
+        boundary_origin=ChapterBoundaryOrigin(
+            motivo_editoriale=group.boundary_reason, regola_audio=rule,
+            slide_indizio_seconds=group.slide_hint_seconds,
+        ) if group.block_id is not None else None,
     )
+
+
+def _aligned_blocks(interventions: Sequence[Intervention]) -> list[SpeechBlock]:
+    children: dict[str, list[Intervention]] = {}
+    for index, item in enumerate(interventions):
+        if item.block_id is None:
+            if item.chapter_number is not None or item.chapters_in_block is not None:
+                raise ValueError("La partizione dei blocchi non è valida")
+            continue
+        if (not item.block_id.strip() or item.tipo in {"pausa", "logistica"}
+                or (item.block_id in children
+                    and interventions[index - 1].block_id != item.block_id)):
+            raise ValueError("La partizione dei blocchi non è valida")
+        children.setdefault(item.block_id, []).append(item)
+    blocks = []
+    for block_id, chapters in children.items():
+        if (any(chapter.chapter_number != index + 1
+                or chapter.chapters_in_block != len(chapters)
+                or chapter.tipo != chapters[0].tipo
+                for index, chapter in enumerate(chapters))
+                or any(left.end_seconds != right.start_seconds
+                       for left, right in zip(chapters, chapters[1:]))):
+            raise ValueError("La partizione dei blocchi non è valida")
+        longest = max(chapters, key=lambda chapter: chapter.end_seconds - chapter.start_seconds)
+        blocks.append(SpeechBlock(
+            id=block_id, start_seconds=chapters[0].start_seconds,
+            end_seconds=chapters[-1].end_seconds, tipo=chapters[0].tipo,
+            relatori=list(dict.fromkeys(name for chapter in chapters for name in chapter.relatori)),
+            titolo=longest.titolo,
+            sinossi=" ".join(dict.fromkeys(chapter.sintesi for chapter in chapters)),
+        ))
+    return blocks
 
 
 def _evidence(previous: Intervention, following: Intervention, before: Sequence[TranscriptWord],
@@ -147,7 +207,20 @@ def has_complete_boundary_evidence(report: AcademyContent) -> bool:
         return False
     if not math.isfinite(report.duration_seconds) or report.duration_seconds <= 0:
         return False
-    return _complete(report.interventions, report.boundaries, nearest_second(report.duration_seconds))
+    duration = bunny_end_second(report.duration_seconds)
+    # Legacy reports retain their established export eligibility. Strict new
+    # slide/block provenance bounds apply to granular analysis results only.
+    if report.analysis_profile == 2:
+        if any(slide.timestamp_seconds > duration for slide in report.slides):
+            return False
+        if any(block.end_seconds > duration for block in report.speech_blocks):
+            return False
+        if any(item.boundary_origin is not None
+               and item.boundary_origin.slide_indizio_seconds is not None
+               and item.boundary_origin.slide_indizio_seconds > duration
+               for item in report.interventions):
+            return False
+    return _complete(report.interventions, report.boundaries, duration)
 
 
 def align_intervention_boundaries(
@@ -157,7 +230,7 @@ def align_intervention_boundaries(
 ) -> BoundaryAlignment:
     if not math.isfinite(duration_seconds) or duration_seconds <= 0 or not semantic_groups:
         raise ValueError("La partizione degli interventi non è valida")
-    duration = nearest_second(duration_seconds)
+    duration = bunny_end_second(duration_seconds)
     if duration <= 0:
         raise ValueError("La partizione richiede almeno un secondo")
 
@@ -170,13 +243,27 @@ def align_intervention_boundaries(
         # and only by one second. Internal groups stay strictly bounded so no
         # generated cut can land outside the actual video. The terminal group
         # must still contain speech before Bunny's end even though its final
-        # word may extend into the accepted provider rounding second.
+        # words may begin and end inside the accepted provider rounding second.
+        group_start_limit = duration_seconds if is_terminal_group else duration
         if (
             speech_start >= speech_end
-            or speech_start >= duration_seconds
-            or speech_end > duration_seconds + (1 if is_terminal_group else 0)
+            or speech_start >= group_start_limit
+            or speech_end > (duration_seconds + 1 if is_terminal_group else duration)
+            or (not is_terminal_group
+                and any(word.start_seconds >= duration for word in words[index]))
         ):
             raise ValueError("La partizione contiene tempi vocali non validi")
+        # Keep the provider's original words untouched. Only the effective
+        # terminal extent is limited to Bunny's authoritative whole-second end.
+        if is_terminal_group:
+            effective_end = min(speech_end, duration)
+            if speech_start >= effective_end:
+                raise ValueError("La partizione contiene tempi vocali non validi")
+            extents[index] = (speech_start, effective_end)
+        if (group.slide_hint_seconds is not None
+                and (not math.isfinite(group.slide_hint_seconds)
+                     or not 0 <= group.slide_hint_seconds <= duration)):
+            raise ValueError("La partizione contiene un indizio slide fuori durata")
 
     final_groups = [semantic_groups[0]]
     final_words = [words[0]]
@@ -203,12 +290,17 @@ def align_intervention_boundaries(
                 )
         silence = _matching_silence(previous_end, next_start, silence_intervals)
         rule = "no_pause" if silence is None else "short_pause"
-        candidate = previous_end if silence is None else (silence.start_seconds + silence.end_seconds) / 2
+        candidate = previous_end if silence is None else previous_end + (
+            silence.end_seconds - silence.start_seconds
+        ) / 2
         if silence is not None and silence.end_seconds - silence.start_seconds >= 2:
             rule = "long_pause"
             left = _whole_second(previous_end + 1, lower, upper, silence)
             right = _whole_second(next_start - 1, lower, upper, silence)
-            if right - left >= 1 and semantic_groups[index].tipo != "pausa" and semantic_groups[index + 1].tipo != "pausa":
+            candidate = left
+            same_block = (semantic_groups[index].block_id is not None
+                          and semantic_groups[index].block_id == semantic_groups[index + 1].block_id)
+            if right - left >= 1 and not same_block:
                 cuts.append(left)
                 rules.append(rule)
                 final_groups.append(_pause_group())
@@ -221,7 +313,8 @@ def align_intervention_boundaries(
 
     endpoints = [0, *cuts, duration]
     interventions = [
-        _intervention(index + 1, group, endpoints[index], endpoints[index + 1])
+        _intervention(index + 1, group, endpoints[index], endpoints[index + 1],
+                      rules[index - 1] if index else "no_pause")
         for index, group in enumerate(final_groups)
     ]
     boundaries = [
@@ -230,4 +323,5 @@ def align_intervention_boundaries(
     ]
     if not _complete(interventions, boundaries, duration):
         raise ValueError("La partizione non ha confini adiacenti con prova completa")
-    return BoundaryAlignment(interventions=interventions, boundaries=boundaries)
+    return BoundaryAlignment(interventions=interventions, boundaries=boundaries,
+                             blocks=_aligned_blocks(interventions))

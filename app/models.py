@@ -1,3 +1,4 @@
+import math
 import re
 from typing import Annotated, Literal
 
@@ -12,6 +13,9 @@ Counter = Annotated[int, Field(ge=0, strict=True)]
 UnitConfidence = Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
 InterventionKind = Literal[
     "intervento", "saluti", "logistica", "domande", "pausa", "cambio_relatore"
+]
+BoundaryReason = Literal[
+    "inizio_blocco", "cambio_tema", "slide_e_tema", "cambio_relatore"
 ]
 GENERIC_INTERVENTION_SPEAKER = re.compile(
     r"^(?:relatore|speaker)(?:[\s_-]*\d+)?$", re.IGNORECASE
@@ -73,6 +77,44 @@ class SlideChange(ReportModel):
     title: str | None = None
     visible_content: list[str] = Field(default_factory=list)
     confidence: Confidence
+    material_title: str | None = None
+    page: int | None = Field(default=None, ge=1)
+
+
+class ChapterBoundaryOrigin(ReportModel):
+    motivo_editoriale: BoundaryReason
+    regola_audio: Literal["long_pause", "short_pause", "no_pause"]
+    slide_indizio_seconds: Nonnegative | None = None
+
+
+class SpeechBlock(ReportModel):
+    id: str
+    start_seconds: Nonnegative
+    end_seconds: Nonnegative
+    tipo: InterventionKind
+    relatori: list[str] = Field(default_factory=list)
+    titolo: str
+    sinossi: str
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> "SpeechBlock":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("fine deve essere successiva a inizio")
+        return self
+
+
+class ReportMaterial(ReportModel):
+    titolo: str
+    relatore: str | None = None
+    url: str | None = None
+    file: str | None = None
+    pagine: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> "ReportMaterial":
+        if (self.url is None) == (self.file is None):
+            raise ValueError("un materiale richiede esattamente una sorgente")
+        return self
 
 
 class Intervention(ReportModel):
@@ -91,6 +133,10 @@ class Intervention(ReportModel):
     sintesi: str
     punti_chiave: list[str] = Field(default_factory=list)
     confidenza: UnitConfidence
+    block_id: str | None = None
+    chapter_number: int | None = Field(default=None, ge=1)
+    chapters_in_block: int | None = Field(default=None, ge=1)
+    boundary_origin: ChapterBoundaryOrigin | None = None
 
     @field_validator("start_seconds", "end_seconds", mode="before")
     @classmethod
@@ -228,6 +274,10 @@ class AcademyContent(ReportModel):
     uncertainties: list[str]
     interventions: list[Intervention] = Field(default_factory=list)
     boundaries: list[BoundaryEvidence] = Field(default_factory=list)
+    speech_blocks: list[SpeechBlock] = Field(default_factory=list)
+    materials: list[ReportMaterial] = Field(default_factory=list)
+    material_failures: list[str] = Field(default_factory=list)
+    analysis_profile: Literal[1, 2] = 1
     # Application-owned provenance; old stored JSON has no audio verification.
     audio_boundary_version: Annotated[int, Field(strict=True, ge=1, le=1)] | None = None
 
@@ -241,3 +291,39 @@ class AcademyReport(AcademyContent):
 class AnalysisResult(AcademyContent):
     """Application-owned usage, added after the strict AcademyContent parse."""
     usage: ProviderUsage = Field(default_factory=ProviderUsage)
+
+    @model_validator(mode="after")
+    def validate_granular_provenance(self) -> "AnalysisResult":
+        if self.analysis_profile != 2:
+            return self
+        if self.audio_boundary_version != 1:
+            raise ValueError("Il report granulare richiede provenienza audio")
+        duration = math.floor(self.duration_seconds)
+        blocks = {block.id: block for block in self.speech_blocks}
+        if len(blocks) != len(self.speech_blocks) or any(not block_id.strip() for block_id in blocks):
+            raise ValueError("I blocchi richiedono identificativi unici e non vuoti")
+        children: dict[str, list[Intervention]] = {}
+        for index, chapter in enumerate(self.interventions):
+            if chapter.tipo in {"pausa", "logistica"}:
+                if any(value is not None for value in (chapter.block_id, chapter.chapter_number,
+                        chapter.chapters_in_block, chapter.boundary_origin)):
+                    raise ValueError("Pause e logistica non appartengono ai blocchi")
+                continue
+            if (chapter.block_id not in blocks or chapter.boundary_origin is None
+                    or (chapter.block_id in children
+                        and self.interventions[index - 1].block_id != chapter.block_id)):
+                raise ValueError("Ogni capitolo richiede un blocco contiguo e origine del confine")
+            children.setdefault(chapter.block_id, []).append(chapter)
+        if list(children) != list(blocks):
+            raise ValueError("Ogni blocco richiede capitoli ordinati")
+        for block_id, block in blocks.items():
+            chapters = children[block_id]
+            if (not 0 <= block.start_seconds < block.end_seconds <= duration
+                    or block.start_seconds != chapters[0].start_seconds
+                    or block.end_seconds != chapters[-1].end_seconds
+                    or any(chapter.chapter_number != number or chapter.chapters_in_block != len(chapters)
+                           or chapter.tipo != block.tipo for number, chapter in enumerate(chapters, 1))
+                    or any(left.end_seconds != right.start_seconds
+                           for left, right in zip(chapters, chapters[1:]))):
+                raise ValueError("I capitoli devono coprire il blocco senza lacune o sovrapposizioni")
+        return self

@@ -116,17 +116,197 @@ def window_result(segment_indexes=None, diarization_labels=None):
     }
 
 
+def test_analyzer_plans_every_window_with_all_classified_slides(inputs, content, monkeypatch):
+    from app import chapters
+    from app.models import SlideChange
+
+    inputs["metadata"].duration_seconds = content["duration_seconds"] = 1100.75
+    inputs["frames"] = []
+    inputs["transcription"].segments = [TranscriptSegment(
+        start_seconds=start, end_seconds=end, diarization_label="chunk-0:A",
+        source_utterance_id=f"u-{index}", text=f"Tema {index}",
+        words=[TranscriptWord(text=f"Tema-{index}.", start_seconds=start, end_seconds=end,
+                              diarization_label="chunk-0:A", confidence=.99)],
+    ) for index, (start, end) in enumerate([(0, 540), (541, 1080), (1081, 1100.7)])]
+    slides = [SlideChange(timestamp_seconds=time, title=title, confidence="alta")
+              for time, title in [(0, "Premesse"), (541, "Controlli"), (1099, "Fine")]]
+    monkeypatch.setattr(OpenAIAnalyzer, "_classify_slides", lambda *args, **kwargs: (slides, 0))
+    seen = []
+    original = chapters.plan_semantic_timeline
+
+    def observe(groups, slides):
+        seen.append((groups, slides))
+        return original(groups, slides)
+
+    # Observe the real planner, keeping planning and audio alignment active.
+    monkeypatch.setattr(chapters, "plan_semantic_timeline", observe)
+    monkeypatch.setattr("app.analysis_chunks.plan_semantic_timeline", observe, raising=False)
+
+    def respond(call):
+        if call["text_format"] is ConsolidatedTextReport:
+            return SimpleNamespace(output_parsed=content)
+        payload = json.loads(call["input"])
+        data = window_result()
+        data["interventions"] = [dict(window_result()["interventions"][0],
+                                      segment_indexes=[item["segment_index"]],
+                                      titolo=f"Tema {item['source_utterance_id']}",
+                                      confine_motivo="cambio_tema") for item in payload["segments"]]
+        data["previous_continuity"] = "separate" if payload.get("previous_context") else None
+        return SimpleNamespace(output_parsed=data)
+
+    client = FakeClient(*([respond] * 5))
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert len(seen) == 1
+    assert [segment.source_utterance_id for group in seen[0][0] for segment in group.segments] == [
+        "u-0", "u-1", "u-2",
+    ]
+    assert [slide.timestamp_seconds for slide in seen[0][1]] == [0, 541, 1099]
+    assert result.analysis_profile == 2
+    assert result.duration_seconds == 1100.75
+    assert [(block.id, block.start_seconds, block.end_seconds) for block in result.speech_blocks] == [
+        ("b001", 0, 1100),
+    ]
+    assert [(chapter.block_id, chapter.chapter_number, chapter.chapters_in_block,
+             chapter.start_seconds, chapter.end_seconds) for chapter in result.interventions] == [
+        ("b001", 1, 2, 0, 540), ("b001", 2, 2, 540, 1100),
+    ]
+    assert result.interventions[1].boundary_origin.motivo_editoriale == "slide_e_tema"
+    assert result.interventions[1].boundary_origin.slide_indizio_seconds == 541
+    assert "source_utterance_id" not in result.model_dump_json()
+    repeated = OpenAIAnalyzer(FakeClient(*([respond] * 5))).analyze(**inputs)
+    assert repeated.model_dump() == result.model_dump()
+
+
+@pytest.mark.parametrize("invalid_fields", [
+    {"punti_chiave": ["PRIVATE-POINT", "PRIVATE-POINT", "Terzo"]},
+    {"confine_motivo": "slide_e_tema", "slide_indizio_seconds": 79},
+    {"confine_motivo": "cambio_tema", "slide_indizio_seconds": 2},
+    {"confine_motivo": "slide_e_tema", "slide_indizio_seconds": None},
+])
+def test_invalid_theme_evidence_regenerates_original_window_before_planning(
+    inputs, content, invalid_fields, caplog,
+):
+    invalid = window_result()
+    invalid["interventions"][0].update(invalid_fields)
+    client = FakeClient(visual("slide", "camera_change", "uncertain"), invalid,
+                        window_result(), content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    windows = [call for call in client.calls if call["text_format"] is WindowAnalysis]
+    assert len(windows) == 2
+    assert windows[1]["input"] == windows[0]["input"]
+    assert windows[1]["instructions"] == WINDOW_PROMPT
+    assert result.interventions[0].punti_chiave == ["Preparazione", "Pubblicazione", "Controllo"]
+    assert "PRIVATE-POINT" not in result.model_dump_json() + caplog.text
+
+
+def test_valid_window_slide_reference_is_accepted_without_retry(inputs, content):
+    data = window_result()
+    data["interventions"][0].update(confine_motivo="slide_e_tema", slide_indizio_seconds=2)
+    client = FakeClient(visual("slide", "camera_change", "uncertain"), data, content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert len(client.calls) == 3
+    assert json.loads(client.calls[1]["input"])["slide_hints"] == [
+        {"timestamp_seconds": 2, "title": "Frame 0"},
+    ]
+    assert result.interventions[0].boundary_origin.slide_indizio_seconds == 2
+
+
+def test_window_provider_schema_requires_editorial_fields_without_wire_defaults():
+    from openai.lib._pydantic import to_strict_json_schema
+
+    schema = to_strict_json_schema(WindowAnalysis)["$defs"]["WindowInterventionDraft"]
+    assert {"confine_motivo", "slide_indizio_seconds"} <= set(schema["required"])
+    assert "default" not in schema["properties"]["confine_motivo"]
+    assert "default" not in schema["properties"]["slide_indizio_seconds"]
+
+
+def test_classified_slide_omitted_by_payload_cap_cannot_be_referenced(inputs, content, monkeypatch):
+    from app.models import SlideChange
+
+    slides = [SlideChange(timestamp_seconds=index, title=f"Tema {index}", confidence="alta")
+              for index in range(10)]
+    monkeypatch.setattr(OpenAIAnalyzer, "_classify_slides", lambda *args, **kwargs: (slides, 0))
+    invalid = window_result()
+    invalid["interventions"][0].update(confine_motivo="slide_e_tema", slide_indizio_seconds=9)
+    valid = window_result()
+    valid["interventions"][0].update(confine_motivo="slide_e_tema", slide_indizio_seconds=7)
+    client = FakeClient(invalid, valid, content)
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+    assert [hint["timestamp_seconds"] for hint in json.loads(client.calls[0]["input"])["slide_hints"]] == list(range(8))
+    assert client.calls[1]["input"] == client.calls[0]["input"]
+    assert len(client.calls) == 3
+    assert [slide.timestamp_seconds for slide in result.slides] == list(range(10))
+    assert result.interventions[0].start_seconds == 0
+
+
+@pytest.mark.parametrize("invalid_fields", [
+    {"punti_chiave": ["PRIVATE-DUPLICATE"] * 3},
+    {"confine_motivo": "slide_e_tema", "slide_indizio_seconds": 2},
+    {"confine_motivo": "slide_e_tema", "slide_indizio_seconds": float("nan")},
+    {"confine_motivo": "slide_e_tema", "slide_indizio_seconds": -1},
+])
+def test_invalid_theme_evidence_exhausts_window_retries_safely(inputs, invalid_fields, caplog):
+    inputs["frames"] = []
+    invalid = window_result()
+    invalid["interventions"][0].update(invalid_fields)
+    client = FakeClient(invalid, invalid, invalid)
+    with pytest.raises(AnalysisError) as caught:
+        OpenAIAnalyzer(client).analyze(**inputs)
+    assert caught.value.stage == "boundary"
+    assert caught.value.detail_code == "window_contract"
+    assert len(client.calls) == 3
+    assert all(call["input"] == client.calls[0]["input"] for call in client.calls)
+    assert all(call["instructions"] == WINDOW_PROMPT for call in client.calls)
+    assert "PRIVATE-DUPLICATE" not in str(caught.value) + caplog.text
+
+
+@pytest.mark.parametrize("corruption", ["blocks", "block_id", "origin", "number", "duplicate_block",
+                                        "block_overrun", "duplicate_chapter", "gap", "overlap"])
+def test_result_with_slides_rejects_invalid_chapter_block_provenance(inputs, content, corruption):
+    result = OpenAIAnalyzer(FakeClient(visual("slide", "camera_change", "uncertain"),
+                                      window_result(), content)).analyze(**inputs)
+    alignment = BoundaryAlignment(interventions=copy.deepcopy(result.interventions),
+                                  boundaries=copy.deepcopy(result.boundaries),
+                                  blocks=copy.deepcopy(result.speech_blocks))
+    assert alignment.blocks
+    if corruption == "blocks":
+        alignment.blocks.clear()
+    elif corruption == "block_id":
+        alignment.interventions[0].block_id = "missing"
+    elif corruption == "origin":
+        alignment.interventions[0].boundary_origin = None
+    elif corruption == "number":
+        alignment.interventions[0].chapter_number = 2
+    elif corruption == "duplicate_block":
+        alignment.blocks.append(copy.deepcopy(alignment.blocks[0]))
+    elif corruption == "block_overrun":
+        alignment.blocks[0].end_seconds = 91
+    elif corruption == "duplicate_chapter":
+        alignment.interventions.append(copy.deepcopy(alignment.interventions[0]))
+    elif corruption == "gap":
+        alignment.interventions[0].start_seconds = 1
+    else:
+        alignment.interventions[0].end_seconds = 91
+    with pytest.raises(AnalysisError, match="Verifica audio"):
+        OpenAIAnalyzer._result_with_slides(ConsolidatedTextReport(**content), [], alignment,
+                                         0, ProviderUsage(), None)
+
+
 def test_window_prompt_requires_complete_semantic_groups_without_model_boundaries():
     requirement = """Raggruppa tutte le utterance che completano la stessa frase, esempio,
 spiegazione, risposta o linea di ragionamento. Non creare mai un confine nel
 mezzo di questi elementi. Se interviene il moderatore, assegna le sue
 utterance a un segmento autonomo saluti, domande o cambio_relatore: non
 accodarle all'intervento precedente. I timestamp finali sono calcolati
-localmente dall'audio; non usare i cambi di slide per dividere gli interventi."""
+localmente dall'audio: non scegliere mai il secondo finale di un confine."""
 
     assert requirement in WINDOW_PROMPT
     assert "CONFINE" not in WINDOW_PROMPT
     assert "timestamp del silenzio" not in WINDOW_PROMPT.lower()
+    assert "piccole unità tematiche omogenee" in WINDOW_PROMPT
+    assert "quando anche il parlato chiude un" in WINDOW_PROMPT
+    assert "Il cambio di slide da solo non giustifica un taglio" in WINDOW_PROMPT
+    assert "non ripetere o inventare" in WINDOW_PROMPT
 
 
 @pytest.mark.parametrize("limit", ["seconds", "characters"])
@@ -143,12 +323,23 @@ def test_window_seam_continuation_is_decided_with_previous_context(
     texts = [before, after] if limit == "seconds" else ["Premessa. " * 700 + before, after + " Spiegazione." * 580]
     inputs["metadata"].duration_seconds = content["duration_seconds"] = duration
     inputs["frames"] = []
+
+    def word_evidence(text, left, right):
+        terms = text.split()
+        return [TranscriptWord(
+            text=term,
+            start_seconds=left + (right - left) * index / len(terms),
+            end_seconds=left + (right - left) * (index + 1) / len(terms),
+            diarization_label="assembly:A", confidence=.9,
+        ) for index, term in enumerate(terms)]
+
     inputs["transcription"].segments = [TranscriptSegment(
         start_seconds=left, end_seconds=right, diarization_label="assembly:A",
         text=text, source_utterance_id=f"distinct-{index}",
-        words=[TranscriptWord(text="PRIVATE-WORD-EVIDENCE", start_seconds=left,
-                              end_seconds=right, diarization_label="assembly:A", confidence=.9)],
+        words=word_evidence(text, left, right),
     ) for index, (left, right, text) in enumerate([(0, end, texts[0]), (start, duration - 1, texts[1])])]
+
+    payloads = []
 
     def respond(call):
         if call["text_format"] is ConsolidatedTextReport:
@@ -158,8 +349,9 @@ def test_window_seam_continuation_is_decided_with_previous_context(
         if payload["start_seconds"]:
             context = payload.get("previous_context")
             assert context is not None
-            assert context["segments"][-1]["text"].endswith(before)
+            assert payloads[-1]["segments"][-1]["text"].endswith(context["segments"][-1]["text"])
             data["previous_continuity"] = "continue"
+        payloads.append(payload)
         return SimpleNamespace(output_parsed=data, usage=SimpleNamespace(input_tokens=11, output_tokens=3))
 
     client = FakeClient(*([respond] * 6))
@@ -169,9 +361,11 @@ def test_window_seam_continuation_is_decided_with_previous_context(
     assert (result.interventions[0].start_seconds, result.interventions[0].end_seconds) == (0, duration)
     assert result.boundaries == []
     assert getattr(result, "audio_boundary_version", None) == 1
-    assert len(client.calls) == 3  # Two windows and consolidation; no seam request.
-    assert result.usage.requests == 3
-    assert result.usage.input_tokens == 22
+    assert len(payloads) >= 2
+    assert " ".join(item["text"] for payload in payloads for item in payload["segments"]) == " ".join(texts)
+    assert len(client.calls) == len(payloads) + 1  # Windows and consolidation; no seam request.
+    assert result.usage.requests == len(payloads) + 1
+    assert result.usage.input_tokens == 11 * len(payloads)
     assert all(len(call["input"]) <= 12_000 for call in client.calls[:-1])
     assert all("PRIVATE-WORD-EVIDENCE" not in call["input"] for call in client.calls)
     assert before not in caplog.text and "PRIVATE-WORD-EVIDENCE" not in caplog.text
@@ -415,9 +609,9 @@ def test_inventory_hints_canonicalize_spelling_but_provider_letters_stay_generic
         **inputs, speaker_name_hints=["Furio d'Andrea"],
     )
 
-    assert result.speakers[0].display_name == "Furio d'Andrea"
+    assert result.speakers[0].display_name == "Furio D'Andrea"
     assert result.speakers[1].display_name == "Relatore 1"
-    assert result.interventions[0].relatori == ["Furio d'Andrea"]
+    assert result.interventions[0].relatori == ["Furio D'Andrea"]
 
 
 def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(inputs, content, caplog, capsys):
@@ -426,13 +620,15 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
         text="private full transcript", audio_seconds=5760,
         segments=[TranscriptSegment(
             start_seconds=i * 60, end_seconds=(i + 1) * 60,
-            diarization_label=f"chunk-{i // 10}:A", source_utterance_id=f"u{i}",
-            text=f"Segmento distinto {i}: pubblicazione Academy.",
-            words=[TranscriptWord(
-                text=f"parola-{i}", start_seconds=i * 60 + 1,
-                end_seconds=(i + 1) * 60 - 1,
-                diarization_label=f"chunk-{i // 10}:A", confidence=.9,
-            )],
+                diarization_label=f"chunk-{i // 10}:A", source_utterance_id=f"u{i}",
+                text=f"Segmento distinto {i}: pubblicazione Academy.",
+                words=[TranscriptWord(
+                    text=word, start_seconds=i * 60 + 1 + word_index,
+                    end_seconds=i * 60 + 1.4 + word_index,
+                    diarization_label=f"chunk-{i // 10}:A", confidence=.9,
+                ) for word_index, word in enumerate(
+                    f"Segmento distinto {i}: pubblicazione Academy.".split()
+                )],
         )
                   for i in range(96)],
     )
@@ -559,7 +755,7 @@ def test_long_provider_segment_is_split_before_remote_analysis(inputs, content, 
 def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, content):
     inputs["transcription"].segments[0].source_utterance_id = "assembly-u000001"
     inputs["transcription"].segments[0].words = [TranscriptWord(
-        text="PRIVATE-WORD-EVIDENCE", start_seconds=0, end_seconds=1,
+        text="Sono Giulia Bianchi.", start_seconds=0, end_seconds=10,
         diarization_label="chunk-0:A", confidence=.97,
     )]
     client = FakeClient(visual("slide", "camera_change", "uncertain"), window_result(), content)

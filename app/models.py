@@ -1,3 +1,4 @@
+import math
 import re
 from typing import Annotated, Literal
 
@@ -290,3 +291,39 @@ class AcademyReport(AcademyContent):
 class AnalysisResult(AcademyContent):
     """Application-owned usage, added after the strict AcademyContent parse."""
     usage: ProviderUsage = Field(default_factory=ProviderUsage)
+
+    @model_validator(mode="after")
+    def validate_granular_provenance(self) -> "AnalysisResult":
+        if self.analysis_profile != 2:
+            return self
+        if self.audio_boundary_version != 1:
+            raise ValueError("Il report granulare richiede provenienza audio")
+        duration = math.floor(self.duration_seconds)
+        blocks = {block.id: block for block in self.speech_blocks}
+        if len(blocks) != len(self.speech_blocks) or any(not block_id.strip() for block_id in blocks):
+            raise ValueError("I blocchi richiedono identificativi unici e non vuoti")
+        children: dict[str, list[Intervention]] = {}
+        for index, chapter in enumerate(self.interventions):
+            if chapter.tipo in {"pausa", "logistica"}:
+                if any(value is not None for value in (chapter.block_id, chapter.chapter_number,
+                        chapter.chapters_in_block, chapter.boundary_origin)):
+                    raise ValueError("Pause e logistica non appartengono ai blocchi")
+                continue
+            if (chapter.block_id not in blocks or chapter.boundary_origin is None
+                    or (chapter.block_id in children
+                        and self.interventions[index - 1].block_id != chapter.block_id)):
+                raise ValueError("Ogni capitolo richiede un blocco contiguo e origine del confine")
+            children.setdefault(chapter.block_id, []).append(chapter)
+        if list(children) != list(blocks):
+            raise ValueError("Ogni blocco richiede capitoli ordinati")
+        for block_id, block in blocks.items():
+            chapters = children[block_id]
+            if (not 0 <= block.start_seconds < block.end_seconds <= duration
+                    or block.start_seconds != chapters[0].start_seconds
+                    or block.end_seconds != chapters[-1].end_seconds
+                    or any(chapter.chapter_number != number or chapter.chapters_in_block != len(chapters)
+                           or chapter.tipo != block.tipo for number, chapter in enumerate(chapters, 1))
+                    or any(left.end_seconds != right.start_seconds
+                           for left, right in zip(chapters, chapters[1:]))):
+                raise ValueError("I capitoli devono coprire il blocco senza lacune o sovrapposizioni")
+        return self

@@ -381,8 +381,28 @@ def test_completeness_rejects_slide_origin_after_floored_bunny_end():
                       chapters_in_block=1, boundary_reason="inizio_blocco")
     result = align_intervention_boundaries(540.9, [planned], [])
     report = report_for(result, 540.9)
+    report.analysis_profile = 2
     report.interventions[0].boundary_origin.slide_indizio_seconds = 540.5
     assert not has_complete_boundary_evidence(report)
+
+
+@pytest.mark.parametrize("profile,expected", [(1, True), (2, False)])
+@pytest.mark.parametrize("extra", ["slide", "block", "chapter_origin"])
+def test_new_endpoint_checks_preserve_legacy_boundary_eligibility(profile, expected, extra):
+    from app.models import ChapterBoundaryOrigin, SlideChange, SpeechBlock
+
+    report = report_for(align_intervention_boundaries(40, [group(0, 39)], []))
+    report.analysis_profile = profile
+    if extra == "slide":
+        report.slides = [SlideChange(timestamp_seconds=50, title="Storica", confidence="alta")]
+    elif extra == "block":
+        report.speech_blocks = [SpeechBlock(id="b001", start_seconds=0, end_seconds=41,
+                                           tipo="intervento", titolo="Tema", sinossi="Sintesi")]
+    else:
+        report.interventions[0].boundary_origin = ChapterBoundaryOrigin(
+            motivo_editoriale="slide_e_tema", regola_audio="no_pause", slide_indizio_seconds=40.5,
+        )
+    assert has_complete_boundary_evidence(report) is expected
 
 
 def test_short_pause_adds_half_measured_duration_to_last_word():

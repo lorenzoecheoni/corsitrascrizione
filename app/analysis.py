@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.bunny import BunnyVideoMetadata
 from app.analysis_chunks import (
-    MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS,
+    MAX_CONSOLIDATION_CHARS, MAX_WINDOW_CHARS, MAX_SLIDE_HINT_CHARS,
     ConsolidatedTextReport, WindowAnalysis, build_consolidation_payload,
     materialize_interventions, previous_window_context, shares_seam_utterance,
     split_transcript_windows,
@@ -188,10 +188,27 @@ def _normalize_window_speakers(data: dict, hints: Sequence[str]) -> None:
             speaker["display_name"] = _canonical_name(name.strip(), hints)
 
 
-def _window_payload(window, hints: Sequence[str], previous_context: dict | None = None) -> str:
+def _window_payload(window, hints: Sequence[str], previous_context: dict | None = None,
+                    *, slide_hints: Sequence[SlideChange] = ()) -> str:
     payload = json.loads(window.to_payload())
     if previous_context is not None:
         payload["previous_context"] = previous_context
+    payload["slide_hints"] = []
+    seen_times: set[float] = set()
+    for slide in sorted(slide_hints, key=lambda item: (item.timestamp_seconds, item.title or "")):
+        if (not window.start_seconds - 30 <= slide.timestamp_seconds <= window.end_seconds + 30
+                or slide.timestamp_seconds in seen_times):
+            continue
+        item = {"timestamp_seconds": slide.timestamp_seconds,
+                "title": slide.title[:120] if slide.title is not None else None}
+        payload["slide_hints"].append(item)
+        if (len(json.dumps({"slide_hints": payload["slide_hints"]}, ensure_ascii=False)) > MAX_SLIDE_HINT_CHARS
+                or len(json.dumps(payload, ensure_ascii=False)) > MAX_WINDOW_CHARS):
+            payload["slide_hints"].pop()
+            break
+        seen_times.add(slide.timestamp_seconds)
+        if len(payload["slide_hints"]) == 8:
+            break
     base_payload = json.dumps(payload, ensure_ascii=False)
     if len(base_payload) > MAX_WINDOW_CHARS:
         raise AnalysisError("boundaries", stage="boundary", detail_code="window_payload")
@@ -330,6 +347,7 @@ class OpenAIAnalyzer:
         validation_error_stage: AnalysisStage | None = None,
         model: str = "gpt-5.6-luna",
         max_output_tokens: int = 4000,
+        validation_context: dict | None = None,
     ) -> T:
         original_payload = payload
         original_instructions = instructions
@@ -415,7 +433,7 @@ class OpenAIAnalyzer:
                 # Detach normalization from caller/SDK-owned objects.
                 data = json.loads(json.dumps(data))
                 prepare(data)
-                result = text_format.model_validate(data)
+                result = text_format.model_validate(data, context=validation_context)
                 errors = validate(result)
             except ValidationError as exc:
                 if attempts < 3:
@@ -515,9 +533,13 @@ class OpenAIAnalyzer:
                 raise AnalysisError(
                     "boundaries", stage="boundary", detail_code="window_context",
                 ) from None
+            window_payload = _window_payload(window, speaker_name_hints, context, slide_hints=slides)
+            allowed_slide_seconds = [hint["timestamp_seconds"]
+                                    for hint in json.loads(window_payload)["slide_hints"]]
             analyses.append(self._structured(
                 text_format=WindowAnalysis, instructions=WINDOW_PROMPT,
-                payload=_window_payload(window, speaker_name_hints, context),
+                payload=window_payload,
+                validation_context={"slide_hint_seconds": allowed_slide_seconds},
                 prepare=lambda data: _normalize_window_speakers(data, speaker_name_hints),
                 validate=lambda result, current=window, previous=previous_window: _window_errors(current, result, previous),
                 cancellation_event=cancellation_event,
@@ -537,6 +559,7 @@ class OpenAIAnalyzer:
                 analyses,
                 _supported_window_speaker_names(analyses),
                 silence_intervals,
+                slides,
             )
         except (AttributeError, TypeError, ValueError) as exc:
             detail_code = _BOUNDARY_DETAIL_BY_MESSAGE.get(
@@ -647,7 +670,8 @@ class OpenAIAnalyzer:
         try:
             content = AnalysisResult(
                 **data, slides=slide_data, interventions=alignment.interventions,
-                boundaries=alignment.boundaries, audio_boundary_version=1, usage=usage,
+                boundaries=alignment.boundaries, speech_blocks=alignment.blocks,
+                audio_boundary_version=1, analysis_profile=2, usage=usage,
             )
         except (AttributeError, TypeError, ValidationError, ValueError):
             raise AnalysisError("boundaries", stage="boundary") from None

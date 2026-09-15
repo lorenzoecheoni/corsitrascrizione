@@ -208,15 +208,18 @@ def has_complete_boundary_evidence(report: AcademyContent) -> bool:
     if not math.isfinite(report.duration_seconds) or report.duration_seconds <= 0:
         return False
     duration = bunny_end_second(report.duration_seconds)
-    if any(slide.timestamp_seconds > duration for slide in report.slides):
-        return False
-    if any(block.end_seconds > duration for block in report.speech_blocks):
-        return False
-    if any(item.boundary_origin is not None
-           and item.boundary_origin.slide_indizio_seconds is not None
-           and item.boundary_origin.slide_indizio_seconds > duration
-           for item in report.interventions):
-        return False
+    # Legacy reports retain their established export eligibility. Strict new
+    # slide/block provenance bounds apply to granular analysis results only.
+    if report.analysis_profile == 2:
+        if any(slide.timestamp_seconds > duration for slide in report.slides):
+            return False
+        if any(block.end_seconds > duration for block in report.speech_blocks):
+            return False
+        if any(item.boundary_origin is not None
+               and item.boundary_origin.slide_indizio_seconds is not None
+               and item.boundary_origin.slide_indizio_seconds > duration
+               for item in report.interventions):
+            return False
     return _complete(report.interventions, report.boundaries, duration)
 
 

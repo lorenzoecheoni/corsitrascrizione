@@ -12,6 +12,7 @@ from uuid import UUID
 
 import httpx
 
+from app.academy_registry import registered_slug
 from app.boundaries import has_complete_boundary_evidence, nearest_second
 from app.intermediate_models import (
     IntermediateInterventionV11,
@@ -23,17 +24,16 @@ from app.intermediate_models import (
     format_hms,
 )
 from app.models import AcademyReport, GENERIC_SPEAKER_LABEL
-from app.reporting import canonical_speaker_name_map, correct_speaker_name_mentions, reconcile_speakers
+from app.reporting import (
+    correct_speaker_name_mentions,
+    reconcile_speakers_detailed,
+    rewrite_speaker_references,
+)
 
 
-_REGISTERED_SPEAKERS = {
-    "vincenzo manfredi": "vincenzo-manfredi",
-    "gaetano de vito": "gaetano-de-vito",
-    "antonio sibilia": "antonio-sibilia",
-    "luigi morra": "luigi-morra",
-}
 _ASSOHOLDING_ROLE = re.compile(
-    r"^(?P<role>.*?)\s+di\s+(?:ass holding|asso holding|assoholding)\s*$", re.IGNORECASE
+    r"^(?P<role>.*?)\s+di\s+(?:ass holding|asso holding|assholding|assoholding)\s*$",
+    re.IGNORECASE,
 )
 _CONFIDENCE_SCORE = {"alta": .95, "media": .65, "bassa": .35}
 _SHORT_SEGMENT_KEYWORDS = {
@@ -66,11 +66,6 @@ def _name_key(value: str) -> str:
     return " ".join(re.findall(r"[a-z]+", folded))
 
 
-def registered_slug(name: str) -> str | None:
-    """Return the fixed Academy registry slug for a known speaker."""
-    return _REGISTERED_SPEAKERS.get(_name_key(name))
-
-
 def split_role_organization(role: str | None) -> tuple[str | None, str | None]:
     """Split only explicit ``di Ass Holding`` organization suffixes."""
     if role is None:
@@ -96,6 +91,17 @@ def _speaker_warning(name: str, role: str | None) -> dict[str, str]:
         "campo": f"relatori:{_name_key(name)}:{'ruolo' if role is None else 'nome'}",
         "messaggio": message,
     }
+
+
+def _ambiguous_alias_warning(name: str) -> VerificationRequestV11:
+    return _verification(
+        "avviso", "ALIAS_RELATORE_AMBIGUO", video="v1",
+        field=f"relatori:{_name_key(name)}:alias",
+        message=(
+            f"L'alias relatore {name} corrisponde a più persone: "
+            "mantenere l'identità separata fino alla verifica nel Registro."
+        ),
+    )
 
 
 def _normalized_text(value: str) -> str:
@@ -155,6 +161,10 @@ def normalize_interventions(
             punti_chiave=list(intervention.punti_chiave) if kind == "intervento" else [],
             accesso="iscritti",
             confidenza=intervention.confidenza,
+            blocco=intervention.block_id,
+            capitolo_numero=intervention.chapter_number,
+            capitoli_blocco=intervention.chapters_in_block,
+            confine_inizio=intervention.boundary_origin,
         ))
     return normalized
 
@@ -439,13 +449,28 @@ def build_intermediate_report(
             reachable = False
         if not reachable:
             material_failures.append(source)
+    reconciliation = reconcile_speakers_detailed(report)
     speakers = [
-        speaker for speaker in reconcile_speakers(report)
+        speaker for speaker in reconciliation.speakers
         if not GENERIC_SPEAKER_LABEL.fullmatch(speaker.display_name)
     ]
     canonical_names = [speaker.display_name for speaker in speakers]
-    canonical_by_key = canonical_speaker_name_map(canonical_names)
-    corrected = lambda value: correct_speaker_name_mentions(value, canonical_names)
+    canonical_by_key = reconciliation.canonical_by_key
+    corrected = lambda value: correct_speaker_name_mentions(
+        value, canonical_names, canonical_by_key,
+    )
+
+    for material in report.materials:
+        material_speakers = rewrite_speaker_references(
+            [material.relatore] if material.relatore else [], canonical_by_key,
+        )
+        materials.append(IntermediateMaterialV11.model_validate({
+            "titolo": corrected(material.titolo),
+            "relatore": material_speakers[0] if material_speakers else None,
+            "url": material.url,
+            "file": material.file,
+            "pagine": material.pagine,
+        }))
 
     intermediate_speakers: list[IntermediateSpeakerV11] = []
     for speaker in speakers:
@@ -464,7 +489,7 @@ def build_intermediate_report(
         report, stored_to_exported_ids=stored_to_exported_ids,
     )
     corrected_interventions = [item.model_copy(update={
-        "relatori": [canonical_by_key[_name_key(name)] for name in item.relatori],
+        "relatori": rewrite_speaker_references(item.relatori, canonical_by_key),
         "titolo": corrected(item.titolo),
         "sintesi": corrected(item.sintesi),
         "punti_chiave": [corrected(point) for point in item.punti_chiave],
@@ -481,7 +506,7 @@ def build_intermediate_report(
         "confidenza": _CONFIDENCE_SCORE[slide.confidence],
     } for slide in report.slides]
 
-    video = IntermediateVideoV11.model_validate({
+    video_data = {
         "chiave": "v1",
         "guid": str(guid),
         "titolo_bunny": corrected(report.bunny_title),
@@ -492,11 +517,36 @@ def build_intermediate_report(
         "interventi": interventions,
         "slide": slides,
         "materiali": materials,
-    })
+    }
+    if report.analysis_profile == 2:
+        video_data.update({
+            "blocchi_parlato": [{
+                "id": block.id,
+                "inizio": block.start_seconds,
+                "fine": block.end_seconds,
+                "tipo": block.tipo,
+                "relatori": rewrite_speaker_references(
+                    block.relatori, canonical_by_key,
+                ),
+                "titolo": corrected(block.titolo),
+                "sinossi": corrected(block.sinossi),
+            } for block in report.speech_blocks],
+            "costo_stimato": {
+                "minimo": report.cost.estimated_low_usd,
+                "massimo": report.cost.estimated_high_usd,
+                "banda_bunny": report.cost.bunny_bandwidth_usd,
+                "trascrizione": report.cost.transcription_usd,
+                "analisi": report.cost.analysis_usd,
+                "criterio": report.cost.basis,
+            },
+        })
+    video = IntermediateVideoV11.model_validate(video_data)
     verifications = [
         *build_verifications(video, intermediate_speakers, material_failures),
+        *(_ambiguous_alias_warning(name) for name in reconciliation.ambiguous_aliases),
         *boundary_verifications,
     ]
+    verifications = _deduplicate_verifications(verifications)
     status = "da_verificare" if any(
         item.livello == "critico" for item in verifications
     ) else "verificato"

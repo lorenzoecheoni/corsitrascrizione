@@ -358,9 +358,9 @@ def test_timeline_only_normalized_names_preserve_the_first_spelling_and_known_al
 
     result = build_intermediate_report(report, TARGET_GUID)
 
-    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio d'Andrea"]
+    assert [speaker.nome for speaker in result.relatori] == ["Jose Nunez", "Furio D’Andrea"]
     assert [item.relatori for item in result.video[0].interventi] == [
-        ["Jose Nunez"], ["Jose Nunez", "Furio d'Andrea"], ["Furio d'Andrea"],
+        ["Jose Nunez"], ["Jose Nunez", "Furio D’Andrea"], ["Furio D’Andrea"],
     ]
     assert "Fulvio" not in render_markdown(report)
     assert "Fulvio" not in render_text(report)
@@ -507,17 +507,17 @@ def test_builder_wraps_one_video_and_reconciles_registry_speakers() -> None:
     data = result.model_dump(mode="json", by_alias=True, exclude_none=True)
     assert data["versione"] == 1
     assert data["corso"] == {
-        "titolo": "Webinar con Furio d'Andrea",
-        "sinossi_corso": "Furio d'Andrea presenta la sinossi.",
+        "titolo": "Webinar con Furio D’Andrea",
+        "sinossi_corso": "Furio D’Andrea presenta la sinossi.",
     }
     assert [(item["chiave"], item["ordine"]) for item in data["video"]] == [("v1", 1)]
     assert [item["nome"] for item in data["relatori"]] == [
-        "Vincenzo Manfredi", "Gaetano De Vito", "Furio d'Andrea",
+        "Vincenzo Manfredi", "Gaetano De Vito", "Furio D’Andrea",
         "Antonio Sibilia", "Luigi Morra",
     ]
     assert {item.get("slug") for item in data["relatori"]} == {
         "vincenzo-manfredi", "gaetano-de-vito", "antonio-sibilia",
-        "luigi-morra", None,
+        "luigi-morra", "furio-dandrea",
     }
     assert [item["id"] for item in data["video"][0]["interventi"]] == [
         "v1-i001", "v1-i002", "v1-i003", "v1-i004", "v1-i005",
@@ -539,12 +539,12 @@ def test_registered_speakers_receive_fixed_slugs_and_timeline_names_are_audio_on
     speakers = result.model_dump(mode="json", exclude_none=True)["relatori"]
 
     assert registered_slug("GAETANO de Vito") == "gaetano-de-vito"
-    assert registered_slug("Furio d'Andrea") is None
+    assert registered_slug("Furio d'Andrea") == "furio-dandrea"
     assert speakers[1]["origine_nome"] == ["audio"]
     assert speakers[1]["confidenza"] == .65
 
 
-def test_role_split_and_furio_registry_warning_request_missing_qualification() -> None:
+def test_role_split_and_furio_registry_entry_avoid_unregistered_warning() -> None:
     report = report_with_reconciled_speakers()
     report.interventions[1].relatori = ["Gaetano De Vito"]
     report.speakers.append(SpeakerProfile(
@@ -571,9 +571,7 @@ def test_role_split_and_furio_registry_warning_request_missing_qualification() -
     )
     assert gaetano["ruolo"] == "Public Policy and Advocacy Director"
     assert gaetano["organizzazione"] == "Assoholding"
-    assert len(furio_warnings) == 1
-    assert "Furio d'Andrea" in furio_warnings[0]["messaggio"]
-    assert "qualifica" in furio_warnings[0]["messaggio"].casefold()
+    assert furio_warnings == []
 
 
 @pytest.mark.parametrize("organization", ["Ass Holding", "Asso Holding", "Assoholding"])
@@ -583,9 +581,9 @@ def test_role_split_accepts_every_explicit_assoholding_spelling(organization: st
     )
 
 
-def test_role_split_rejects_assholding_without_the_required_space() -> None:
+def test_role_split_canonicalizes_assholding_without_the_required_space() -> None:
     assert split_role_organization("Direttore di Assholding") == (
-        "Direttore di Assholding", None,
+        "Direttore", "Assoholding",
     )
 
 
@@ -606,9 +604,160 @@ def test_furio_is_canonical_when_furio_and_fulvio_are_both_candidate_names() -> 
 
     assert correct_speaker_name_mentions(
         "Furio d'Andrea e Fulvio D'Andrea", ["Furio d'Andrea", "Fulvio D'Andrea"]
-    ) == "Furio d'Andrea e Furio d'Andrea"
-    assert names.count("Furio d'Andrea") == 1
+    ) == "Furio D’Andrea e Furio D’Andrea"
+    assert names.count("Furio D’Andrea") == 1
     assert "Fulvio D'Andrea" not in names
+
+
+def test_governance_aliases_collapse_to_registry_people_and_rewrite_references() -> None:
+    names = [
+        "Avvocato Furio D'Andrea", "Luigi Morra", "Dottor Morra",
+        "Antonio Sibilia", "Dott. Sibilia", "Dottore Gaetano de Vito",
+        "prof. vincenzo MANFREDI",
+    ]
+    report = make_report([
+        make_intervention(
+            index * 120, (index + 1) * 120, relatori=[name],
+            titolo=f"Intervento di {name}", sintesi=f"{name} tratta la governance.",
+        )
+        for index, name in enumerate(names)
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio", display_name="Avv. Furio D'Andrea",
+            role="Responsabile legale di ASSOHOLDING", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Avv. Furio D'Andrea."}],
+        ),
+        SpeakerProfile(
+            id="luigi", display_name="Luigi Morra", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Luigi Morra."}],
+        ),
+        SpeakerProfile(
+            id="antonio", display_name="Antonio Sibilia", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Antonio Sibilia."}],
+        ),
+    ]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [(person.nome, person.slug) for person in result.relatori] == [
+        ("Furio D’Andrea", "furio-dandrea"),
+        ("Luigi Morra", "luigi-morra"),
+        ("Antonio Sibilia", "antonio-sibilia"),
+        ("Gaetano De Vito", "gaetano-de-vito"),
+        ("Vincenzo Manfredi", "vincenzo-manfredi"),
+    ]
+    assert [item.relatori for item in result.video[0].interventi] == [
+        ["Furio D’Andrea"], ["Luigi Morra"], ["Luigi Morra"],
+        ["Antonio Sibilia"], ["Antonio Sibilia"], ["Gaetano De Vito"],
+        ["Vincenzo Manfredi"],
+    ]
+    assert result.relatori[0].ruolo == "Responsabile legale"
+    assert result.relatori[0].organizzazione == "Assoholding"
+    assert all(
+        title not in name
+        for item in result.video[0].interventi
+        for name in item.relatori
+        for title in ("Avvocato", "Avv.", "Dottor", "Dott.", "Prof.")
+    )
+    assert all(
+        check.codice != "ALIAS_RELATORE_AMBIGUO"
+        for check in result.verifiche_richieste
+    )
+
+
+def test_compatible_explicit_role_keeps_its_evidenced_organization() -> None:
+    report = make_report([
+        make_intervention(0, 600, relatori=["Furio d'Andrea"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id="furio-a", display_name="Furio d'Andrea",
+            role="Responsabile legale", confidence="alta",
+            evidence=[{"kind": "introduzione", "note": "Furio si presenta."}],
+        ),
+        SpeakerProfile(
+            id="furio-b", display_name="Avv. Furio D’Andrea",
+            role="Responsabile legale di Asso Holding", confidence="alta",
+            evidence=[{"kind": "slide", "note": "Qualifica completa in slide."}],
+        ),
+    ]
+
+    speaker = build_intermediate_report(report, TARGET_GUID).relatori[0]
+
+    assert speaker.ruolo == "Responsabile legale"
+    assert speaker.organizzazione == "Assoholding"
+
+
+def test_surname_only_alias_stays_unresolved_when_report_contains_a_collision() -> None:
+    report = make_report([
+        make_intervention(0, 120, relatori=["Luigi Morra"]),
+        make_intervention(120, 240, relatori=["Mario Morra"]),
+        make_intervention(240, 360, relatori=["Dottor Morra"]),
+    ])
+    report.speakers = [
+        SpeakerProfile(
+            id=name, display_name=name, confidence="alta",
+            evidence=[{"kind": "introduzione", "note": f"Presentazione di {name}."}],
+        )
+        for name in ("Luigi Morra", "Mario Morra")
+    ]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert [speaker.nome for speaker in result.relatori] == [
+        "Luigi Morra", "Mario Morra", "Morra",
+    ]
+    assert result.video[0].interventi[2].relatori == ["Morra"]
+    warnings = [
+        check for check in result.verifiche_richieste
+        if check.codice == "ALIAS_RELATORE_AMBIGUO"
+    ]
+    assert len(warnings) == 1
+    assert "Morra" in warnings[0].messaggio
+
+
+def test_granular_export_rewrites_block_chapter_slide_and_material_references() -> None:
+    from app.models import ChapterBoundaryOrigin, ReportMaterial, SpeechBlock
+
+    chapter = make_intervention(
+        0, 600, relatori=["Avv. Furio d'Andrea", "Furio D’Andrea"],
+        titolo="Capitolo di Fulvio D'Andrea",
+        sintesi="Fulvio D'Andrea illustra la governance.",
+    ).model_copy(update={
+        "block_id": "b001", "chapter_number": 1, "chapters_in_block": 1,
+        "boundary_origin": ChapterBoundaryOrigin(
+            motivo_editoriale="inizio_blocco", regola_audio="long_pause",
+        ),
+    })
+    report = make_report([chapter], duration=600)
+    report.analysis_profile = 2
+    report.speakers = []
+    report.speech_blocks = [SpeechBlock(
+        id="b001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Avvocato Furio D'Andrea"],
+        titolo="Blocco di Fulvio D'Andrea",
+        sinossi="Fulvio D'Andrea tratta gli assetti.",
+    )]
+    report.materials = [ReportMaterial(
+        titolo="Slide · Fulvio D'Andrea", relatore="Avv. Furio D'Andrea",
+        file="furio.pptx", pagine=18,
+    )]
+    report.slides = report.slides[:1]
+    report.slides[0].title = "Fulvio D'Andrea in apertura"
+    report.slides[0].visible_content = ["Relazione di Fulvio D'Andrea"]
+
+    result = build_intermediate_report(report, TARGET_GUID)
+    video = result.video[0]
+
+    assert video.blocchi_parlato[0].relatori == ["Furio D’Andrea"]
+    assert video.blocchi_parlato[0].titolo == "Blocco di Furio D’Andrea"
+    assert video.blocchi_parlato[0].sinossi == "Furio D’Andrea tratta gli assetti."
+    assert video.interventi[0].relatori == ["Furio D’Andrea"]
+    assert video.interventi[0].blocco == "b001"
+    assert video.slide[0].titolo == "Furio D’Andrea in apertura"
+    assert video.materiali[0].relatore == "Furio D’Andrea"
+    assert video.materiali[0].titolo == "Slide · Furio D’Andrea"
 
 
 def test_builder_filters_generic_formal_speaker_profiles() -> None:

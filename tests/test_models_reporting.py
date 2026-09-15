@@ -5,9 +5,15 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from app import academy_registry, reporting
 from app.costs import estimate_cost
 from app.models import AcademyReport, Intervention, SpeakerProfile
-from app.reporting import build_video_report_payload, format_timestamp, render_markdown, render_text
+from app.reporting import (
+    build_video_report_payload,
+    format_timestamp,
+    render_markdown,
+    render_text,
+)
 
 
 def load_report() -> AcademyReport:
@@ -200,11 +206,109 @@ def test_exports_merge_duplicate_speakers_and_correct_near_name_mentions() -> No
     payload = build_video_report_payload(report, UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438"))
     markdown = render_markdown(report)
 
-    assert [speaker["nome"] for speaker in payload["relatori"]] == ["Furio d'Andrea"]
+    assert [speaker["nome"] for speaker in payload["relatori"]] == ["Furio D’Andrea"]
     assert len(payload["relatori"][0]["evidenze"]) == 2
     assert "Fulvio" not in json.dumps(payload, ensure_ascii=False)
     assert "Fulvio" not in markdown
-    assert "Furio d'Andrea illustra" in payload["interventi"][0]["sintesi"]
+    assert "Furio D’Andrea illustra" in payload["interventi"][0]["sintesi"]
+
+
+def test_registry_canonicalizes_governance_aliases_and_preserves_unrelated_full_names() -> None:
+    report = load_report()
+    report.speakers = [
+        SpeakerProfile(
+            id=f"speaker-{index}", display_name=name, confidence="alta",
+            evidence=[{"kind": "introduzione", "note": f"Presentazione: {name}."}],
+        )
+        for index, name in enumerate([
+            "  avv.   FURIO D'ANDREA ", "Luigi   Morra", "ANTONIO sibilia",
+            "Dottore Gaetano de vito", "prof. vincenzo MANFREDI",
+            "Fabio D'Andrea", "Antonia Sibilia", "Luis Morra",
+        ])
+    ]
+    report.interventions = []
+
+    reconciliation = reporting.reconcile_speakers_detailed(report)
+
+    assert [speaker.display_name for speaker in reconciliation.speakers] == [
+        "Furio D’Andrea", "Luigi Morra", "Antonio Sibilia", "Gaetano De Vito",
+        "Vincenzo Manfredi", "Fabio D'Andrea", "Antonia Sibilia", "Luis Morra",
+    ]
+    assert reconciliation.canonical_by_key["avv furio d andrea"] == "Furio D’Andrea"
+    assert reconciliation.canonical_by_key["dottore gaetano de vito"] == "Gaetano De Vito"
+    assert reconciliation.ambiguous_aliases == []
+
+
+@pytest.mark.parametrize("honorific", [
+    "Avvocata", "Dottoressa", "Professore", "Professoressa",
+])
+def test_every_supported_honorific_is_role_only_not_identity(honorific: str) -> None:
+    report = load_report()
+    report.speakers = [SpeakerProfile(
+        id="antonio", display_name=f"{honorific} Antonio Sibilia",
+        confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Presentazione esplicita."}],
+    )]
+    report.interventions = []
+
+    speaker = reporting.reconcile_speakers_detailed(report).speakers[0]
+
+    assert speaker.display_name == "Antonio Sibilia"
+    assert speaker.role == honorific
+
+
+def test_surname_alias_is_ambiguous_with_two_registry_people(monkeypatch) -> None:
+    monkeypatch.setattr(
+        academy_registry,
+        "REGISTRY_PEOPLE",
+        (*academy_registry.REGISTRY_PEOPLE,
+         academy_registry.RegistryPerson("Mario Morra", "mario-morra")),
+    )
+    report = load_report()
+    report.speakers = [SpeakerProfile(
+        id="luigi", display_name="Luigi Morra", confidence="alta",
+        evidence=[{"kind": "introduzione", "note": "Luigi Morra si presenta."}],
+    )]
+    report.interventions = [Intervention(
+        id="i001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Dottor Morra"], titolo="Governance", sintesi="Governance.",
+        punti_chiave=["Organi", "Deleghe", "Controlli"], confidenza=.9,
+    )]
+
+    reconciliation = reporting.reconcile_speakers_detailed(report)
+
+    assert [speaker.display_name for speaker in reconciliation.speakers] == [
+        "Luigi Morra", "Morra",
+    ]
+    assert reconciliation.ambiguous_aliases == ["Morra"]
+
+
+def test_reconciliation_map_covers_block_and_material_speaker_references() -> None:
+    from app.models import ReportMaterial, SpeechBlock
+
+    report = load_report()
+    report.speakers = []
+    report.interventions = []
+    report.speech_blocks = [SpeechBlock(
+        id="b001", start_seconds=0, end_seconds=600, tipo="intervento",
+        relatori=["Furio d'Andrea", "Avvocato Furio D’Andrea"],
+        titolo="Governance", sinossi="Poteri e responsabilità.",
+    )]
+    report.materials = [ReportMaterial(
+        titolo="Slide Morra", relatore="Dottor Morra", file="morra.pptx",
+    )]
+
+    reconciliation = reporting.reconcile_speakers_detailed(report)
+
+    assert [speaker.display_name for speaker in reconciliation.speakers] == [
+        "Furio D’Andrea", "Luigi Morra",
+    ]
+    assert reporting.rewrite_speaker_references(
+        report.speech_blocks[0].relatori, reconciliation.canonical_by_key,
+    ) == ["Furio D’Andrea"]
+    assert reconciliation.canonical_by_key["dottor morra"] == "Luigi Morra"
+    assert reconciliation.speakers[1].role == "Dottor"
+    assert reconciliation.speakers[1].origins == ["inventario"]
 
 
 def test_exports_include_named_intervention_speakers_missing_from_profiles() -> None:
@@ -231,10 +335,10 @@ def test_exports_include_named_intervention_speakers_missing_from_profiles() -> 
     markdown = render_markdown(report)
 
     assert [speaker["nome"] for speaker in payload["relatori"]] == [
-        "Giulia Bianchi", "Gaetano De Vito", "Furio d'Andrea",
+        "Giulia Bianchi", "Gaetano De Vito", "Furio D’Andrea",
     ]
     assert "- Gaetano De Vito" in markdown
-    assert "- Furio d'Andrea" in markdown
+    assert "- Furio D’Andrea" in markdown
 
 
 def test_markdown_preserves_generic_formal_speaker_profiles() -> None:

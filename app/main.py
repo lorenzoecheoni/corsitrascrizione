@@ -24,7 +24,7 @@ from app.inventory import DEFAULT_INVENTORY_TABS, InventoryClient, inventory_con
 from app.jobs import JobStore, SingleWorkerRunner
 from app.logging_config import configure_logging, log_event
 from app.media import FFmpegProcessor
-from app.material_registry import AnalysisInventoryContext
+from app.material_registry import AnalysisInventoryContext, match_library_file, scan_library_files
 from app.materials import MaterialProcessor
 from app.pipeline import AnalysisPipeline
 from app.selection import ConfirmationStore
@@ -67,9 +67,17 @@ def build_services(settings: Settings) -> Services:
         service_account_json=settings.google_service_account_json,
     )
 
+    library_matcher = None
+    if settings.material_library_dir:
+        library_directory = Path(settings.material_library_dir)
+
+        def library_matcher(label: str) -> Path | None:
+            return match_library_file(label, scan_library_files(library_directory))
+
     def inventory_context_provider(metadata) -> AnalysisInventoryContext:
         return inventory_context_for_video(
             inventory.fetch(), metadata.video_id, metadata.title,
+            library=library_matcher,
         )
 
     assemblyai = None

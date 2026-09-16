@@ -193,6 +193,18 @@ Un materiale viene emesso solo quando contiene un URL HTTP(S) reale oppure un
 file con nome ed estensione realmente disponibili. Una semplice etichetta non
 diventa mai un file.
 
+Quando è configurata `MATERIAL_LIBRARY_DIR`, l'etichetta del foglio (es.
+“Slide Furio D'Andrea”) viene abbinata per nome ai deck `.pdf`/`.pptx` che
+l'operatore ha scaricato manualmente in quella cartella: i token del nome
+(cognomi, parole del titolo, numeri progressivi) sono confrontati dopo
+normalizzazione di accenti e apostrofi; un solo miglior abbinamento vince, i
+pareggi falliscono chiusi. Un'etichetta abbinata produce un materiale reale
+con il titolo canonico dell'etichetta; una senza corrispondenza resta
+`sorgente_reale_assente`. Nell'export il campo `file` porta solo il nome del
+deck, mai il percorso locale: l'import Academy lo risolve rispetto a
+`--materiali-da`. Le dichiarazioni locali possono anche avere la forma
+esplicita `Titolo | percorso/al/deck.pdf`.
+
 Per il video Governance il registro iniziale userà gli URL ufficiali già
 presenti nell'import Academy esistente:
 

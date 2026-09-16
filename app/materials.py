@@ -101,8 +101,11 @@ def parse_material_source(value: str) -> ReportMaterial | None:
         return None
     source = sources[0]
     if " | " in source:
-        title, url = source.split(" | ", 1)
-        return ReportMaterial(titolo=canonical_material_title(title), url=url)
+        title, right = source.split(" | ", 1)
+        if right.startswith(("https://", "http://")):
+            return ReportMaterial(titolo=canonical_material_title(title), url=right)
+        path = Path(right)
+        return ReportMaterial(titolo=canonical_material_title(title), file=str(path))
     if source.startswith(("https://", "http://")):
         return ReportMaterial(titolo=Path(urlsplit(source).path).name or source, url=source)
     path = Path(source)
@@ -962,7 +965,11 @@ class MaterialProcessor:
                 url = None
                 local = None
                 if " | " in candidate:
-                    title, url = candidate.split(" | ", 1)
+                    title, right = candidate.split(" | ", 1)
+                    if right.startswith(("https://", "http://")):
+                        url = right
+                    else:
+                        local = Path(right)
                 elif candidate.startswith(("https://", "http://")):
                     url = candidate
                     title = Path(urlsplit(url).path).name or "Materiale"

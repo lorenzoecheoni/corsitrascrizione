@@ -382,7 +382,7 @@ def test_non_curated_materials_require_an_http_url_or_existing_supported_file(tm
     )
 
     assert material_sources_for_video([course], target_id, course.titolo) == [
-        str(deck),
+        f"dispensa | {deck}",
         "Slide · Persona | https://materials.example.test/deck.pptx",
     ]
 

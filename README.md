@@ -33,6 +33,7 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `APP_PASSWORD` | Password lunga e casuale condivisa esclusivamente con il team |
 | `DATABASE_PATH` | File SQLite dei report; in produzione Railway usare `/data/bunny-video-report.sqlite3` su volume persistente |
 | `MATERIAL_ALLOWED_HOSTS` | `www.assoholding.it` per impostazione predefinita; eventuali altri hostname esatti, separati da virgole, senza URL, porte o wildcard |
+| `MATERIAL_LIBRARY_DIR` | Facoltativa: cartella con i deck PDF/PPTX scaricati a mano da Drive; le etichette del foglio (es. `Slide Furio D'Andrea`) vengono abbinate ai nomi dei file e il report espone solo il nome del deck, pronto per `--materiali-da` |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 
@@ -76,7 +77,7 @@ Le persone riconosciute usano nome e slug del Registro. In particolare la grafia
 
 ## Materiali verificati e limiti
 
-Il lavoro può leggere URL reali dall'inventario, hyperlink Google Sheets quando il service account è configurato, sorgenti curate per GUID e file PDF/PPTX realmente disponibili. Un'etichetta come `Slide relatore` non diventa un file. I PPTX vengono letti con `zipfile`/XML nell'ordine della presentazione; i PDF con la dipendenza dichiarata `pypdf>=6,<7`, inclusa in `uv.lock`. L'estrazione legge il testo: non aggiunge OCR alle pagine PDF composte soltanto da immagini.
+Il lavoro può leggere URL reali dall'inventario, hyperlink Google Sheets quando il service account è configurato, sorgenti curate per GUID e file PDF/PPTX realmente disponibili. Un'etichetta come `Slide relatore` non diventa un file. Se `MATERIAL_LIBRARY_DIR` è configurata, l'etichetta viene però abbinata ai deck scaricati a mano in quella cartella: il confronto usa i token del nome (cognomi, titoli, numeri) dopo aver normalizzato accenti e apostrofi, richiede un unico miglior candidato e fallisce chiuso sui pareggi. Il materiale abbinato conserva il titolo canonico dell'etichetta e il JSON v1.1 esporta in `file` soltanto il nome del deck, mai il percorso locale. I PPTX vengono letti con `zipfile`/XML nell'ordine della presentazione; i PDF con la dipendenza dichiarata `pypdf>=6,<7`, inclusa in `uv.lock`. L'estrazione legge il testo: non aggiunge OCR alle pagine PDF composte soltanto da immagini.
 
 Il recupero remoto ammette solo HTTPS sulla porta 443 e gli host esatti di `MATERIAL_ALLOWED_HOSTS=www.assoholding.it`. Rifiuta credenziali, query e frammenti negli URL, indirizzi IP e destinazioni private. Ogni redirect (massimo cinque) ripete i controlli DNS e di host; la connessione usa gli indirizzi pubblici verificati e non usa proxy, cookie o credenziali implicite. Il contenuto dei documenti non viene eseguito. Collegamenti esterni, azioni attive, macro, allegati e PDF cifrati non sono supportati.
 

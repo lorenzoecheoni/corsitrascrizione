@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     media_inactivity_seconds: float = Field(default=120, gt=0, allow_inf_nan=False)
     media_max_workspace_bytes: int = Field(default=2_000_000_000, gt=0)
     material_allowed_hosts: str = "www.assoholding.it"
+    material_library_dir: str | None = None
 
     @field_validator("material_allowed_hosts")
     @classmethod

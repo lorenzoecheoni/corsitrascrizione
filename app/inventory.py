@@ -20,6 +20,7 @@ from pydantic import Field, field_validator
 from app.bunny import BunnyCatalogVideo
 from app.material_registry import (
     AnalysisInventoryContext,
+    LibraryMatcher,
     MaterialSourceFailure,
     is_curated_material_label,
     material_declaration_failure_reason,
@@ -612,6 +613,7 @@ def material_sources_for_video(
     courses: Sequence[InventoryCourse], video_id: UUID, title: str,
     *,
     file_exists: Callable[[Path], bool] = Path.is_file,
+    library: LibraryMatcher | None = None,
 ) -> list[str]:
     """Return explicit candidates associated with one video, without fetching.
 
@@ -621,7 +623,7 @@ def material_sources_for_video(
     """
     return resolve_material_sources(
         _material_cells_for_video(courses, video_id, title), video_id,
-        file_exists=file_exists,
+        file_exists=file_exists, library=library,
     )
 
 
@@ -636,6 +638,7 @@ def inventory_context_for_video(
     courses: Sequence[InventoryCourse], video_id: UUID, title: str,
     *,
     file_exists: Callable[[Path], bool] = Path.is_file,
+    library: LibraryMatcher | None = None,
 ) -> AnalysisInventoryContext:
     """Keep the once-fetched inventory inputs for analysis in one value."""
     normalized_title = normalize_title(title)
@@ -653,7 +656,7 @@ def inventory_context_for_video(
                 material_failures.append(failure)
         for source in course.materiali:
             reason = material_declaration_failure_reason(
-                source, file_exists=file_exists,
+                source, file_exists=file_exists, library=library,
             )
             if reason is None or is_curated_material_label(video_id, source):
                 continue
@@ -667,7 +670,7 @@ def inventory_context_for_video(
         speaker_hints=tuple(speaker_hints_for_video(list(courses), video_id, title)),
         material_sources=tuple(material_sources_for_video(
             courses, video_id, title,
-            file_exists=file_exists,
+            file_exists=file_exists, library=library,
         )),
         material_failures=tuple(material_failures),
     )

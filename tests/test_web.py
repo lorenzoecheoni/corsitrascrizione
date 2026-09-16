@@ -160,7 +160,7 @@ def test_real_processed_archived_material_remains_downloadable(client, monkeypat
             assert "Slide · Furio D'Andrea" in response.text
             if extension == "json":
                 video = response.json()["video"][0]
-                assert video["materiali"][0]["file"] == stored_source
+                assert video["materiali"][0]["file"] == source.name
                 assert video["materiali"][0]["pagine"] == 2
                 assert video["slide"][0]["pagina"] == 2
             else:

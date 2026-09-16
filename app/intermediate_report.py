@@ -3,6 +3,7 @@
 import math
 import re
 import unicodedata
+from pathlib import PurePosixPath
 from typing import Mapping, Sequence
 from uuid import UUID
 
@@ -506,7 +507,9 @@ def build_intermediate_report(
             "titolo": title,
             "relatore": material_speakers[0] if material_speakers else None,
             "url": material.url,
-            "file": material.file,
+            # The Academy import resolves ``file`` against ``--materiali-da``;
+            # only the deck name leaves this machine, never its local path.
+            "file": PurePosixPath(material.file).name if material.file is not None else None,
             "pagine": material.pagine,
         })
         canonical_materials.append((material.titolo, exported_material))

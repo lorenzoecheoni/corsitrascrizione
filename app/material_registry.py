@@ -6,10 +6,11 @@ performed later inside the job workspace.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import unicodedata
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -29,6 +30,17 @@ _EXACT_HTTP_URL = re.compile(r"https?://[^\s<>\"'|]+", re.IGNORECASE)
 _EXACT_TITLE = re.compile(r"[^\x00-\x1f<>|]+")
 _SLIDE_TITLE = re.compile(r"^\s*slide(?:\s*[\u00b7:\-–—]\s*|\s+)(?P<person>.+?)\s*$", re.I)
 _SUPPORTED_LOCAL_EXTENSIONS = {".pdf", ".pptx"}
+
+LibraryMatcher = Callable[[str], "Path | None"]
+
+_LIBRARY_STOPWORDS = frozenset({
+    "slide", "slides", "dispensa", "materiale", "materiali", "link",
+    "e", "di", "del", "dello", "della", "dei", "degli", "delle", "da", "de",
+    "con", "per", "il", "lo", "la", "i", "gli", "le", "un", "una",
+    "prima", "seconda", "terza", "parte",
+})
+_DELETE_APOSTROPHES = str.maketrans("", "", "’'ʼ`")
+_LIBRARY_TOKEN = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
@@ -64,7 +76,7 @@ class RegistryMaterial:
         object.__setattr__(self, "title", title)
 
     def as_inventory_source(self) -> str:
-        return f"{self.title} | {self.url}" if self.url is not None else str(self.file)
+        return f"{self.title} | {self.url}" if self.url is not None else f"{self.title} | {self.file}"
 
 
 def canonical_material_title(value: str) -> str:
@@ -76,6 +88,70 @@ def canonical_material_title(value: str) -> str:
     parsed = parse_speaker_identity(match.group("person"))
     person = find_registry_person(parsed.name)
     return f"Slide · {person.nome}" if person is not None else title
+
+
+def scan_library_files(directory: Path) -> tuple[Path, ...]:
+    """List candidate deck files directly inside the configured library."""
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return ()
+    return tuple(
+        entry for entry in entries
+        if entry.suffix.lower() in _SUPPORTED_LOCAL_EXTENSIONS
+        and not entry.name.startswith(".")
+        and entry.is_file()
+    )
+
+
+def _library_tokens(text: str) -> list[str]:
+    folded = "".join(
+        character for character in unicodedata.normalize("NFKD", text.casefold())
+        if not unicodedata.combining(character)
+    )
+    folded = folded.translate(_DELETE_APOSTROPHES)
+    return [token for token in _LIBRARY_TOKEN.findall(folded) if token not in _LIBRARY_STOPWORDS]
+
+
+def match_library_file(label: str, files: Sequence[Path]) -> Path | None:
+    """Return the one library deck named like the label; ambiguous means None.
+
+    File names usually carry only the speaker surname, so any shared name
+    token qualifies; ranking prefers more tokens, the compact signature, the
+    trailing (surname) token, label numbers, then the shortest file name.
+    """
+    source = label.strip().strip("|").strip()
+    if not source:
+        return None
+    declared = Path(source)
+    if declared.suffix.lower() in _SUPPORTED_LOCAL_EXTENSIONS:
+        source = declared.stem
+    tokens = _library_tokens(source)
+    alpha = [token for token in tokens if not token.isdigit()]
+    numbers = [token for token in tokens if token.isdigit()]
+    required = [token for token in alpha if len(token) > 1]
+    if not required:
+        return None
+    signature = "".join(alpha)
+    scored: list[tuple[tuple[int, int, int, int, int], Path]] = []
+    for file in files:
+        file_tokens = _library_tokens(file.stem)
+        if not file_tokens:
+            continue
+        hits = sum(1 for token in required if token in file_tokens)
+        signature_hit = int(len(alpha) > 1 and signature in "".join(file_tokens))
+        if hits == 0 and not signature_hit:
+            continue
+        surname_hit = int(required[-1] in file_tokens)
+        numeric_hits = sum(1 for number in numbers if number in file_tokens)
+        scored.append(((hits, signature_hit, surname_hit, numeric_hits, -len(file_tokens)), file))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (tuple(-score for score in item[0][:4]), -item[0][4], str(item[1])))
+    best = scored[0]
+    if len(scored) > 1 and scored[1][0] == best[0]:
+        return None
+    return best[1]
 
 
 def _valid_http_url(value: str) -> bool:
@@ -108,21 +184,29 @@ def _declared_material(
     value: str,
     *,
     file_exists: Callable[[Path], bool],
+    library: LibraryMatcher | None = None,
 ) -> RegistryMaterial | None:
     source = value.strip()
     if not source:
         return None
     if source.count(" | ") == 1:
-        title, url = source.split(" | ", 1)
-        if (
-            title != title.strip()
-            or not _EXACT_TITLE.fullmatch(title)
-            or not _EXACT_HTTP_URL.fullmatch(url)
-        ):
+        title, right = source.split(" | ", 1)
+        if title != title.strip() or not _EXACT_TITLE.fullmatch(title):
             return None
-        if not _valid_http_url(url):
+        if _EXACT_HTTP_URL.fullmatch(right):
+            if not _valid_http_url(right):
+                return None
+            return RegistryMaterial(canonical_material_title(title), url=right)
+        path = Path(right)
+        if path.suffix.lower() not in _SUPPORTED_LOCAL_EXTENSIONS:
             return None
-        return RegistryMaterial(canonical_material_title(title), url=url)
+        try:
+            exists = file_exists(path)
+        except (OSError, ValueError):
+            exists = False
+        if not exists:
+            return None
+        return RegistryMaterial(canonical_material_title(title), file=str(path))
     if _EXACT_HTTP_URL.fullmatch(source):
         if not _valid_http_url(source):
             return None
@@ -130,24 +214,29 @@ def _declared_material(
         return RegistryMaterial(canonical_material_title(title), url=source)
 
     path = Path(source)
-    if path.suffix.lower() not in _SUPPORTED_LOCAL_EXTENSIONS:
-        return None
-    try:
-        exists = file_exists(path)
-    except (OSError, ValueError):
-        exists = False
-    if not exists:
-        return None
-    return RegistryMaterial(path.stem, file=str(path))
+    if path.suffix.lower() in _SUPPORTED_LOCAL_EXTENSIONS:
+        try:
+            exists = file_exists(path)
+        except (OSError, ValueError):
+            exists = False
+        if exists:
+            return RegistryMaterial(path.stem, file=str(path))
+    if library is not None:
+        label = source.strip("|").strip()
+        matched = library(label)
+        if matched is not None:
+            return RegistryMaterial(canonical_material_title(label), file=str(matched))
+    return None
 
 
 def material_declaration_failure_reason(
     value: str,
     *,
     file_exists: Callable[[Path], bool] = Path.is_file,
+    library: LibraryMatcher | None = None,
 ) -> Literal["dichiarazione_ambigua", "sorgente_reale_assente"] | None:
     """Classify a rejected declaration without retaining its untrusted text."""
-    if _declared_material(value, file_exists=file_exists) is not None:
+    if _declared_material(value, file_exists=file_exists, library=library) is not None:
         return None
     source = value.strip()
     if " | " in source or re.search(r"https?://", source, re.I) or "<" in source or ">" in source:
@@ -169,6 +258,7 @@ def resolve_material_sources(
     video_id: UUID,
     *,
     file_exists: Callable[[Path], bool] = Path.is_file,
+    library: LibraryMatcher | None = None,
 ) -> list[str]:
     """Return curated sources first, then explicit source candidates.
 
@@ -179,7 +269,7 @@ def resolve_material_sources(
     sources: list[str] = []
     seen: set[tuple[str, str]] = set()
     for candidate in candidates:
-        material = _declared_material(candidate, file_exists=file_exists)
+        material = _declared_material(candidate, file_exists=file_exists, library=library)
         if material is None:
             continue
         if material.url is not None:
@@ -195,7 +285,8 @@ def resolve_material_sources(
 
 __all__ = [
     "AnalysisInventoryContext", "CURATED_MATERIALS", "GOVERNANCE_GUID",
-    "MaterialSourceFailure", "RegistryMaterial", "canonical_material_title",
-    "is_curated_material_label", "material_declaration_failure_reason",
-    "resolve_material_sources",
+    "LibraryMatcher", "MaterialSourceFailure", "RegistryMaterial",
+    "canonical_material_title", "is_curated_material_label",
+    "match_library_file", "material_declaration_failure_reason",
+    "resolve_material_sources", "scan_library_files",
 ]

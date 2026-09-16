@@ -115,8 +115,8 @@ def test_profile2_revalidates_persisted_material_source_syntax_offline(field, so
     ("url", "https://www.assoholding.it/wp-content/uploads/deck.pptx", "https://www.assoholding.it/wp-content/uploads/deck.pptx"),
     ("url", "https://WWW.ASSOHOLDING.IT:443/slides/deck%20Furio.pdf", "https://www.assoholding.it/slides/deck%20Furio.pdf"),
     ("file", "furio.pptx", "furio.pptx"),
-    ("file", "materials/Governance Furio.pdf", "materials/Governance Furio.pdf"),
-    ("file", "/data/materials/Furio D'Andrea.pptx", "/data/materials/Furio D'Andrea.pptx"),
+    ("file", "materials/Governance Furio.pdf", "Governance Furio.pdf"),
+    ("file", "/data/materials/Furio D'Andrea.pptx", "Furio D'Andrea.pptx"),
 ])
 def test_profile2_accepts_supported_persisted_material_sources_without_accessing_them(monkeypatch, field, source, expected):
     report = governance_report()
@@ -152,7 +152,9 @@ def test_durable_archive_names_are_not_scratch_evidence(monkeypatch, directory, 
         for method in ("resolve", "is_file", "stat"):
             offline.setattr(Path, method, forbidden)
         result = build_intermediate_report(report, TARGET_GUID)
-    assert result.video[0].materiali[0].file == source
+    # The export carries only the deck name: the Academy import resolves it
+    # against --materiali-da, and local paths never leave this machine.
+    assert result.video[0].materiali[0].file == "Furio D'Andrea.pptx"
     assert result.video[0].slide[0].pagina == 2
     assert report.model_dump_json() == before
 

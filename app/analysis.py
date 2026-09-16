@@ -529,7 +529,9 @@ class OpenAIAnalyzer:
                 prepare=lambda data: _normalize_window_speakers(data, speaker_name_hints),
                 validate=lambda result, current=window, previous=previous_window: _window_errors(current, result, previous),
                 cancellation_event=cancellation_event,
-                usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
+                # Legacy chat models no longer survive Responses API output
+                # validation in current SDKs; keep one supported model family.
+                usage=usage, model="gpt-5.6-luna", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
                 stage="window",
                 validation_error_code="boundaries",
@@ -565,7 +567,7 @@ class OpenAIAnalyzer:
             text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
             prepare=lambda data: _normalize_speakers(data, speaker_name_hints),
             validate=lambda content: _content_errors(content, metadata.duration_seconds),
-            cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
+            cancellation_event=cancellation_event, usage=usage, model="gpt-5.6-luna",
             max_output_tokens=4000,
             max_repair_chars=MAX_CONSOLIDATION_CHARS,
             stage="consolidation",

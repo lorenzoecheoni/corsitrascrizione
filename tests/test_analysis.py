@@ -666,7 +666,7 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     assert "data:image" not in final_call["input"]
     assert [call["max_output_tokens"] for call in window_calls] == [2000] * len(window_calls)
     assert final_call["max_output_tokens"] == 4000
-    assert all(call["model"] == "gpt-4o-mini" and call["store"] is False for call in client.calls)
+    assert all(call["model"] == "gpt-5.6-luna" and call["store"] is False for call in client.calls)
     assert progress == [("transcript", i, 10) for i in range(1, 11)] + [("consolidation", 0, 1)]
     assert result.usage.requests == 11
     assert result.usage.input_tokens == 110
@@ -764,7 +764,7 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     assert client.max_retries == 0
     assert [call["text_format"] for call in client.calls] == [SlideBatchResult, WindowAnalysis, ConsolidatedTextReport]
     assert all(call["store"] is False for call in client.calls)
-    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini"]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna"] * 3
     payload = json.loads(client.calls[-1]["input"])
     assert "transcription" not in payload
     assert json.loads(client.calls[1]["input"])["segments"] == [{
@@ -800,9 +800,7 @@ def test_fast_analysis_uses_complete_window_path_for_globally_diarized_transcrip
     assert [call["text_format"] for call in client.calls] == [
         SlideBatchResult, WindowAnalysis, ConsolidatedTextReport,
     ]
-    assert [call["model"] for call in client.calls] == [
-        "gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini",
-    ]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna"] * 3
     assert all(call["store"] is False for call in client.calls)
     window_payload = json.loads(client.calls[1]["input"])
     assert window_payload["segments"][0]["diarization_label"] == "chunk-0:A"

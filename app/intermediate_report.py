@@ -130,11 +130,11 @@ def _truncate_text(text: str, limit: int = 500) -> str:
     """Truncate at a word or bullet boundary so exported text never breaks mid-word."""
     if len(text) <= limit:
         return text
-    window = text[:limit]
+    window = text[: limit - 2]
     boundary = max(window.rfind(" "), window.rfind("·"))
     if boundary >= (limit * 3) // 5:
         return window[:boundary].rstrip(" ·,;") + " …"
-    return window
+    return text[:limit]
 
 
 def _normalize_language(value: str) -> str:

@@ -1751,6 +1751,13 @@ def test_slide_text_without_boundary_falls_back_to_hard_window():
     assert slide.testo_principale == "x" * 500
 
 
+def test_slide_text_never_exceeds_limit_when_boundary_sits_at_window_edge():
+    report = governance_report()
+    report.slides[0].visible_content = ["y" * 499 + " coda"]
+    slide = build_intermediate_report(report, TARGET_GUID).video[0].slide[0]
+    assert len(slide.testo_principale) <= 500
+
+
 def test_export_normalizes_language_name_casing_only():
     report = governance_report()
     report.detected_language = "italiano"

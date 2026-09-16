@@ -9,6 +9,7 @@ from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from enum import StrEnum
+import json
 import logging
 from pathlib import Path
 import sqlite3
@@ -47,6 +48,7 @@ class JobRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
     report: AcademyReport | None = None
+    editorial: dict | None = Field(default=None, exclude=True, repr=False)
     error: str | None = None
 
 
@@ -117,6 +119,13 @@ class JobStore:
                     ON batch_jobs(job_id);
                 """
             )
+            columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(jobs)")
+            }
+            if "editorial_json" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN editorial_json TEXT"
+                )
 
     def _recover_interrupted_jobs(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -255,6 +264,14 @@ class JobStore:
                     extra={"job_id": row["id"], "error_code": "stored_report_invalid"},
                 )
                 stored_error = _CORRUPT_REPORT_ERROR
+        editorial = None
+        if row["editorial_json"] is not None:
+            try:
+                parsed = json.loads(row["editorial_json"])
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                editorial = parsed
         record = JobRecord(
             id=UUID(row["id"]),
             source_url=row["source_url"],
@@ -265,6 +282,7 @@ class JobStore:
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             report=report,
+            editorial=editorial,
             error=stored_error,
         )
         return record.model_copy(deep=True)
@@ -279,6 +297,21 @@ class JobStore:
             if JobState(row["state"]) != JobState.COMPLETED:
                 raise ValueError("Solo un report completato può essere eliminato")
             self._connection.execute("DELETE FROM jobs WHERE id = ?", (str(job_id),))
+
+    def save_editorial(self, job_id: UUID, editorial: dict) -> None:
+        """Persist the validated editorial layer of a completed job."""
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT state FROM jobs WHERE id = ?", (str(job_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if JobState(row["state"]) != JobState.COMPLETED:
+                raise ValueError("L'arricchimento editoriale richiede un lavoro completato")
+            self._connection.execute(
+                "UPDATE jobs SET editorial_json = ? WHERE id = ?",
+                (json.dumps(editorial, ensure_ascii=False), str(job_id)),
+            )
 
     def update(
         self,

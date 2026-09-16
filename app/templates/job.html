@@ -33,6 +33,7 @@
           <a class="button secondary" href="/#catalog-title">Rianalisi necessaria · torna al catalogo</a>
           {% else %}
           <a class="button secondary" href="/jobs/{{ job.id }}/report.json">Download JSON v1.1</a>
+          <a class="button secondary" href="/jobs/{{ job.id }}/report-v2.json">Download JSON v2</a>
           {% endif %}
           <a class="button secondary" href="/jobs/{{ job.id }}/report.md">Download Markdown</a>
           <a class="button secondary" href="/jobs/{{ job.id }}/report.txt">Download TXT</a>

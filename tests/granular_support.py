@@ -63,6 +63,44 @@ def conflicting_material_report():
     return report
 
 
+def valid_editorial_draft():
+    """Editorial layer matching governance_report(): ids v1-i001..i006, blocks b001/b002."""
+    return {
+        "corso": {
+            "sottotitolo": "Organi, deleghe e controlli nella holding",
+            "area": "Governance",
+            "competenze": [
+                "Comprendere gli assetti", "Valutare le deleghe",
+                "Distinguere gli organi", "Applicare i controlli",
+                "Riconoscere i rischi",
+            ],
+            "profili": [
+                "Commercialisti | Che assistono gruppi societari.",
+                "Imprenditori | Che guidano holding di famiglia.",
+                "Avvocati | Che seguono la governance.",
+            ],
+            "faq": [
+                {"domanda": "Serve una holding già costituita?", "risposta": "No."},
+                {"domanda": "Quanto dura il corso?", "risposta": "Circa due ore."},
+            ],
+        },
+        "interventi": [
+            {
+                "id": f"v1-i00{number}",
+                "titolo_lezione": f"Lezione {number}",
+                "descrizione": f"Cosa si vede nella lezione {number}.",
+                "casi": [f"Caso {number}"],
+                "riferimenti": ["art. 2479 c.c."],
+            }
+            for number in range(1, 7)
+        ],
+        "blocchi": [
+            {"id": "v1-b001", "titolo_modulo": "La governance della holding"},
+            {"id": "v1-b002", "titolo_modulo": "I controlli"},
+        ],
+    }
+
+
 # Syntax-only export checks must reject these without resolving any source.
 UNSAFE_MATERIAL_SOURCES = [
     ("url", ""),

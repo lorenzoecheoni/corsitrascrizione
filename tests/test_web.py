@@ -21,6 +21,7 @@ from app.bunny import (
 )
 from app.config import Settings
 from app.course_models import AcademyImport, IntermediateCourseReport
+from app.editorial import EditorialDraft, EditorialGenerationError
 from app.jobs import JobState
 from app.inventory import InventoryCourse, InventoryError
 from app.main import create_app
@@ -34,7 +35,12 @@ OTHER_VIDEO_ID = "00000000-0000-0000-0000-000000000002"
 VIDEO_TITLE = "Corso di prova"
 OTHER_VIDEO_TITLE = "Secondo corso"
 
-from granular_support import UNSAFE_MATERIAL_SOURCES, conflicting_material_report, governance_report
+from granular_support import (
+    UNSAFE_MATERIAL_SOURCES,
+    conflicting_material_report,
+    governance_report,
+    valid_editorial_draft,
+)
 
 
 def test_conflicting_material_record_cannot_rebind_slide_in_any_download(client, monkeypatch, caplog):
@@ -1411,3 +1417,73 @@ def test_academy_generation_is_blocked_before_report_confirmation(client):
 def test_inventory_and_review_mutations_require_csrf(client, method, path):
     response = getattr(client, method)(path, headers={"X-CSRF-Token": ""})
     assert response.status_code == 403
+
+
+def _completed_profile2_job(client):
+    report = governance_report()
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    return job
+
+
+def test_report_v2_enriches_once_and_reuses_the_saved_editorial_layer(client):
+    job = _completed_profile2_job(client)
+    calls = []
+    client.app.state.editorial_enricher = type("FakeEnricher", (), {
+        "enrich": lambda self, source: calls.append(source)
+        or EditorialDraft.model_validate(valid_editorial_draft()),
+    })()
+
+    first = client.get(f"/jobs/{job.id}/report-v2.json")
+
+    assert first.status_code == 200
+    assert first.json()["versione"] == 2
+    assert first.json()["corso"]["area"] == "Governance"
+    assert "attachment" in first.headers["content-disposition"]
+    assert len(calls) == 1
+    assert client.app.state.store.get(job.id).editorial is not None
+
+    def forbidden(self, source):
+        raise AssertionError("La seconda lettura non deve richiamare il modello")
+
+    client.app.state.editorial_enricher = type("FailingEnricher", (), {"enrich": forbidden})()
+    second = client.get(f"/jobs/{job.id}/report-v2.json")
+    assert second.status_code == 200
+    assert second.content == first.content
+
+
+def test_report_v2_requires_the_granular_profile(client):
+    report = governance_report()
+    report.analysis_profile = 1
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    calls = []
+    client.app.state.editorial_enricher = type("FakeEnricher", (), {
+        "enrich": lambda self, source: calls.append(source),
+    })()
+
+    response = client.get(f"/jobs/{job.id}/report-v2.json")
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Rianalisi necessaria per il formato granulare"}
+    assert calls == []
+
+
+def test_report_v2_returns_a_safe_error_when_enrichment_fails(client):
+    job = _completed_profile2_job(client)
+
+    def fail(self, source):
+        raise EditorialGenerationError(
+            "Il servizio OpenAI è temporaneamente non disponibile; riprova più tardi"
+        )
+
+    client.app.state.editorial_enricher = type("FailingEnricher", (), {"enrich": fail})()
+
+    response = client.get(f"/jobs/{job.id}/report-v2.json")
+
+    assert response.status_code == 503
+    assert client.app.state.store.get(job.id).editorial is None

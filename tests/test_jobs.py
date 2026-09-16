@@ -506,3 +506,44 @@ def test_cancel_before_submission_and_submit_after_shutdown(report) -> None:
     with pytest.raises(RuntimeError):
         runner.submit(queued.id)
     assert store.get(queued.id).state == JobState.QUEUED
+
+
+def test_save_editorial_round_trip_requires_a_completed_job(tmp_path, report) -> None:
+    path = tmp_path / "reports.sqlite3"
+    store = JobStore(path)
+    job = store.create("https://private.invalid/video")
+    with pytest.raises(ValueError):
+        store.save_editorial(job.id, {"corso": {}})
+    with pytest.raises(KeyError):
+        store.save_editorial(uuid4(), {"corso": {}})
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    editorial = {
+        "corso": {"area": "Governance"},
+        "interventi": [{"id": "v1-i001", "titolo_lezione": "Lezione 1"}],
+        "blocchi": [],
+    }
+
+    store.save_editorial(job.id, editorial)
+
+    reopened = JobStore(path)
+    assert reopened.get(job.id).editorial == editorial
+    assert "editorial" not in reopened.get(job.id).model_dump()
+
+
+def test_editorial_column_is_added_to_a_pre_existing_database(tmp_path, report) -> None:
+    path = tmp_path / "reports.sqlite3"
+    store = JobStore(path)
+    job = store.create("https://private.invalid/video")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+    legacy = sqlite3.connect(path)
+    legacy.execute("ALTER TABLE jobs DROP COLUMN editorial_json")
+    legacy.commit()
+    legacy.close()
+
+    reopened = JobStore(path)
+
+    assert reopened.get(job.id).editorial is None
+    reopened.save_editorial(job.id, {"corso": {"area": "Governance"}})
+    assert reopened.get(job.id).editorial == {"corso": {"area": "Governance"}}

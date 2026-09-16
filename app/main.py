@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 
 from app.academy import AcademyGenerator
+from app.editorial import EditorialEnricher
 from app.analysis import OpenAIAnalyzer
 from app.assemblyai import AssemblyAITranscriber
 from app.auth import SESSION_COOKIE, session_is_valid
@@ -50,6 +51,7 @@ class Services:
     inventory_context_provider: Callable[[object], AnalysisInventoryContext]
     course_store: CourseStore
     academy_generator: AcademyGenerator
+    editorial_enricher: EditorialEnricher
 
 
 def build_services(settings: Settings) -> Services:
@@ -98,9 +100,11 @@ def build_services(settings: Settings) -> Services:
     runner = SingleWorkerRunner(store, pipeline.run)
     course_store = CourseStore(settings.database_path)
     academy_generator = AcademyGenerator(openai)
+    editorial_enricher = EditorialEnricher(openai)
     return Services(
         bunny, media, openai, transcriber, analyzer, assemblyai, pipeline,
-        store, runner, inventory, inventory_context_provider, course_store, academy_generator,
+        store, runner, inventory, inventory_context_provider, course_store,
+        academy_generator, editorial_enricher,
     )
 
 
@@ -142,6 +146,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.inventory_context_provider = services.inventory_context_provider
     app.state.course_store = services.course_store
     app.state.academy_generator = services.academy_generator
+    app.state.editorial_enricher = services.editorial_enricher
     app.state.csrf_token = secrets.token_urlsafe(32)
     app.state.confirmation_key = secrets.token_bytes(32)
     app.state.confirmations = ConfirmationStore()

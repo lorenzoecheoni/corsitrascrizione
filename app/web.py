@@ -28,7 +28,9 @@ from app.bunny import (
 from app.costs import estimate_cost
 from app.courses import CourseAssemblyError, build_intermediate_report as build_course_intermediate_report, sign_course_selection
 from app.course_models import AcademyImport, IntermediateCourseReport, format_hms
+from app.editorial import EditorialDraft, EditorialGenerationError, validate_editorial_draft
 from app.intermediate_report import build_intermediate_report
+from app.report_v2 import build_report_v2
 from app.inventory import (
     InventoryError,
     organize_catalog,
@@ -726,6 +728,55 @@ def markdown_report(request: Request, job_id: str) -> Response:
 @router.get("/jobs/{job_id}/report.txt")
 def text_report(request: Request, job_id: str) -> Response:
     return export_report(request, job_id, "txt")
+
+
+@router.get("/jobs/{job_id}/report-v2.json")
+def json_report_v2(request: Request, job_id: str) -> Response:
+    job = get_job(request, job_id)
+    if job.state != JobState.COMPLETED or job.report is None:
+        raise HTTPException(409, "Il report non è ancora disponibile")
+    if job.report.analysis_profile != 2:
+        raise HTTPException(
+            409, "Rianalisi necessaria per il formato granulare",
+        )
+    settings = request.app.state.settings
+    try:
+        reference = parse_bunny_url(
+            job.source_url,
+            expected_library_id=settings.bunny_library_id,
+            cdn_hostname=settings.bunny_cdn_hostname,
+        )
+    except BunnyUrlError:
+        raise HTTPException(409, "Il report non contiene un riferimento Bunny valido") from None
+    try:
+        source = build_intermediate_report(job.report, reference.video_id)
+    except ValueError:
+        raise HTTPException(409, "Report granulare non valido: rianalisi necessaria") from None
+    editorial = None
+    if job.editorial is not None:
+        try:
+            candidate = EditorialDraft.model_validate(job.editorial)
+            if not validate_editorial_draft(candidate, source):
+                editorial = candidate
+        except ValidationError:
+            editorial = None
+    if editorial is None:
+        try:
+            editorial = request.app.state.editorial_enricher.enrich(source)
+        except EditorialGenerationError as exc:
+            raise HTTPException(503, str(exc)) from None
+        request.app.state.store.save_editorial(
+            job.id, editorial.model_dump(mode="json")
+        )
+    try:
+        report = build_report_v2(job.report, reference.video_id, editorial)
+    except ValueError:
+        raise HTTPException(409, "Report granulare non valido: rianalisi necessaria") from None
+    return Response(
+        report.model_dump_json(indent=2, by_alias=True, exclude_none=True),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="report-v2-{job.id}.json"'},
+    )
 
 
 @router.get("/jobs/{job_id}/report.json")

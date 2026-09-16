@@ -141,7 +141,8 @@ def _apply_price(data: dict[str, Any]) -> dict[str, Any]:
 
 
 class AcademyGenerator:
-    MODEL = "gpt-4o-mini"
+    # Same Responses API compatibility constraint as the analysis pipeline.
+    MODEL = "gpt-5.6-luna"
     MAX_OUTPUT_TOKENS = 12_000
 
     def __init__(self, client: Any) -> None:

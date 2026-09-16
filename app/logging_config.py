@@ -13,6 +13,7 @@ from copy import copy
 from functools import wraps
 import logging
 import math
+import re
 from threading import RLock
 from uuid import UUID
 
@@ -31,7 +32,7 @@ _CODES = {"ok", "cancelled", "invalid_link", "bunny_auth", "not_found", "protect
           "timeout", "transport", "remote_response", "invalid_request", "unauthorized",
           "log_suppressed", "MATERIALE_NON_RAGGIUNGIBILE"}
 _DETAIL_CODES = {
-    "window_payload", "window_context", "window_contract",
+    "window_payload", "window_context", "window_contract", "window_incomplete",
     "materialize_length", "materialize_empty", "materialize_indexes",
     "materialize_margin", "materialize_labels", "materialize_source_conflict",
     "alignment_invalid", "alignment_word_evidence", "alignment_source_split",
@@ -74,6 +75,9 @@ class SafeEventFilter(logging.Filter):
                             event[key] = value
                     except ValueError:
                         pass
+                elif key == "remote_type" and type(value) is str \
+                        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,60}", value):
+                    event[key] = value
                 elif key in {"status_code", "attempt"} and type(value) is int:
                     if (key == "status_code" and 100 <= value <= 599) or (key == "attempt" and 1 <= value <= 100):
                         event[key] = value
@@ -158,10 +162,11 @@ def job_log_context(job_id: UUID):
 def log_event(phase: str, *, elapsed_seconds: float, error_code: str = "ok",
               status_code: int | None = None, attempt: int | None = None,
               route: str | None = None, method: str | None = None,
-              detail_code: str | None = None) -> None:
+              detail_code: str | None = None, remote_type: str | None = None) -> None:
     event = {"job_id": _job_id.get(), "phase": phase, "elapsed_seconds": elapsed_seconds,
              "error_code": error_code, "status_code": status_code, "attempt": attempt,
-             "route": route, "method": method, "detail_code": detail_code}
+             "route": route, "method": method, "detail_code": detail_code,
+             "remote_type": remote_type}
     record = logging.LogRecord("app.events", logging.INFO, __file__, 0, event, (), None)
     _filter.filter(record)
     logging.getLogger("app.events").info(record.msg)

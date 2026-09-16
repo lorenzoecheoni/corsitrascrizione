@@ -11,6 +11,7 @@ from typing import Literal, TypeVar
 
 import httpx
 from openai import APIStatusError, APITimeoutError, OpenAI
+from openai.types.responses import Response
 from pydantic import BaseModel, Field, ValidationError
 
 from app.academy_registry import find_registry_person, person_key
@@ -76,6 +77,7 @@ class AnalysisError(Exception):
         retry_after_seconds: float | None = None,
         stage: AnalysisStage = "consolidation",
         detail_code: str | None = None,
+        remote_type: str | None = None,
     ) -> None:
         if stage not in {"visual", "window", "consolidation", "boundary"}:
             raise ValueError("Fase di analisi non valida")
@@ -85,6 +87,7 @@ class AnalysisError(Exception):
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
         self.detail_code = detail_code
+        self.remote_type = remote_type
         self.retryable = code in {"timeout", "rate_limit", "server"}
 
 
@@ -109,10 +112,11 @@ _BOUNDARY_DETAIL_BY_MESSAGE = {
 
 
 def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
+    remote_type = type(exc).__name__
     if isinstance(exc, (APITimeoutError, TimeoutError, httpx.TimeoutException)):
-        return AnalysisError("timeout", stage=stage)
+        return AnalysisError("timeout", stage=stage, remote_type=remote_type)
     if isinstance(exc, ValidationError):
-        return AnalysisError("response", stage=stage)
+        return AnalysisError("response", stage=stage, remote_type=remote_type)
     if isinstance(exc, APIStatusError):
         status = exc.status_code
         code = ("rate_limit" if status == 429 else "server" if 500 <= status <= 599
@@ -127,8 +131,9 @@ def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
                 pass
             if retry_after is None:
                 retry_after = parse_reset_seconds(exc.response.headers.get("x-ratelimit-reset-project-tokens", ""))
-        return AnalysisError(code, stage=stage, status_code=status, retry_after_seconds=retry_after)
-    return AnalysisError("transport", stage=stage)
+        return AnalysisError(code, stage=stage, status_code=status, retry_after_seconds=retry_after,
+                             remote_type=remote_type)
+    return AnalysisError("transport", stage=stage, remote_type=remote_type)
 
 
 def _analysis_retry_delay(exc: Exception, default_delay: float) -> float:
@@ -367,7 +372,15 @@ class OpenAIAnalyzer:
                     )
                     try:
                         self._rate_gate.observe(model, raw.headers)
-                        response = raw.parse()
+                        try:
+                            response = raw.parse()
+                        except ValidationError:
+                            # The SDK eagerly validates the model output text
+                            # against text_format and raises before the local
+                            # repair loop can inspect the payload. Keep the
+                            # already-validated envelope so the raw JSON text
+                            # reaches the local validation and repair path.
+                            response = Response.model_validate(raw.http_response.json())
                     finally:
                         del raw
                 except CancelledError:
@@ -406,12 +419,16 @@ class OpenAIAnalyzer:
                     current_max_output_tokens = max_output_tokens * 2
                     output_limit_retry_used = True
                     continue
-                raise AnalysisError("response", stage=stage) from None
+                raise AnalysisError("response", stage=stage, detail_code="window_incomplete") from None
             try:
-                parsed = response.output_parsed
+                parsed = getattr(response, "output_parsed", None)
                 if parsed is None:
-                    raise ValueError
-                data = parsed.model_dump(mode="json") if isinstance(parsed, BaseModel) else parsed
+                    # Envelope-only fallback: parse the raw output text here so
+                    # schema mismatches enter the repair loop instead of the
+                    # remote-error path.
+                    data = json.loads(response.output_text)
+                else:
+                    data = parsed.model_dump(mode="json") if isinstance(parsed, BaseModel) else parsed
                 # Detach normalization from caller/SDK-owned objects.
                 data = json.loads(json.dumps(data))
                 prepare(data)
@@ -504,7 +521,7 @@ class OpenAIAnalyzer:
         try:
             windows = split_transcript_windows(transcription.segments)
         except ValueError:
-            raise AnalysisError("response", stage="window") from None
+            raise AnalysisError("response", stage="window", detail_code="window_payload") from None
         analyses: list[WindowAnalysis] = []
         for index, window in enumerate(windows, start=1):
             check_cancelled(cancellation_event)
@@ -525,7 +542,9 @@ class OpenAIAnalyzer:
                 prepare=lambda data: _normalize_window_speakers(data, speaker_name_hints),
                 validate=lambda result, current=window, previous=previous_window: _window_errors(current, result, previous),
                 cancellation_event=cancellation_event,
-                usage=usage, model="gpt-4o-mini", max_output_tokens=2000,
+                # Legacy chat models no longer survive Responses API output
+                # validation in current SDKs; keep one supported model family.
+                usage=usage, model="gpt-5.6-luna", max_output_tokens=2000,
                 max_repair_chars=MAX_WINDOW_CHARS,
                 stage="window",
                 validation_error_code="boundaries",
@@ -561,7 +580,7 @@ class OpenAIAnalyzer:
             text_format=ConsolidatedTextReport, instructions=CONSOLIDATION_PROMPT, payload=payload,
             prepare=lambda data: _normalize_speakers(data, speaker_name_hints),
             validate=lambda content: _content_errors(content, metadata.duration_seconds),
-            cancellation_event=cancellation_event, usage=usage, model="gpt-4o-mini",
+            cancellation_event=cancellation_event, usage=usage, model="gpt-5.6-luna",
             max_output_tokens=4000,
             max_repair_chars=MAX_CONSOLIDATION_CHARS,
             stage="consolidation",

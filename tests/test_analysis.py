@@ -9,6 +9,7 @@ from uuid import UUID
 
 import httpx
 from openai import APIStatusError, OpenAI
+from pydantic import ValidationError
 from PIL import Image
 import pytest
 
@@ -666,7 +667,7 @@ def test_long_transcript_is_mapped_in_bounded_windows_before_small_final_call(in
     assert "data:image" not in final_call["input"]
     assert [call["max_output_tokens"] for call in window_calls] == [2000] * len(window_calls)
     assert final_call["max_output_tokens"] == 4000
-    assert all(call["model"] == "gpt-4o-mini" and call["store"] is False for call in client.calls)
+    assert all(call["model"] == "gpt-5.6-luna" and call["store"] is False for call in client.calls)
     assert progress == [("transcript", i, 10) for i in range(1, 11)] + [("consolidation", 0, 1)]
     assert result.usage.requests == 11
     assert result.usage.input_tokens == 110
@@ -764,7 +765,7 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     assert client.max_retries == 0
     assert [call["text_format"] for call in client.calls] == [SlideBatchResult, WindowAnalysis, ConsolidatedTextReport]
     assert all(call["store"] is False for call in client.calls)
-    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini"]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna"] * 3
     payload = json.loads(client.calls[-1]["input"])
     assert "transcription" not in payload
     assert json.loads(client.calls[1]["input"])["segments"] == [{
@@ -787,6 +788,50 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
                for part in images)
 
 
+class EagerFailClient(FakeClient):
+    """Simulates SDK eager output parsing raising before the local repair loop."""
+
+    def raw_parse(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        outcome = self.outcomes.pop(0)
+        if outcome == "eager":
+            raw_json = {
+                "id": "resp_test", "object": "response", "created_at": 1,
+                "model": "gpt-5.6-luna", "status": "completed",
+                "output": [{
+                    "id": "msg_test", "type": "message", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "annotations": [],
+                                 "text": json.dumps(window_result())}],
+                }],
+                "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+            }
+            try:
+                WindowAnalysis.model_validate({})
+            except ValidationError as exc:
+                eager_error = exc
+            return SimpleNamespace(
+                headers={}, http_response=SimpleNamespace(json=lambda: raw_json),
+                parse=lambda: (_ for _ in ()).throw(eager_error),
+            )
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(kwargs)
+        return SimpleNamespace(headers={}, parse=lambda: SimpleNamespace(output_parsed=outcome))
+
+
+def test_eager_sdk_validation_error_falls_back_to_envelope_output_text(inputs, content):
+    client = EagerFailClient(visual("slide", "camera_change", "uncertain"), "eager", content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert isinstance(result, AcademyContent)
+    assert [call["text_format"] for call in client.calls] == [
+        SlideBatchResult, WindowAnalysis, ConsolidatedTextReport,
+    ]
+
+
 def test_fast_analysis_uses_complete_window_path_for_globally_diarized_transcript(inputs, content):
     client = FakeClient(
         visual("slide", "camera_change", "uncertain"), window_result(), content
@@ -800,9 +845,7 @@ def test_fast_analysis_uses_complete_window_path_for_globally_diarized_transcrip
     assert [call["text_format"] for call in client.calls] == [
         SlideBatchResult, WindowAnalysis, ConsolidatedTextReport,
     ]
-    assert [call["model"] for call in client.calls] == [
-        "gpt-5.6-luna", "gpt-4o-mini", "gpt-4o-mini",
-    ]
+    assert [call["model"] for call in client.calls] == ["gpt-5.6-luna"] * 3
     assert all(call["store"] is False for call in client.calls)
     window_payload = json.loads(client.calls[1]["input"])
     assert window_payload["segments"][0]["diarization_label"] == "chunk-0:A"

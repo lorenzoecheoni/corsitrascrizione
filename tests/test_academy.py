@@ -137,7 +137,7 @@ def test_generator_returns_valid_schema_and_overwrites_price_from_lesson_seconds
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["store"] is False
-    assert call["model"] == "gpt-4o-mini"
+    assert call["model"] == "gpt-5.6-luna"
     assert call["text_format"].__name__ == "AcademyDraft"
     assert "Governance delle holding" not in call["instructions"]
     assert "Governance delle holding" in call["input"]

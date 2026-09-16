@@ -29,15 +29,15 @@ Regole editoriali:
   nomi; separa solo se ogni parte supera 8 minuti e ha un titolo proprio;
 - accoda domande sotto 8 minuti alla lezione che le ha generate; da 8 minuti in
   su crea una lezione "Domande e risposte" in coda al modulo;
-- imposta hero e anteprima sulla stessa unica lezione rappresentativa, di norma
-  la prima vera lezione da 8 a 15 minuti, mai sui soli saluti;
+- imposta hero e anteprima solo sulla lezione che nasce dal capitolo con
+  accesso pubblico; se nessun capitolo è pubblico, non impostare alcuna hero;
 - usa le slide come prova per titolo, descrizione e quiz, mai come confini
   automatici di lezione;
 - compila 5-7 competenze che iniziano con un verbo;
 - compila i profili nel formato "Categoria | frase";
 - scrivi la presentazione in esattamente 3 paragrafi;
 - scegli l'area solo fra i valori ammessi dallo schema;
-- non inserire crediti; il prezzo verrà calcolato dal software.
+- non inserire crediti, prezzo, ore né durata: sono calcolati dal software.
 """.strip()
 
 

@@ -185,9 +185,7 @@ def test_legacy_even_with_audio_provenance_requires_granular_reanalysis(client):
 
 def test_malformed_profile2_returns_static_contract_failure(client):
     report = governance_report()
-    for chapter in report.interventions:
-        chapter.tipo = "saluti"
-        chapter.punti_chiave = []
+    report.interventions[0].chapter_number = 2
     report.material_failures = ["parser private query token=SECRET"]
     store = client.app.state.store
     job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")

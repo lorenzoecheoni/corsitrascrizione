@@ -129,11 +129,16 @@ class FakeClient:
 
 
 def test_generator_returns_valid_schema_and_overwrites_price_from_lesson_seconds():
-    client = FakeClient(valid_academy(price=999))
+    draft = valid_academy(price=999)
+    draft["corso"]["ore"] = 12
+    draft["corso"]["durata"] = "durata inventata"
+    client = FakeClient(draft)
 
     result = AcademyGenerator(client).generate(source_report())
 
     assert result.corso.prezzo == 97
+    assert result.corso.ore == 0.5
+    assert result.corso.durata == "1 modulo · ~0.5h"
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["store"] is False

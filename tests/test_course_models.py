@@ -304,7 +304,7 @@ def test_academy_validation_rejects_invented_speaker_role():
     assert any("ruolo" in error for error in errors)
 
 
-def test_academy_validation_checks_refs_bounds_overlap_speakers_price_and_hero():
+def test_academy_validation_checks_refs_bounds_overlap_speakers_and_price():
     source = source_report()
     final = academy_import()
     data = final.model_dump(mode="json", by_alias=True)
@@ -312,7 +312,6 @@ def test_academy_validation_checks_refs_bounds_overlap_speakers_price_and_hero()
     data["moduli"][0]["lezioni"][0]["relatori"] = ["Persona Inventata"]
     data["moduli"][0]["lezioni"][1]["inizio"] = "0:09:59"
     data["moduli"][0]["lezioni"][1]["fine"] = "0:21:00"
-    data["moduli"][0]["lezioni"][0]["hero"] = False
     data["corso"]["prezzo"] = 147
     invalid = AcademyImport.model_validate(data)
     errors = validate_academy_import(invalid, source)
@@ -320,8 +319,15 @@ def test_academy_validation_checks_refs_bounds_overlap_speakers_price_and_hero()
     assert any("relatore" in error.lower() for error in errors)
     assert any("sovrapp" in error.lower() for error in errors)
     assert any("durata" in error.lower() for error in errors)
-    assert any("hero" in error.lower() for error in errors)
     assert any("prezzo" in error.lower() for error in errors)
+
+
+def test_academy_contract_allows_course_without_hero():
+    data = academy_import().model_dump(mode="json", by_alias=True)
+    data["moduli"][0]["lezioni"][0]["hero"] = False
+    data["moduli"][0]["lezioni"][0]["anteprima"] = False
+    valid = AcademyImport.model_validate(data)
+    assert not any("hero" in error.lower() for error in validate_academy_import(valid, source_report()))
 
 
 def test_academy_contract_rejects_two_heroes():

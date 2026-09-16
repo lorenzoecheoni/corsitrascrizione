@@ -252,23 +252,35 @@ def test_public_preview_skips_nondidactic_segments_and_includes_900_seconds(kind
     assert intermediate_report.choose_public_intervention(intermediate_report.normalize_interventions(report)) == "v1-i002"
 
 
-def test_profile2_without_valid_preview_fails_without_inventing_chapters():
+def test_profile2_without_valid_preview_warns_without_inventing_chapters():
     report = governance_report()
     for chapter in report.interventions:
         chapter.tipo = "saluti"
         chapter.punti_chiave = []
-    with pytest.raises(ValueError, match="pubblico"):
-        build_intermediate_report(report, TARGET_GUID)
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert all(item.accesso == "iscritti" for item in result.video[0].interventi)
+    assert any(
+        check.livello == "avviso" and check.codice == "ANTEPRIMA_ASSENTE"
+        for check in result.verifiche_richieste
+    )
 
 
-def test_profile2_cannot_publish_an_oversized_preview_fallback():
+def test_profile2_oversized_preview_candidate_falls_back_to_warning():
     report = governance_report()
     chapter = report.interventions[0].model_copy(update={"end_seconds": 5789, "chapters_in_block": 1})
     report.interventions = [chapter]
     report.speech_blocks = [report.speech_blocks[0].model_copy(update={"end_seconds": 5789})]
     report.boundaries = []
-    with pytest.raises(ValueError, match="pubblico"):
-        build_intermediate_report(report, TARGET_GUID)
+
+    result = build_intermediate_report(report, TARGET_GUID)
+
+    assert all(item.accesso == "iscritti" for item in result.video[0].interventi)
+    assert any(
+        check.livello == "avviso" and check.codice == "ANTEPRIMA_ASSENTE"
+        for check in result.verifiche_richieste
+    )
 
 
 @pytest.mark.parametrize("defect", ["unknown_reference", "empty_id", "missing_origin"])
@@ -1489,6 +1501,7 @@ def test_missing_speaker_on_spoken_segment_is_critical_verification() -> None:
     assert [(check.livello, check.codice, check.intervento) for check in checks] == [
         ("critico", "RELATORE_NON_IDENTIFICATO", "v1-i001"),
         ("avviso", "INTERVENTO_BREVE", "v1-i001"),
+        ("avviso", "ANTEPRIMA_ASSENTE", None),
     ]
 
 

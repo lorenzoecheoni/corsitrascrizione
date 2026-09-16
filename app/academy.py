@@ -128,7 +128,7 @@ def _as_detached_json(value: Any) -> dict[str, Any]:
     return json.loads(json.dumps(value, ensure_ascii=False))
 
 
-def _apply_price(data: dict[str, Any]) -> dict[str, Any]:
+def _apply_computed_fields(data: dict[str, Any]) -> dict[str, Any]:
     included_seconds = 0
     for module in data.get("moduli", []):
         for lesson in module.get("lezioni", []):
@@ -137,6 +137,12 @@ def _apply_price(data: dict[str, Any]) -> dict[str, Any]:
             included_seconds += parse_hms(lesson["fine"]) - parse_hms(lesson["inizio"])
     updated = json.loads(json.dumps(data, ensure_ascii=False))
     updated["corso"]["prezzo"] = float(academy_price(included_seconds))
+    ore = max(0.5, round(included_seconds / 1800) / 2)
+    updated["corso"]["ore"] = ore
+    module_count = len(updated.get("moduli", []))
+    updated["corso"]["durata"] = (
+        f"{module_count} modul{'o' if module_count == 1 else 'i'} · ~{ore:g}h"
+    )
     return updated
 
 
@@ -199,7 +205,7 @@ class AcademyGenerator:
             errors: list[dict[str, Any] | str]
             try:
                 data = _as_detached_json(parsed)
-                candidate = AcademyImport.model_validate(_apply_price(data))
+                candidate = AcademyImport.model_validate(_apply_computed_fields(data))
             except (ValidationError, ValueError, TypeError, KeyError) as error:
                 if isinstance(error, ValidationError):
                     errors = _pydantic_errors(error)

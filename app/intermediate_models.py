@@ -25,7 +25,7 @@ VerificationCode = Literal[
     "RELATORE_NON_NEL_REGISTRO", "INTERVENTO_BREVE",
     "CONFIDENZA_BASSA", "MATERIALE_NON_RAGGIUNGIBILE", "CONFINE",
     "INTERVENTO_LUNGO", "SLIDE_NON_ABBINATA", "ALIAS_RELATORE_AMBIGUO",
-    "RELATORE_INFERITO", "RELATORE_NON_COERENTE",
+    "RELATORE_INFERITO", "RELATORE_NON_COERENTE", "ANTEPRIMA_ASSENTE",
 ]
 Access = Literal["pubblico", "iscritti"]
 NameOrigin = Literal["audio", "slide", "inventario", "metadata", "revisione"]
@@ -40,7 +40,7 @@ _WARNING_CODES = {
     "RELATORE_NON_NEL_REGISTRO", "INTERVENTO_BREVE", "CONFIDENZA_BASSA",
     "MATERIALE_NON_RAGGIUNGIBILE", "CONFINE", "INTERVENTO_LUNGO",
     "SLIDE_NON_ABBINATA", "ALIAS_RELATORE_AMBIGUO",
-    "RELATORE_INFERITO", "RELATORE_NON_COERENTE",
+    "RELATORE_INFERITO", "RELATORE_NON_COERENTE", "ANTEPRIMA_ASSENTE",
 }
 
 
@@ -380,11 +380,14 @@ class IntermediateVideoV11(_Model):
                 raise ValueError("i capitoli di un blocco devono essere contigui")
 
         public_chapters = [chapter for chapter in self.interventi if chapter.accesso == "pubblico"]
-        if len(public_chapters) != 1 or public_chapters[0].tipo != "intervento":
-            raise ValueError("è richiesto esattamente un capitolo didattico pubblico")
-        public_duration = public_chapters[0].end_seconds - public_chapters[0].start_seconds
-        if not 480 <= public_duration <= 900:
-            raise ValueError("il capitolo didattico pubblico deve durare 480-900 secondi")
+        if len(public_chapters) > 1:
+            raise ValueError("è ammesso al più un capitolo didattico pubblico")
+        if public_chapters:
+            preview = public_chapters[0]
+            if preview.tipo != "intervento":
+                raise ValueError("il capitolo pubblico deve essere didattico")
+            if not 480 <= preview.end_seconds - preview.start_seconds <= 900:
+                raise ValueError("il capitolo didattico pubblico deve durare 480-900 secondi")
         return self
 
 
@@ -414,8 +417,9 @@ class IntermediateEditorialGuideV11(_Model):
         "riferimenti a materiale e pagina; non sono mai confini automatici di lezione."
     )
     anteprima: str = (
-        "Il solo capitolo con accesso pubblico è il candidato hero/anteprima "
-        "della piattaforma."
+        "Il capitolo con accesso pubblico, se presente, è il candidato "
+        "hero/anteprima della piattaforma; se nessun capitolo è pubblico, il "
+        "corso nasce senza anteprima gratuita."
     )
     quiz: str = (
         "Formula i quiz dei moduli esclusivamente dai punti_chiave e dai testi "

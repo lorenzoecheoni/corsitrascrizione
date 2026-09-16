@@ -388,6 +388,15 @@ def build_verifications(
                 message="Confidenza dell'intervento inferiore a 0,8.",
             ))
 
+    if not any(item.accesso == "pubblico" for item in interventions):
+        checks.append(_verification(
+            "avviso", "ANTEPRIMA_ASSENTE", video=video.chiave, field="accesso",
+            message=(
+                "Nessun capitolo didattico di 8-15 minuti è pubblico: "
+                "il corso nasce senza anteprima gratuita."
+            ),
+        ))
+
     if interventions and interventions[0].start_seconds != 0:
         checks.append(_verification(
             "critico", "TEMPI_INCOERENTI", video=video.chiave,

@@ -402,8 +402,8 @@ def validate_academy_import(
                 errors.append(f"Le lezioni del video {video_key} si sovrappongono.")
                 break
 
-    if len(hero_lessons) != 1:
-        errors.append("Il JSON Academy deve contenere una sola lezione hero.")
+    if len(hero_lessons) > 1:
+        errors.append("Il JSON Academy non può contenere più di una lezione hero.")
     if included_seconds:
         try:
             expected_price = academy_price(included_seconds)

@@ -195,7 +195,10 @@ def test_intermediate_json_exposes_blocks_chapters_cost_and_one_public_preview()
         "trascrizione": .234567, "analisi": .345678, "criterio": "Costi persistiti per richiesta.",
     }
     payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
-    assert set(payload) == {"versione", "stato", "corso", "relatori", "video", "verifiche_richieste"}
+    assert set(payload) == {
+        "versione", "stato", "corso", "guida_editoriale", "relatori", "video",
+        "verifiche_richieste",
+    }
     assert payload["video"][0]["interventi"][1]["confine_inizio"] == {
         "motivo_editoriale": "slide_e_tema", "regola_audio": "short_pause", "slide_indizio": "0:09:59",
     }
@@ -318,7 +321,8 @@ def test_profile2_markdown_and_text_render_the_same_persisted_contract():
 def test_profile2_only_critical_identity_or_timeline_warnings_require_verification(critical):
     report = governance_report()
     if critical == "speaker":
-        report.interventions[0].relatori = []
+        report.speech_blocks[1].relatori = []
+        report.interventions[3].relatori = []
     else:
         report.duration_seconds = 5790
     result = build_intermediate_report(report, TARGET_GUID)
@@ -1666,3 +1670,77 @@ def test_parse_material_source_rejects_mixed_title_url_separators() -> None:
     )
 
     assert material is None
+
+
+def test_profile2_infers_unambiguous_missing_chapter_speaker():
+    report = governance_report()
+    report.interventions[4].relatori = []
+    result = build_intermediate_report(report, TARGET_GUID)
+    chapter = result.video[0].interventi[4]
+    assert chapter.id == "v1-i005"
+    assert chapter.relatori == ["Luigi Morra"]
+    inferred = [check for check in result.verifiche_richieste
+                if check.codice == "RELATORE_INFERITO"]
+    assert [check.intervento for check in inferred] == ["v1-i005"]
+    assert inferred[0].livello == "avviso"
+    assert not any(check.codice == "RELATORE_NON_IDENTIFICATO"
+                   for check in result.verifiche_richieste)
+    assert result.stato == "verificato"
+
+
+def test_profile2_keeps_critical_when_missing_speaker_is_ambiguous():
+    report = governance_report()
+    report.speech_blocks[1].relatori = []
+    report.interventions[3].relatori = []
+    result = build_intermediate_report(report, TARGET_GUID)
+    checks = result.verifiche_richieste
+    assert any(check.codice == "RELATORE_NON_IDENTIFICATO"
+               and check.intervento == "v1-i004" for check in checks)
+    assert not any(check.codice == "RELATORE_INFERITO" for check in checks)
+    assert result.stato == "da_verificare"
+
+
+def test_profile2_warns_when_chapter_speaker_conflicts_with_block():
+    report = governance_report()
+    report.interventions[4].relatori = ["Gaetano De Vito"]
+    result = build_intermediate_report(report, TARGET_GUID)
+    checks = [check for check in result.verifiche_richieste
+              if check.codice == "RELATORE_NON_COERENTE"]
+    assert [check.intervento for check in checks] == ["v1-i005"]
+    assert result.stato == "verificato"
+
+
+def test_export_carries_fixed_editorial_guide_for_course_builders():
+    result = build_intermediate_report(governance_report(), TARGET_GUID)
+    guide = result.guida_editoriale
+    assert "capitolo" in guide.lezioni and "8-15" in guide.lezioni
+    assert "2-6" in guide.moduli
+    assert "saluti" in guide.segmenti_non_didattici
+    assert "hero" in guide.anteprima
+    payload = result.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert payload["guida_editoriale"] == guide.model_dump()
+
+
+def test_slide_text_truncates_at_word_boundary_within_limit():
+    report = governance_report()
+    report.slides[0].visible_content = ["parola " * 90]
+    slide = build_intermediate_report(report, TARGET_GUID).video[0].slide[0]
+    assert len(slide.testo_principale) <= 500
+    assert slide.testo_principale.endswith("parola …")
+
+
+def test_slide_text_without_boundary_falls_back_to_hard_window():
+    report = governance_report()
+    report.slides[0].visible_content = ["x" * 600]
+    slide = build_intermediate_report(report, TARGET_GUID).video[0].slide[0]
+    assert slide.testo_principale == "x" * 500
+
+
+def test_export_normalizes_language_name_casing_only():
+    report = governance_report()
+    report.detected_language = "italiano"
+    assert build_intermediate_report(report, TARGET_GUID).video[0].lingua == "Italiano"
+    report.detected_language = "it"
+    assert build_intermediate_report(report, TARGET_GUID).video[0].lingua == "it"
+    report.detected_language = "Italiano"
+    assert build_intermediate_report(report, TARGET_GUID).video[0].lingua == "Italiano"

@@ -899,7 +899,8 @@ def test_completed_job_downloads_and_page_escape_untrusted_content(client):
     assert 'filename="report-intermedio-' in json_response.headers["content-disposition"]
     payload = json_response.json()
     assert set(payload) == {
-        "versione", "stato", "corso", "relatori", "video", "verifiche_richieste",
+        "versione", "stato", "corso", "guida_editoriale", "relatori", "video",
+        "verifiche_richieste",
     }
     assert payload["versione"] == 1
     assert payload["video"][0]["guid"] == VIDEO_ID

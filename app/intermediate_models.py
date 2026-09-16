@@ -25,6 +25,7 @@ VerificationCode = Literal[
     "RELATORE_NON_NEL_REGISTRO", "INTERVENTO_BREVE",
     "CONFIDENZA_BASSA", "MATERIALE_NON_RAGGIUNGIBILE", "CONFINE",
     "INTERVENTO_LUNGO", "SLIDE_NON_ABBINATA", "ALIAS_RELATORE_AMBIGUO",
+    "RELATORE_INFERITO", "RELATORE_NON_COERENTE",
 ]
 Access = Literal["pubblico", "iscritti"]
 NameOrigin = Literal["audio", "slide", "inventario", "metadata", "revisione"]
@@ -39,6 +40,7 @@ _WARNING_CODES = {
     "RELATORE_NON_NEL_REGISTRO", "INTERVENTO_BREVE", "CONFIDENZA_BASSA",
     "MATERIALE_NON_RAGGIUNGIBILE", "CONFINE", "INTERVENTO_LUNGO",
     "SLIDE_NON_ABBINATA", "ALIAS_RELATORE_AMBIGUO",
+    "RELATORE_INFERITO", "RELATORE_NON_COERENTE",
 }
 
 
@@ -386,6 +388,41 @@ class IntermediateVideoV11(_Model):
         return self
 
 
+class IntermediateEditorialGuideV11(_Model):
+    """Istruzioni deterministiche per chi trasforma il report in un corso.
+
+    Il contenuto è fisso: il builder non la personalizza, così ogni export
+    v1.1 porta con sé le stesse regole di mappatura capitoli→lezioni.
+    """
+
+    lezioni: str = (
+        "Ogni capitolo (intervento con capitolo_numero e capitoli_blocco) è una "
+        "lezione candidata: dura in genere 8-15 minuti; il tetto editoriale è 20 "
+        "minuti e la tolleranza di importazione 40."
+    )
+    moduli: str = (
+        "Un modulo raggruppa 2-6 lezioni video consecutive dello stesso tema; "
+        "ogni blocco di parlato è il candidato naturale di modulo."
+    )
+    segmenti_non_didattici: str = (
+        "I segmenti saluti, cambio_relatore, pausa e logistica sono fatti del "
+        "video: assorbili nella lezione adiacente se durano meno di due minuti, "
+        "altrimenti escludili; non creare lezioni dedicate."
+    )
+    slide: str = (
+        "Le slide sono prove per titoli, descrizioni e quiz e portano i "
+        "riferimenti a materiale e pagina; non sono mai confini automatici di lezione."
+    )
+    anteprima: str = (
+        "Il solo capitolo con accesso pubblico è il candidato hero/anteprima "
+        "della piattaforma."
+    )
+    quiz: str = (
+        "Formula i quiz dei moduli esclusivamente dai punti_chiave e dai testi "
+        "delle slide dei capitoli coperti."
+    )
+
+
 class VerificationRequestV11(_Model):
     livello: VerificationLevel
     codice: VerificationCode
@@ -407,6 +444,9 @@ class IntermediateReportV11(_Model):
     versione: Literal[1]
     stato: Literal["verificato", "da_verificare"]
     corso: IntermediateCourseV11
+    guida_editoriale: IntermediateEditorialGuideV11 = Field(
+        default_factory=IntermediateEditorialGuideV11
+    )
     relatori: list[IntermediateSpeakerV11]
     video: list[IntermediateVideoV11] = Field(min_length=1, max_length=1)
     verifiche_richieste: list[VerificationRequestV11]
@@ -440,6 +480,7 @@ __all__ = [
     "IntermediateReportV11", "IntermediateCourseV11", "IntermediateSpeakerV11",
     "IntermediateVideoV11", "IntermediateInterventionV11", "IntermediateSlideV11",
     "IntermediateMaterialV11", "IntermediateSpeechBlockV11", "IntermediateCostV11",
+    "IntermediateEditorialGuideV11",
     "VerificationRequestV11", "VerificationCode", "Access",
     "NameOrigin", "format_hms", "parse_hms",
 ]

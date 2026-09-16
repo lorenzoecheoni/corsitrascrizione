@@ -72,13 +72,20 @@ _GENERIC_SLIDE = re.compile(
     r"(?:slide|pagina|page|diapositiva)(?:\s*\d+)?|titolo|presentazione|untitled",
     re.IGNORECASE,
 )
+# Ringraziamenti e contatti sono fotogrammi di cortesia, non titoli di
+# capitolo: usarli produrrebbe lezioni denominate «Grazie».
+_NOISY_SLIDE_TITLE = re.compile(
+    r"(?:grazie(?:\s+|$)|thanks?\b|contatt\w*|ringraziam\w*)",
+    re.IGNORECASE,
+)
 
 
 def _opening_slide(slides: Sequence[SlideChange], start: float) -> SlideChange | None:
     return next((slide for slide in slides
                  if abs(slide.timestamp_seconds - start) <= 30
                  and slide.confidence == "alta" and slide.title and slide.title.strip()
-                 and not _GENERIC_SLIDE.fullmatch(slide.title.strip())), None)
+                 and not _GENERIC_SLIDE.fullmatch(slide.title.strip())
+                 and not _NOISY_SLIDE_TITLE.match(slide.title.strip())), None)
 
 
 def _chapter(units: Sequence[SemanticIntervention], block_id: str, number: int,

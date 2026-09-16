@@ -53,6 +53,96 @@ _INTRODUCTORY_VERB = re.compile(
 )
 
 
+def _single_name(names: Sequence[str]) -> str | None:
+    unique = list(dict.fromkeys(names))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _inherit_chapter_speakers(
+    interventions: Sequence[IntermediateInterventionV11],
+    block_speakers: Mapping[str, Sequence[str]],
+) -> tuple[list[IntermediateInterventionV11], list[VerificationRequestV11]]:
+    """Fill unambiguous missing chapter speakers and warn on incoherent ones.
+
+    A spoken chapter without relatori inherits the speaker only when the
+    evidence is univocal: its own speech block names exactly one person, or
+    the nearest spoken neighbours on both sides agree on a single person.
+    Anything else keeps the critical ``RELATORE_NON_IDENTIFICATO``.
+    """
+    updated = list(interventions)
+    spoken_indexes = [
+        index for index, item in enumerate(updated)
+        if item.tipo not in {"pausa", "logistica"}
+    ]
+    position_of = {index: position for position, index in enumerate(spoken_indexes)}
+    warnings: list[VerificationRequestV11] = []
+    for index in spoken_indexes:
+        item = updated[index]
+        if item.relatori:
+            continue
+        candidates: list[str] = []
+        if item.blocco is not None:
+            block_name = _single_name(block_speakers.get(item.blocco, ()))
+            if block_name is not None:
+                candidates.append(block_name)
+        position = position_of[index]
+        neighbours = []
+        if position > 0:
+            neighbours.append(updated[spoken_indexes[position - 1]].relatori)
+        if position < len(spoken_indexes) - 1:
+            neighbours.append(updated[spoken_indexes[position + 1]].relatori)
+        for neighbour in neighbours:
+            neighbour_name = _single_name(neighbour)
+            if neighbour_name is not None:
+                candidates.append(neighbour_name)
+        name = _single_name(candidates)
+        if name is None or not candidates:
+            continue
+        updated[index] = item.model_copy(update={"relatori": [name]})
+        warnings.append(_verification(
+            "avviso", "RELATORE_INFERITO", video="v1", intervention=item.id,
+            field="relatori",
+            message=(
+                f"Relatore {name} dedotto dal blocco di parlato o dai capitoli "
+                "adiacenti: confermare l'attribuzione prima della pubblicazione."
+            ),
+        ))
+    for index in spoken_indexes:
+        item = updated[index]
+        block_names = list(block_speakers.get(item.blocco or "", ()))
+        if not item.relatori or not block_names:
+            continue
+        if set(item.relatori) == set(block_names):
+            continue
+        warnings.append(_verification(
+            "avviso", "RELATORE_NON_COERENTE", video="v1", intervention=item.id,
+            field="relatori",
+            message=(
+                f"Il capitolo attribuisce {', '.join(item.relatori)} mentre il blocco "
+                f"{item.blocco} elenca {', '.join(block_names)}: controllare l'attribuzione."
+            ),
+        ))
+    return updated, warnings
+
+
+def _truncate_text(text: str, limit: int = 500) -> str:
+    """Truncate at a word or bullet boundary so exported text never breaks mid-word."""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    boundary = max(window.rfind(" "), window.rfind("·"))
+    if boundary >= (limit * 3) // 5:
+        return window[:boundary].rstrip(" ·,;") + " …"
+    return window
+
+
+def _normalize_language(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) > 3 and stripped[:1].islower():
+        return stripped[:1].upper() + stripped[1:]
+    return stripped
+
+
 def _name_key(value: str) -> str:
     folded = "".join(
         character for character in unicodedata.normalize("NFKD", value.casefold())
@@ -462,6 +552,15 @@ def build_intermediate_report(
         "punti_chiave": [corrected(point) for point in item.punti_chiave],
         "blocco": block_ids.get(item.blocco, item.blocco),
     }) for item in normalized]
+    speaker_warnings: list[VerificationRequestV11] = []
+    if report.analysis_profile == 2:
+        exported_block_speakers = {
+            block_ids[block.id]: rewrite_speaker_references(block.relatori, canonical_by_key)
+            for block in report.speech_blocks
+        }
+        corrected_interventions, speaker_warnings = _inherit_chapter_speakers(
+            corrected_interventions, exported_block_speakers,
+        )
     public_id = choose_public_intervention(corrected_interventions)
     interventions = [item.model_copy(update={
         "accesso": "pubblico" if item.id == public_id else "iscritti",
@@ -470,7 +569,7 @@ def build_intermediate_report(
     slides = [{
         "inizio": slide.timestamp_seconds if report.analysis_profile == 2 else min(slide.timestamp_seconds, duration),
         "titolo": corrected(slide.title) if slide.title else "Senza titolo",
-        "testo_principale": corrected(" · ".join(slide.visible_content))[:500],
+        "testo_principale": _truncate_text(corrected(" · ".join(slide.visible_content))),
         "confidenza": _CONFIDENCE_SCORE[slide.confidence],
         "materiale": material_titles.get(slide.material_title, corrected(canonical_material_title(slide.material_title))) if slide.material_title else None,
         "pagina": slide.page,
@@ -482,7 +581,7 @@ def build_intermediate_report(
         "titolo_bunny": corrected(report.bunny_title),
         "durata_secondi": duration,
         "ordine": 1,
-        "lingua": report.detected_language,
+        "lingua": _normalize_language(report.detected_language),
         "sinossi": corrected(report.synopsis),
         "interventi": interventions,
         "slide": slides,
@@ -516,6 +615,7 @@ def build_intermediate_report(
         *build_verifications(video, intermediate_speakers, material_failures),
         *(_ambiguous_alias_warning(name) for name in reconciliation.ambiguous_aliases),
         *boundary_verifications,
+        *speaker_warnings,
     ]
     verifications = _deduplicate_verifications(verifications)
     status = "da_verificare" if any(

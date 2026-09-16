@@ -130,3 +130,14 @@ def test_valid_distinct_points_keep_order_after_duplicate_removal():
     assert plan.groups[0].punti_chiave == ("Uno", "Due", "Tre")
     result = align_intervention_boundaries(540, plan.groups, [])
     assert result.interventions[0].punti_chiave == ["Uno", "Due", "Tre"]
+
+
+@pytest.mark.parametrize("title", ["GRAZIE", "Grazie per l'attenzione", "Contatti"])
+def test_courtesy_slide_titles_never_name_chapters(title):
+    units = [topic_unit(0, 540), topic_unit(540, 1080)]
+    plan = plan_semantic_timeline(units, [
+        SlideChange(timestamp_seconds=540, title=title, confidence="alta"),
+    ])
+    assert plan.groups[1].titolo == "Tema 540"
+    assert plan.groups[1].boundary_reason == "cambio_tema"
+    assert plan.groups[1].slide_hint_seconds is None

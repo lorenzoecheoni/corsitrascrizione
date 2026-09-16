@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from app.intermediate_models import (
     IntermediateCostV11,
+    IntermediateEditorialGuideV11,
     IntermediateReportV11,
     IntermediateSpeechBlockV11,
 )
@@ -93,7 +94,8 @@ def test_boundary_slide_hint_uses_hms_and_round_trips():
     origin.update(motivo_editoriale="slide_e_tema", slide_indizio="0:00:12")
     model = IntermediateReportV11.model_validate(data)
     assert model.video[0].interventi[0].confine_inizio.slide_indizio_seconds == 12
-    assert model.model_dump(mode="json", by_alias=True, exclude_none=True) == data
+    expected = {**data, "guida_editoriale": IntermediateEditorialGuideV11().model_dump()}
+    assert model.model_dump(mode="json", by_alias=True, exclude_none=True) == expected
 
 
 @pytest.mark.parametrize("mutation", [
@@ -210,7 +212,11 @@ def test_v11_rejects_duplicate_intervention_ids():
 
 def test_v11_round_trips_exact_contract():
     model = IntermediateReportV11.model_validate(valid_payload())
-    assert model.model_dump(mode="json", by_alias=True, exclude_none=True) == valid_payload()
+    expected = {
+        **valid_payload(),
+        "guida_editoriale": IntermediateEditorialGuideV11().model_dump(),
+    }
+    assert model.model_dump(mode="json", by_alias=True, exclude_none=True) == expected
 
 
 def test_v11_rejects_generic_speaker_name():
@@ -338,3 +344,29 @@ def test_v11_rejects_values_outside_contract(mutation):
     mutation(data)
     with pytest.raises(ValidationError):
         IntermediateReportV11.model_validate(data)
+
+
+def test_v11_speaker_inference_and_incoherence_codes_are_warnings():
+    data = valid_payload()
+    data["verifiche_richieste"] = [
+        {"livello": "avviso", "codice": "RELATORE_INFERITO", "video": "v1",
+         "intervento": "v1-i001", "campo": "relatori",
+         "messaggio": "Relatore dedotto dal blocco di parlato."},
+        {"livello": "avviso", "codice": "RELATORE_NON_COERENTE", "video": "v1",
+         "intervento": "v1-i001", "campo": "relatori",
+         "messaggio": "Attribuzione da controllare."},
+    ]
+    model = IntermediateReportV11.model_validate(data)
+    assert [check.codice for check in model.verifiche_richieste] == [
+        "RELATORE_INFERITO", "RELATORE_NON_COERENTE",
+    ]
+
+
+def test_v11_editorial_guide_defaults_are_present_and_fixed():
+    model = IntermediateReportV11.model_validate(valid_payload())
+    assert model.guida_editoriale == IntermediateEditorialGuideV11()
+    payload = model.model_dump(mode="json", by_alias=True, exclude_none=True)
+    assert payload["guida_editoriale"] == IntermediateEditorialGuideV11().model_dump()
+    assert set(payload["guida_editoriale"]) == {
+        "lezioni", "moduli", "segmenti_non_didattici", "slide", "anteprima", "quiz",
+    }

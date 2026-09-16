@@ -308,6 +308,34 @@ Ogni elemento di `video` aggiunge `costo_stimato`, derivato dallo stesso
 Gli importi sono stime, non valori di fatturazione, ma il JSON deve consentire
 di leggerli senza accedere al pannello del tool.
 
+### Guida editoriale ed export pulito
+
+La busta aggiunge `guida_editoriale`, un oggetto a contenuto fisso con le
+regole di mappatura per chi trasforma il report in un corso: capitoli come
+lezioni candidate (8-15 minuti, tetto editoriale 20, tolleranza di
+importazione 40), blocchi come candidati naturali di modulo (2-6 lezioni),
+assorbimento o esclusione dei segmenti non didattici, slide come prova e mai
+confine automatico, capitolo pubblico unico come hero/anteprima, quiz
+formulati solo dai punti_chiave e dai testi slide. Il builder non la
+personalizza: ogni export v1.1 porta le stesse regole.
+
+L'export applica inoltre tre normalizzazioni deterministiche:
+
+- i titoli delle slide di cortesia (ringraziamenti e contatti, per esempio
+  «Grazie») non possono diventare titoli di capitolo o blocchi: il
+  pianificatore li ignora e conserva il titolo tematico;
+- `slide[].testo_principale` viene troncato al limite di 500 caratteri solo a
+  confine di parola o elenco, mai nel mezzo di una parola;
+- `video[].lingua` normalizza solo la capitalizzazione dei nomi di lingua
+  (`italiano` → `Italiano`), senza tradurre codici né inventare valori.
+
+Quando un capitolo parlato non ha relatori, l'export tenta una deduzione
+univoca — blocco di appartenenza con esattamente un relatore, oppure due
+capitoli parlati adiacenti d'accordo su una sola persona — e la dichiara con
+`RELATORE_INFERITO`; senza evidenza univoca resta il critico
+`RELATORE_NON_IDENTIFICATO`. La verifica `RELATORE_NON_COERENTE` segnala i
+capitoli i cui relatori divergono dal blocco di parlato di origine.
+
 ## Confini audio
 
 Restano valide le regole già concordate:
@@ -402,7 +430,12 @@ Oltre ai codici già esistenti vengono introdotti:
 - `SLIDE_NON_ABBINATA` — avviso; slide rilevata senza materiale/pagina
   sufficientemente certi;
 - `ALIAS_RELATORE_AMBIGUO` — avviso; titolo o cognome non consentono un merge
-  anagrafico univoco.
+  anagrafico univoco;
+- `RELATORE_INFERITO` — avviso; capitolo parlato senza relatore il cui
+  relatore è stato dedotto in modo univoco dal blocco di parlato o dai
+  capitoli adiacenti: l'attribuzione va confermata prima della pubblicazione;
+- `RELATORE_NON_COERENTE` — avviso; il capitolo attribuisce relatori diversi
+  da quelli del proprio blocco di parlato.
 
 `MATERIALE_NON_RAGGIUNGIBILE` continua a indicare URL/file reali ma non
 accessibili. Un'etichetta priva di sorgente non viene emessa come materiale e

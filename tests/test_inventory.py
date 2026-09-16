@@ -517,7 +517,7 @@ def test_inventory_context_records_safe_failure_for_unresolved_bare_label() -> N
     )
 
 
-def _grid_sheet_payload(*, material_cell) -> dict:
+def _grid_sheet_payload(*, material_cell, link_cell=None) -> dict:
     return {
         "sheets": [{
             "properties": {"sheetId": 0, "title": "Formazione"},
@@ -532,11 +532,83 @@ def _grid_sheet_payload(*, material_cell) -> dict:
                     {"formattedValue": "Corso con hyperlink"},
                     {"formattedValue": "Persona"},
                     material_cell,
-                    {"formattedValue": "bunny"},
+                    link_cell if link_cell is not None else {"formattedValue": "bunny"},
                 ]},
             ]}],
         }],
     }
+
+
+def _fetch_courses(payload: dict) -> list:
+    def handle(request: httpx.Request):
+        return httpx.Response(200, json=payload, request=request)
+
+    client = InventoryClient(
+        SHEET_ID, (DEFAULT_INVENTORY_TABS[0],), service_account_json="configured",
+        token_provider=lambda: "test-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    )
+    try:
+        return client.fetch()
+    finally:
+        client.close()
+
+
+VIDEO_URL = (
+    "https://player.mediadelivery.net/play/748068/"
+    "cbf23d46-d210-4716-809e-e2c1dbb3f4f1"
+)
+
+
+def test_authenticated_fetch_recovers_video_link_behind_placeholder_text() -> None:
+    courses = _fetch_courses(_grid_sheet_payload(
+        material_cell={"formattedValue": "Nessun materiale"},
+        link_cell={"formattedValue": "bunny", "hyperlink": VIDEO_URL},
+    ))
+
+    assert courses[0].link == VIDEO_URL
+    assert courses[0].guid_esplicito == UUID("cbf23d46-d210-4716-809e-e2c1dbb3f4f1")
+
+
+def test_authenticated_fetch_recovers_video_link_behind_an_empty_cell() -> None:
+    courses = _fetch_courses(_grid_sheet_payload(
+        material_cell={"formattedValue": "Nessun materiale"},
+        link_cell={"hyperlink": VIDEO_URL},
+    ))
+
+    assert courses[0].link == VIDEO_URL
+    assert courses[0].guid_esplicito == UUID("cbf23d46-d210-4716-809e-e2c1dbb3f4f1")
+
+
+def test_authenticated_fetch_prefers_explicit_video_link_text_over_the_hyperlink() -> None:
+    explicit = (
+        "https://player.mediadelivery.net/play/748068/"
+        "7f254c4d-fe34-4fd3-a4cf-cda4f447e438"
+    )
+    courses = _fetch_courses(_grid_sheet_payload(
+        material_cell={"formattedValue": "Nessun materiale"},
+        link_cell={"formattedValue": explicit, "hyperlink": VIDEO_URL},
+    ))
+
+    assert courses[0].link == explicit
+    assert courses[0].guid_esplicito == UUID("7f254c4d-fe34-4fd3-a4cf-cda4f447e438")
+
+
+def test_authenticated_fetch_keeps_placeholder_text_when_links_are_ambiguous() -> None:
+    courses = _fetch_courses(_grid_sheet_payload(
+        material_cell={"formattedValue": "Nessun materiale"},
+        link_cell={
+            "formattedValue": "bunny",
+            "hyperlink": VIDEO_URL,
+            "textFormatRuns": [{"format": {"link": {"uri": (
+                "https://player.mediadelivery.net/play/748068/"
+                "9d1ea40a-8bee-4138-a434-30fc7e295c79"
+            )}}}],
+        },
+    ))
+
+    assert courses[0].link == "bunny"
+    assert courses[0].guid_esplicito is None
 
 
 def test_authenticated_fetch_retains_material_cell_hyperlink() -> None:

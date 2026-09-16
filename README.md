@@ -34,6 +34,7 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `DATABASE_PATH` | File SQLite dei report; in produzione Railway usare `/data/bunny-video-report.sqlite3` su volume persistente |
 | `MATERIAL_ALLOWED_HOSTS` | `www.assoholding.it` per impostazione predefinita; eventuali altri hostname esatti, separati da virgole, senza URL, porte o wildcard |
 | `MATERIAL_LIBRARY_DIR` | Facoltativa: cartella con i deck PDF/PPTX scaricati a mano da Drive; le etichette del foglio (es. `Slide Furio D'Andrea`) vengono abbinate ai nomi dei file e il report espone solo il nome del deck, pronto per `--materiali-da` |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Facoltativa: JSON del service account con cui è condiviso il foglio inventario; con esso la lettura avviene via API e recupera anche gli hyperlink delle celle — i link video nascosti dietro testi come `bunny` e gli URL dei deck dietro le etichette delle slide |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 

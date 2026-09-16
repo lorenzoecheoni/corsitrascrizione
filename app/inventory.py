@@ -217,12 +217,10 @@ def _cell_text(cell: object) -> str:
     return value if isinstance(value, str) else str(value)
 
 
-def _material_cell_text(cell: object) -> tuple[str, str | None]:
-    """Keep a cell link only when it identifies one unambiguous source."""
-    value = _cell_text(cell).strip()
-    if not isinstance(cell, dict):
-        return value, None
+def _cell_links(cell: object) -> set[str]:
     links: set[str] = set()
+    if not isinstance(cell, dict):
+        return links
     hyperlink = cell.get("hyperlink")
     if isinstance(hyperlink, str) and hyperlink.strip():
         links.add(hyperlink.strip())
@@ -236,6 +234,13 @@ def _material_cell_text(cell: object) -> tuple[str, str | None]:
             uri = link.get("uri") if isinstance(link, dict) else None
             if isinstance(uri, str) and uri.strip():
                 links.add(uri.strip())
+    return links
+
+
+def _material_cell_text(cell: object) -> tuple[str, str | None]:
+    """Keep a cell link only when it identifies one unambiguous source."""
+    value = _cell_text(cell).strip()
+    links = _cell_links(cell)
     if len(links) > 1:
         return "", "dichiarazione_ambigua"
     if re.search(r"https?://", value, re.I):
@@ -244,6 +249,21 @@ def _material_cell_text(cell: object) -> tuple[str, str | None]:
         return value, None
     link = next(iter(links))
     return (f"{value} | {link}" if value else link), None
+
+
+def _link_cell_text(cell: object) -> str:
+    """Recover the video URL hidden behind placeholder text like “bunny”.
+
+    Explicit text containing a GUID always wins; with several distinct links
+    the cell is ambiguous and the visible text is kept unchanged.
+    """
+    value = _cell_text(cell).strip()
+    if _GUID.search(value):
+        return value
+    links = _cell_links(cell)
+    if len(links) != 1:
+        return value
+    return next(iter(links))
 
 
 def _rows_from_grid_sheet(
@@ -295,6 +315,15 @@ def _rows_from_grid_sheet(
             rows[row_index][column_index] = value
             if rejection is not None:
                 material_rejections.append((row_index + 1, column_index, rejection))
+    link_index = _find_column(
+        [_header(value) for value in rows[0]],
+        {"link", "video", "linkvideo", "linkbunny", "bunny"},
+    )
+    if link_index is not None:
+        for row_index in range(1, len(rows)):
+            rows[row_index][link_index] = _link_cell_text(
+                cells.get((row_index, link_index))
+            )
     return rows, material_rejections
 
 

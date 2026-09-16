@@ -9,6 +9,7 @@ from uuid import UUID
 
 import httpx
 from openai import APIStatusError, OpenAI
+from pydantic import ValidationError
 from PIL import Image
 import pytest
 
@@ -785,6 +786,50 @@ def test_only_slides_feed_final_report_and_every_call_disables_storage(inputs, c
     images = [part for part in client.calls[0]["input"][0]["content"] if part["type"] == "input_image"]
     assert all(part["detail"] == "low" and part["image_url"].startswith("data:image/jpeg;base64,")
                for part in images)
+
+
+class EagerFailClient(FakeClient):
+    """Simulates SDK eager output parsing raising before the local repair loop."""
+
+    def raw_parse(self, **kwargs):
+        self.calls.append(copy.deepcopy(kwargs))
+        outcome = self.outcomes.pop(0)
+        if outcome == "eager":
+            raw_json = {
+                "id": "resp_test", "object": "response", "created_at": 1,
+                "model": "gpt-5.6-luna", "status": "completed",
+                "output": [{
+                    "id": "msg_test", "type": "message", "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "annotations": [],
+                                 "text": json.dumps(window_result())}],
+                }],
+                "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
+            }
+            try:
+                WindowAnalysis.model_validate({})
+            except ValidationError as exc:
+                eager_error = exc
+            return SimpleNamespace(
+                headers={}, http_response=SimpleNamespace(json=lambda: raw_json),
+                parse=lambda: (_ for _ in ()).throw(eager_error),
+            )
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(kwargs)
+        return SimpleNamespace(headers={}, parse=lambda: SimpleNamespace(output_parsed=outcome))
+
+
+def test_eager_sdk_validation_error_falls_back_to_envelope_output_text(inputs, content):
+    client = EagerFailClient(visual("slide", "camera_change", "uncertain"), "eager", content)
+
+    result = OpenAIAnalyzer(client).analyze(**inputs)
+
+    assert isinstance(result, AcademyContent)
+    assert [call["text_format"] for call in client.calls] == [
+        SlideBatchResult, WindowAnalysis, ConsolidatedTextReport,
+    ]
 
 
 def test_fast_analysis_uses_complete_window_path_for_globally_diarized_transcript(inputs, content):

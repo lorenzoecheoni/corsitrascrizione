@@ -11,6 +11,7 @@ from typing import Literal, TypeVar
 
 import httpx
 from openai import APIStatusError, APITimeoutError, OpenAI
+from openai.types.responses import Response
 from pydantic import BaseModel, Field, ValidationError
 
 from app.academy_registry import find_registry_person, person_key
@@ -371,7 +372,15 @@ class OpenAIAnalyzer:
                     )
                     try:
                         self._rate_gate.observe(model, raw.headers)
-                        response = raw.parse()
+                        try:
+                            response = raw.parse()
+                        except ValidationError:
+                            # The SDK eagerly validates the model output text
+                            # against text_format and raises before the local
+                            # repair loop can inspect the payload. Keep the
+                            # already-validated envelope so the raw JSON text
+                            # reaches the local validation and repair path.
+                            response = Response.model_validate(raw.http_response.json())
                     finally:
                         del raw
                 except CancelledError:
@@ -412,10 +421,14 @@ class OpenAIAnalyzer:
                     continue
                 raise AnalysisError("response", stage=stage, detail_code="window_incomplete") from None
             try:
-                parsed = response.output_parsed
+                parsed = getattr(response, "output_parsed", None)
                 if parsed is None:
-                    raise ValueError
-                data = parsed.model_dump(mode="json") if isinstance(parsed, BaseModel) else parsed
+                    # Envelope-only fallback: parse the raw output text here so
+                    # schema mismatches enter the repair loop instead of the
+                    # remote-error path.
+                    data = json.loads(response.output_text)
+                else:
+                    data = parsed.model_dump(mode="json") if isinstance(parsed, BaseModel) else parsed
                 # Detach normalization from caller/SDK-owned objects.
                 data = json.loads(json.dumps(data))
                 prepare(data)

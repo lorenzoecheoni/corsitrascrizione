@@ -513,5 +513,6 @@ class AnalysisPipeline:
                 code = "temporary_failure"
             log_event(phase, elapsed_seconds=monotonic() - started, error_code=code,
                       status_code=getattr(exc, "status_code", None),
-                      detail_code=getattr(exc, "detail_code", None))
+                      detail_code=getattr(exc, "detail_code", None),
+                      remote_type=getattr(exc, "remote_type", None))
             raise PipelineError(code) from None

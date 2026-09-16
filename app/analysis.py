@@ -76,6 +76,7 @@ class AnalysisError(Exception):
         retry_after_seconds: float | None = None,
         stage: AnalysisStage = "consolidation",
         detail_code: str | None = None,
+        remote_type: str | None = None,
     ) -> None:
         if stage not in {"visual", "window", "consolidation", "boundary"}:
             raise ValueError("Fase di analisi non valida")
@@ -85,6 +86,7 @@ class AnalysisError(Exception):
         self.status_code = status_code
         self.retry_after_seconds = retry_after_seconds
         self.detail_code = detail_code
+        self.remote_type = remote_type
         self.retryable = code in {"timeout", "rate_limit", "server"}
 
 
@@ -109,10 +111,11 @@ _BOUNDARY_DETAIL_BY_MESSAGE = {
 
 
 def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
+    remote_type = type(exc).__name__
     if isinstance(exc, (APITimeoutError, TimeoutError, httpx.TimeoutException)):
-        return AnalysisError("timeout", stage=stage)
+        return AnalysisError("timeout", stage=stage, remote_type=remote_type)
     if isinstance(exc, ValidationError):
-        return AnalysisError("response", stage=stage)
+        return AnalysisError("response", stage=stage, remote_type=remote_type)
     if isinstance(exc, APIStatusError):
         status = exc.status_code
         code = ("rate_limit" if status == 429 else "server" if 500 <= status <= 599
@@ -127,8 +130,9 @@ def _remote_error(exc: Exception, stage: AnalysisStage) -> AnalysisError:
                 pass
             if retry_after is None:
                 retry_after = parse_reset_seconds(exc.response.headers.get("x-ratelimit-reset-project-tokens", ""))
-        return AnalysisError(code, stage=stage, status_code=status, retry_after_seconds=retry_after)
-    return AnalysisError("transport", stage=stage)
+        return AnalysisError(code, stage=stage, status_code=status, retry_after_seconds=retry_after,
+                             remote_type=remote_type)
+    return AnalysisError("transport", stage=stage, remote_type=remote_type)
 
 
 def _analysis_retry_delay(exc: Exception, default_delay: float) -> float:
@@ -406,7 +410,7 @@ class OpenAIAnalyzer:
                     current_max_output_tokens = max_output_tokens * 2
                     output_limit_retry_used = True
                     continue
-                raise AnalysisError("response", stage=stage) from None
+                raise AnalysisError("response", stage=stage, detail_code="window_incomplete") from None
             try:
                 parsed = response.output_parsed
                 if parsed is None:
@@ -504,7 +508,7 @@ class OpenAIAnalyzer:
         try:
             windows = split_transcript_windows(transcription.segments)
         except ValueError:
-            raise AnalysisError("response", stage="window") from None
+            raise AnalysisError("response", stage="window", detail_code="window_payload") from None
         analyses: list[WindowAnalysis] = []
         for index, window in enumerate(windows, start=1):
             check_cancelled(cancellation_event)

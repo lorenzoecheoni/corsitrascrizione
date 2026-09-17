@@ -2,7 +2,6 @@
 
 from datetime import date
 import re
-import unicodedata
 from uuid import UUID
 
 from app.editorial import EditorialDraft
@@ -29,23 +28,13 @@ from app.intermediate_models_v2 import (
 from app.intermediate_report import _truncate_text, build_intermediate_report
 from app.models import AcademyReport
 from app.reporting import correct_speaker_name_mentions, reconcile_speakers_detailed
+from app.storage import slugify
 
 
 _DIDACTIC_KINDS = {"intervento", "domande"}
 _LEVEL_V2 = {"critico": "bloccante", "avviso": "avviso"}
 _BUNNY_TITLE_DATE = re.compile(r"(?<!\d)(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})(?!\d)")
 _SLIDE_TEXT_LIMIT = 2000
-
-
-def slugify(value: str) -> str:
-    """Deterministic slug: accents folded, apostrophes dropped, lowercase."""
-    folded = "".join(
-        character
-        for character in unicodedata.normalize("NFKD", value)
-        if not unicodedata.combining(character)
-    )
-    folded = folded.replace("'", "").replace("’", "").lower()
-    return "-".join(re.findall(r"[a-z0-9]+", folded))
 
 
 def _course_code(bunny_title: str, guid: UUID) -> str:

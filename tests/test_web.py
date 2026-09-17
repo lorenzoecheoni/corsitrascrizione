@@ -1487,3 +1487,19 @@ def test_report_v2_returns_a_safe_error_when_enrichment_fails(client):
 
     assert response.status_code == 503
     assert client.app.state.store.get(job.id).editorial is None
+
+
+def test_persisted_cdn_material_url_remains_downloadable(client):
+    report = governance_report()
+    cdn_url = ("https://academy-decks.b-cdn.net/"
+               "00000000-0000-0000-0000-000000000001/slide-furio-dandrea.pptx")
+    report.materials = [report.materials[0].model_copy(update={"url": cdn_url})]
+    store = client.app.state.store
+    job = store.create(f"https://iframe.mediadelivery.net/embed/123/{VIDEO_ID}")
+    store.update(job.id, state=JobState.PROCESSING)
+    store.update(job.id, state=JobState.COMPLETED, report=report)
+
+    response = client.get(f"/jobs/{job.id}/report.json")
+
+    assert response.status_code == 200
+    assert response.json()["video"][0]["materiali"][0]["url"] == cdn_url

@@ -19,6 +19,7 @@ from app.material_registry import AnalysisInventoryContext, MaterialSourceFailur
 from app.materials import DeckPage, MaterialAnalysis, MaterialError, MaterialProcessor
 from app.models import ReportMaterial, SlideChange
 from app.pipeline import AnalysisPipeline, PipelineCancelled, PipelineError
+from app.storage import BunnyStorageError
 from app.transcription import (
     TranscriptSegment, TranscriptWord, TranscriptionError, TranscriptionResult,
 )
@@ -165,6 +166,53 @@ def test_pipeline_materials_persist_verified_links_and_cleanup(components, tmp_p
         assert private not in report.model_dump_json() + caplog.text
 
 
+def test_pipeline_swaps_verified_material_urls_for_the_cdn_copy(components, tmp_path):
+    material_context(components)
+    def fetch(url, workspace, allowed_hosts, cancellation_event):
+        deck = workspace / "furio.pptx"
+        deck.write_bytes(b"deck-bytes")
+        return deck
+    uploads = []
+    def hoster(deck, key):
+        uploads.append(key)
+        return f"https://academy-decks.b-cdn.net/{key}"
+    components.pipeline.material_processor = MaterialProcessor(
+        fetcher=fetch, hoster=hoster,
+        extractor=lambda *args, **kwargs: [DeckPage(1, "Decisioni assembleari")],
+    )
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    video_prefix = str(components.metadata.video_id)
+    assert uploads == [f"{video_prefix}/slide-furio-dandrea.pptx"]
+    assert report.materials == [ReportMaterial(
+        titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
+        url=f"https://academy-decks.b-cdn.net/{video_prefix}/slide-furio-dandrea.pptx",
+        pagine=1,
+    )]
+    assert report.slides[0].material_title == "Slide · Furio D'Andrea"
+    assert report.material_failures == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_pipeline_keeps_original_urls_when_hosting_fails(components, tmp_path):
+    material_context(components)
+    def fetch(url, workspace, allowed_hosts, cancellation_event):
+        deck = workspace / "furio.pptx"
+        deck.write_bytes(b"deck-bytes")
+        return deck
+    def hoster(deck, key):
+        raise BunnyStorageError()
+    components.pipeline.material_processor = MaterialProcessor(
+        fetcher=fetch, hoster=hoster,
+        extractor=lambda *args, **kwargs: [DeckPage(1, "Decisioni assembleari")],
+    )
+    report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
+    assert report.materials == [ReportMaterial(
+        titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
+        url="https://www.assoholding.it/furio.pptx", pagine=1,
+    )]
+    assert report.material_failures == []
+
+
 @pytest.mark.parametrize("failure_stage", ["fetch", "parse"])
 def test_pipeline_material_failure_nonfatal_and_safe(components, tmp_path, caplog, failure_stage):
     caplog.set_level("INFO")
@@ -196,7 +244,7 @@ def test_pipeline_material_failure_nonfatal_and_safe(components, tmp_path, caplo
 @pytest.mark.parametrize("signal", ["raise", "event"])
 def test_pipeline_cancels_inside_materials_and_cleans(components, tmp_path, signal):
     material_context(components)
-    def process(sources, slides, workspace, cancellation_event):
+    def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
         (workspace / "private.pptx").write_bytes(b"private")
         assert cancellation_event is components.event
         if signal == "raise":
@@ -242,7 +290,7 @@ def test_pipeline_propagates_only_source_failure_codes(components, tmp_path):
         inventory_reference="PRIVATE-INVENTORY-REFERENCE", reason="dichiarazione_ambigua",
     ),))
     components.pipeline.material_processor = SimpleNamespace(process=lambda sources, slides, workspace,
-        cancellation_event: MaterialAnalysis((), tuple(slides), ()))
+        cancellation_event, hosting_prefix=None: MaterialAnalysis((), tuple(slides), ()))
     report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
     assert report.material_failures == ["MATERIALE_NON_RAGGIUNGIBILE"]
     assert "PRIVATE-INVENTORY-REFERENCE" not in report.model_dump_json()
@@ -265,7 +313,7 @@ def test_pipeline_omits_sensitive_material_urls_without_inventing_public_url(com
     components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (MATERIAL_SOURCE + suffix,))
     material = ReportMaterial(titolo="Slide · Furio D'Andrea",
         url="https://www.assoholding.it/furio.pptx" + suffix, pagine=2)
-    def process(sources, slides, workspace, cancellation_event):
+    def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
         return MaterialAnalysis((material,), tuple(slide.model_copy(update={
             "material_title": material.titolo, "page": 2}) for slide in slides), ())
     components.pipeline.material_processor = SimpleNamespace(process=process)
@@ -373,7 +421,7 @@ def test_material_processor_cannot_mutate_slide_observations(components, mutatio
     material_context(components)
     components.content.slides[0].visible_content = ["Observed content"]
     original = components.content.slides[0].model_dump()
-    def process(sources, slides, workspace, cancellation_event):
+    def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
         if mutation == "scalars":
             slides[0].title = "PRIVATE-DECK-TEXT"
             slides[0].timestamp_seconds = 777
@@ -414,7 +462,7 @@ def test_processor_contract_violations_fail_safely(components, tmp_path, caplog,
     if violation == "duplicate_sensitive_ref":
         components.pipeline.context_provider = lambda metadata: AnalysisInventoryContext((), (
             MATERIAL_SOURCE, MATERIAL_SOURCE + "?token=PRIVATE"))
-    def process(sources, slides, workspace, cancellation_event):
+    def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
         deck = workspace / "PRIVATE-DECK.pptx"
         deck.write_bytes(b"PRIVATE-DECK-TEXT")
         material = ReportMaterial(titolo="Slide · Furio D'Andrea",
@@ -521,7 +569,7 @@ def test_concurrent_material_jobs_keep_context_progress_and_cancellation_isolate
     barrier = Barrier(2)
     first, second = Event(), Event()
     seen_workspaces = []
-    def process(sources, slides, workspace, cancellation_event):
+    def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
         seen_workspaces.append(workspace)
         (workspace / "private.pptx").write_bytes(b"private")
         barrier.wait(timeout=3)

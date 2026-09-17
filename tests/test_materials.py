@@ -21,6 +21,7 @@ from app.materials import (
     _PinnedHTTPSConnection, extract_deck_pages, fetch_deck, match_slides_to_material,
 )
 from app.models import ReportMaterial, SlideChange
+from app.storage import BunnyStorageError
 
 
 URL = "https://www.assoholding.it/deck.pptx"
@@ -809,6 +810,64 @@ def test_processor_promotes_only_parseable_candidates_and_cleans_workspace(tmp_p
     assert len(result.failures) == 2
     assert "FAKE_ERROR_BODY" not in repr(result)
     assert list(workspace.iterdir()) == []
+
+
+def test_processor_rehosts_fetched_decks_and_reports_the_cdn_url(tmp_path):
+    source = write_test_pptx(tmp_path / "source.pptx", [["Decisioni assembleari"]])
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    def fetcher(url, workspace, allowed_hosts, cancellation_event=None):
+        deck = workspace / "download.pptx"
+        deck.write_bytes(source.read_bytes())
+        return deck
+    uploads = []
+    def hoster(deck, key):
+        uploads.append((Path(deck).read_bytes(), key))
+        return f"https://academy-decks.b-cdn.net/{key}"
+    result = MaterialProcessor(fetcher=fetcher, hoster=hoster).process(
+        ["Slide Furio D’Andrea | https://www.assoholding.it/good.pptx"],
+        [slide()], workspace, Event(), hosting_prefix="video-123")
+    assert uploads == [(source.read_bytes(), "video-123/slide-furio-dandrea.pptx")]
+    assert result.hosted == ((
+        "https://www.assoholding.it/good.pptx",
+        "https://academy-decks.b-cdn.net/video-123/slide-furio-dandrea.pptx",
+    ),)
+    assert result.materials[0].url == "https://www.assoholding.it/good.pptx"
+
+
+def test_processor_hosting_failure_keeps_the_original_source(tmp_path):
+    source = write_test_pptx(tmp_path / "source.pptx", [["Decisioni assembleari"]])
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    def fetcher(url, workspace, allowed_hosts, cancellation_event=None):
+        deck = workspace / "download.pptx"
+        deck.write_bytes(source.read_bytes())
+        return deck
+    def hoster(deck, key):
+        raise BunnyStorageError()
+    result = MaterialProcessor(fetcher=fetcher, hoster=hoster).process(
+        ["Slide Furio D’Andrea | https://www.assoholding.it/good.pptx"],
+        [slide()], workspace, Event(), hosting_prefix="video-123")
+    assert result.hosted == ()
+    assert len(result.materials) == 1
+    assert result.failures == ()
+
+
+def test_processor_without_hosting_prefix_never_uploads(tmp_path):
+    source = write_test_pptx(tmp_path / "source.pptx", [["Decisioni assembleari"]])
+    workspace = tmp_path / "job"
+    workspace.mkdir()
+    def fetcher(url, workspace, allowed_hosts, cancellation_event=None):
+        deck = workspace / "download.pptx"
+        deck.write_bytes(source.read_bytes())
+        return deck
+    def hoster(deck, key):
+        raise AssertionError("Senza hosting_prefix non si carica nulla")
+    result = MaterialProcessor(fetcher=fetcher, hoster=hoster).process(
+        ["Slide Furio D’Andrea | https://www.assoholding.it/good.pptx"],
+        [slide()], workspace, Event())
+    assert result.hosted == ()
+    assert len(result.materials) == 1
 
 
 def test_processor_compares_all_materials_before_accepting(tmp_path):

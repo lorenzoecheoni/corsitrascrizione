@@ -108,8 +108,9 @@ def test_material_job_production_wiring_persistence_and_cleanup(tmp_path, monkey
         if mode in {"contract", "mutation"}:
             from app.materials import MaterialAnalysis
             original_process = app.state.pipeline.material_processor.process
-            def process(sources, slides, workspace, cancellation_event):
-                result = original_process(sources, slides, workspace, cancellation_event)
+            def process(sources, slides, workspace, cancellation_event, hosting_prefix=None):
+                result = original_process(sources, slides, workspace, cancellation_event,
+                                          hosting_prefix=hosting_prefix)
                 if mode == "contract":
                     result.slides[0].page = 999
                 else:

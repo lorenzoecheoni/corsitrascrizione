@@ -43,6 +43,27 @@ class Settings(BaseSettings):
     media_max_workspace_bytes: int = Field(default=2_000_000_000, gt=0)
     material_allowed_hosts: str = "www.assoholding.it"
     material_library_dir: str | None = None
+    bunny_storage_zone: str | None = None
+    bunny_storage_api_key: str | None = Field(default=None, repr=False)
+    bunny_storage_pull_hostname: str | None = None
+    bunny_storage_region: str = "de"
+
+    @field_validator("bunny_storage_pull_hostname")
+    @classmethod
+    def validate_storage_pull_hostname(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        hosts = parse_material_allowed_hosts([value])
+        if len(hosts) != 1:
+            raise ValueError("Hostname CDN della pull zone non valido")
+        return hosts[0]
+
+    @field_validator("bunny_storage_region")
+    @classmethod
+    def validate_storage_region(cls, value: str) -> str:
+        if value not in {"de", "ny", "la", "sg", "syd", "uk", "se", "br", "jh"}:
+            raise ValueError("Regione Bunny Storage non valida")
+        return value
 
     @field_validator("material_allowed_hosts")
     @classmethod
@@ -53,7 +74,10 @@ class Settings(BaseSettings):
     def parsed_material_allowed_hosts(self) -> tuple[str, ...]:
         return parse_material_allowed_hosts(self.material_allowed_hosts)
 
-    @field_validator("assemblyai_api_key", "google_service_account_json", mode="before")
+    @field_validator(
+        "assemblyai_api_key", "google_service_account_json",
+        "bunny_storage_zone", "bunny_storage_api_key", mode="before",
+    )
     @classmethod
     def blank_optional_secret_disables_integration(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value

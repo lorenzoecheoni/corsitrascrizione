@@ -42,6 +42,7 @@ from app.config import parse_material_allowed_hosts
 from app.material_registry import canonical_material_title, resolve_material_sources
 from app.models import ReportMaterial, SlideChange
 from app.retry import check_cancelled
+from app.storage import BunnyStorageError, slugify
 
 
 DOWNLOAD_TIMEOUT_SECONDS = 20.0
@@ -92,6 +93,8 @@ class MaterialAnalysis:
     materials: tuple[ReportMaterial, ...]
     slides: tuple[SlideChange, ...]
     failures: tuple[str, ...]
+    # (original URL, CDN URL) for decks re-hosted on Bunny Storage this run.
+    hosted: tuple[tuple[str, str], ...] = ()
 
 
 def parse_material_source(value: str) -> ReportMaterial | None:
@@ -942,15 +945,19 @@ class MaterialProcessor:
     """Candidate promotion gate; operational failures are nonfatal, bugs propagate."""
 
     def __init__(self, allowed_hosts: Sequence[str] | str = "www.assoholding.it", *,
-                 fetcher: Callable | None = None, extractor: Callable | None = None):
+                 fetcher: Callable | None = None, extractor: Callable | None = None,
+                 hoster: Callable | None = None):
         self.allowed_hosts = parse_material_allowed_hosts(allowed_hosts)
         self.fetcher = fetcher or fetch_deck
         self.extractor = extractor or extract_deck_pages
+        self.hoster = hoster
 
     def process(self, sources: Sequence[str], slides: Sequence[SlideChange], workspace: Path,
-                cancellation_event: Event | None = None) -> MaterialAnalysis:
+                cancellation_event: Event | None = None,
+                hosting_prefix: str | None = None) -> MaterialAnalysis:
         decks = []
         failures = []
+        hosted = []
         seen: set[tuple[str, ...]] = set()
         for position, source in enumerate(sources):
             check_cancelled(cancellation_event)
@@ -1003,13 +1010,24 @@ class MaterialProcessor:
                         pagine=len(pages), **metadata,
                     )
                     decks.append((material, pages))
+                    # Re-host fetched decks while the ephemeral copy still exists.
+                    # A hosting failure never demotes the verified material.
+                    if self.hoster is not None and hosting_prefix and url is not None:
+                        suffix = Path(urlsplit(url).path).suffix.lower()
+                        key = f"{hosting_prefix}/{slugify(title)}{suffix if suffix in {'.pdf', '.pptx'} else ''}"
+                        try:
+                            cdn_url = self.hoster(deck, key)
+                        except (BunnyStorageError, OSError):
+                            cdn_url = None
+                        if cdn_url:
+                            hosted.append((url, cdn_url))
             except CancelledError:
                 raise
             except (MaterialError, OSError):
                 failures.append(_FAILURE)
         failures.extend(_FAILURE for count in Counter(material.titolo for material, _ in decks).values() if count > 1)
         matched = _match_in_workspace(slides, decks, workspace, cancellation_event)
-        return MaterialAnalysis(tuple(material for material, _ in decks), matched, tuple(failures))
+        return MaterialAnalysis(tuple(material for material, _ in decks), matched, tuple(failures), tuple(hosted))
 
 
 def _worker_main() -> int:

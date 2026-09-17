@@ -445,15 +445,26 @@ class AnalysisPipeline:
                     try:
                         material_analysis = self.material_processor.process(
                             context.material_sources, [slide.model_copy(deep=True) for slide in slides], workspace, event,
+                            hosting_prefix=str(ref.video_id),
                         )
                     except MaterialError:
                         material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
                 check_cancelled()
+                hosted = material_analysis.hosted
                 material_analysis = _verified_material_result(
                     context, material_analysis, slide_snapshot, workspace, self.settings.parsed_material_allowed_hosts,
                     content,
                 )
                 materials = material_analysis.materials
+                if hosted:
+                    # Verified against the declared source; only then swapped for
+                    # the CDN copy uploaded from the same verified bytes.
+                    cdn_by_source = dict(hosted)
+                    materials = tuple(
+                        material.model_copy(update={"url": cdn_by_source.get(material.url, material.url)})
+                        if material.url is not None else material
+                        for material in materials
+                    )
                 material_failures.extend("MATERIALE_NON_RAGGIUNGIBILE" for _ in material_analysis.failures)
                 slides = material_analysis.slides
                 progress(96, "Preparazione del report")

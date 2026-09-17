@@ -35,6 +35,10 @@ Il processo legge `.env` dalla directory corrente; le variabili dell'ambiente ha
 | `MATERIAL_ALLOWED_HOSTS` | `www.assoholding.it` per impostazione predefinita; eventuali altri hostname esatti, separati da virgole, senza URL, porte o wildcard |
 | `MATERIAL_LIBRARY_DIR` | Facoltativa: cartella con i deck PDF/PPTX scaricati a mano da Drive; le etichette del foglio (es. `Slide Furio D'Andrea`) vengono abbinate ai nomi dei file e il report espone solo il nome del deck, pronto per `--materiali-da` |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Facoltativa: JSON del service account con cui è condiviso il foglio inventario; con esso la lettura avviene via API e recupera anche gli hyperlink delle celle — i link video nascosti dietro testi come `bunny` e gli URL dei deck dietro le etichette delle slide |
+| `BUNNY_STORAGE_ZONE` | Facoltativa: nome della Bunny Storage Zone su cui ricaricare i deck verificati; assente (o incompleta la tripletta), il report mantiene gli URL sorgente |
+| `BUNNY_STORAGE_API_KEY` | Chiave Read+Write della storage zone (non la chiave dell'account) |
+| `BUNNY_STORAGE_PULL_HOSTNAME` | Hostname CDN della pull zone collegata alla zona, es. `academy-decks.b-cdn.net`; è l'host che finisce negli URL dei materiali del report |
+| `BUNNY_STORAGE_REGION` | Regione della zona: `de` (predefinito, Falkenstein), `ny`, `la`, `sg`, `syd`, `uk`, `se`, `br`, `jh` |
 
 `BUNNY_SAMPLE_VIDEO_URL` serve soltanto al test live. `RUN_LIVE_BUNNY=1` abilita esplicitamente quel test a pagamento. `TEMP_ROOT`, opzionale, seleziona una directory temporanea già esistente e scrivibile dal processo. Non inserire `.env` nel repository, nell'immagine o nei report diagnostici; il file di esempio contiene soltanto segnaposto.
 

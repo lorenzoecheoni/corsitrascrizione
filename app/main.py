@@ -29,6 +29,7 @@ from app.material_registry import AnalysisInventoryContext, match_library_file, 
 from app.materials import MaterialProcessor
 from app.pipeline import AnalysisPipeline
 from app.selection import ConfirmationStore
+from app.storage import BunnyStorageClient
 from app.transcription import OpenAITranscriber
 from app.web import router
 
@@ -90,11 +91,23 @@ def build_services(settings: Settings) -> Services:
             else "https://api.assemblyai.com"
         )
         assemblyai = AssemblyAITranscriber(settings.assemblyai_api_key, base_url=base_url)
+    storage = None
+    if (settings.bunny_storage_zone and settings.bunny_storage_api_key
+            and settings.bunny_storage_pull_hostname):
+        storage = BunnyStorageClient(
+            settings.bunny_storage_zone,
+            settings.bunny_storage_api_key,
+            settings.bunny_storage_pull_hostname,
+            settings.bunny_storage_region,
+        )
     pipeline = AnalysisPipeline(
         settings, bunny, media, transcriber, analyzer,
         fast_transcriber=assemblyai,
         context_provider=inventory_context_provider,
-        material_processor=MaterialProcessor(settings.parsed_material_allowed_hosts),
+        material_processor=MaterialProcessor(
+            settings.parsed_material_allowed_hosts,
+            hoster=storage.upload_file if storage is not None else None,
+        ),
     )
     store = JobStore(settings.database_path)
     runner = SingleWorkerRunner(store, pipeline.run)

@@ -19,7 +19,7 @@ from app.material_registry import AnalysisInventoryContext, MaterialSourceFailur
 from app.materials import DeckPage, MaterialAnalysis, MaterialError, MaterialProcessor
 from app.models import ReportMaterial, SlideChange
 from app.pipeline import AnalysisPipeline, PipelineCancelled, PipelineError
-from app.storage import BunnyStorageError
+from app.storage import BunnyStorageError, slugify
 from app.transcription import (
     TranscriptSegment, TranscriptWord, TranscriptionError, TranscriptionResult,
 )
@@ -181,11 +181,11 @@ def test_pipeline_swaps_verified_material_urls_for_the_cdn_copy(components, tmp_
         extractor=lambda *args, **kwargs: [DeckPage(1, "Decisioni assembleari")],
     )
     report = components.pipeline.run(SOURCE, lambda *_: None, components.event)
-    video_prefix = str(components.metadata.video_id)
-    assert uploads == [f"{video_prefix}/slide-furio-dandrea.pptx"]
+    title_prefix = slugify(components.metadata.title)
+    assert uploads == [f"{title_prefix}/slide-furio-dandrea.pptx"]
     assert report.materials == [ReportMaterial(
         titolo="Slide · Furio D'Andrea", relatore="Furio D'Andrea",
-        url=f"https://academy-decks.b-cdn.net/{video_prefix}/slide-furio-dandrea.pptx",
+        url=f"https://academy-decks.b-cdn.net/{title_prefix}/slide-furio-dandrea.pptx",
         pagine=1,
     )]
     assert report.slides[0].material_title == "Slide · Furio D'Andrea"

@@ -31,6 +31,7 @@ from app.reporting import (
     reconcile_speakers_detailed,
     rewrite_speaker_references,
 )
+from app.storage import slugify
 from app.transcription import OpenAITranscriber, TranscriptionError
 
 
@@ -445,7 +446,7 @@ class AnalysisPipeline:
                     try:
                         material_analysis = self.material_processor.process(
                             context.material_sources, [slide.model_copy(deep=True) for slide in slides], workspace, event,
-                            hosting_prefix=str(ref.video_id),
+                            hosting_prefix=slugify(metadata.title)[:80] or str(ref.video_id),
                         )
                     except MaterialError:
                         material_failures.append("MATERIALE_NON_RAGGIUNGIBILE")
